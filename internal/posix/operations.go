@@ -444,6 +444,43 @@ func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath str
 	return nil
 }
 
+// UpdateAttributes updates file/directory attributes without rewriting content
+func (h *OperationsHandler) UpdateAttributes(ctx context.Context, path string, attrs *types.POSIXAttributes) error {
+	log := logging.WithOperation("UpdateAttributes").With(zap.String("path", path))
+	start := time.Now()
+	defer func() {
+		metrics.RecordNFSRequest("setattr", "success", time.Since(start))
+	}()
+
+	objectKey := h.translator.ToObjectKey(path)
+
+	// Check if it's a directory
+	info, err := h.Stat(ctx, path)
+	if err != nil {
+		return err
+	}
+
+	if info.IsDir() {
+		objectKey = ToDirectoryKey(objectKey)
+	}
+
+	// Encode attributes
+	metadata := EncodePOSIXAttributes(attrs)
+
+	// Update metadata using copy-to-self
+	err = h.cosClient.UpdateObjectMetadata(ctx, objectKey, metadata)
+	if err != nil {
+		log.Error("Failed to update attributes", zap.Error(err))
+		return err
+	}
+
+	// Invalidate metadata cache
+	h.metadataCache.InvalidatePath(path)
+
+	log.Debug("Attributes updated successfully")
+	return nil
+}
+
 // FileInfo represents file information
 type FileInfo struct {
 	name    string

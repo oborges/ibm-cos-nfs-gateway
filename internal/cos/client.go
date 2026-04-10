@@ -40,13 +40,26 @@ func NewClient(cfg *config.COSConfig) (*Client, error) {
 		Region:   aws.String(cfg.Region),
 	}
 
-	// Set timeout
+	// Set timeout - use longer timeout for large file operations
 	timeout, err := cfg.GetTimeout()
 	if err != nil {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
+	
+	// For large files, we need a much longer timeout
+	// Default is 30s, but large files need more time
+	if timeout < 5*time.Minute {
+		timeout = 5 * time.Minute
+	}
+	
 	awsConfig.HTTPClient = &http.Client{
 		Timeout: timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true, // Disable compression for better performance
+		},
 	}
 
 	// Configure authentication
@@ -121,10 +134,47 @@ func (c *Client) ping() error {
 	return nil
 }
 
-// GetObject retrieves an object from COS
+// GetObject retrieves an object from COS with retry logic
 func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 	log := logging.WithOperation("GetObject").With(zap.String("key", key))
 	log.Debug("getting object")
+
+	var lastErr error
+	maxRetries := c.config.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = 3
+	}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt*attempt) * time.Second
+			log.Warn("retrying GetObject", zap.Int("attempt", attempt), zap.Duration("backoff", backoff))
+			time.Sleep(backoff)
+		}
+
+		data, err := c.getObjectAttempt(ctx, key)
+		if err == nil {
+			if attempt > 0 {
+				log.Info("GetObject succeeded after retry", zap.Int("attempt", attempt))
+			}
+			return data, nil
+		}
+
+		lastErr = err
+		
+		// Don't retry on certain errors
+		if isNotFoundError(err) || strings.Contains(err.Error(), "too large") {
+			break
+		}
+	}
+
+	log.Error("GetObject failed after retries", zap.Error(lastErr), zap.Int("maxRetries", maxRetries))
+	return nil, lastErr
+}
+
+// getObjectAttempt performs a single attempt to get an object
+func (c *Client) getObjectAttempt(ctx context.Context, key string) ([]byte, error) {
+	log := logging.WithOperation("GetObject").With(zap.String("key", key))
 
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.bucket),
@@ -133,18 +183,76 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 
 	result, err := c.s3Client.GetObjectWithContext(ctx, input)
 	if err != nil {
-		log.Error("failed to get object", zap.Error(err))
 		return nil, fmt.Errorf("failed to get object: %w", err)
 	}
 	defer result.Body.Close()
 
-	data, err := io.ReadAll(result.Body)
-	if err != nil {
-		log.Error("failed to read object body", zap.Error(err))
-		return nil, fmt.Errorf("failed to read object body: %w", err)
+	// Pre-allocate buffer if content length is known
+	var data []byte
+	var totalSize int64
+	if result.ContentLength != nil && *result.ContentLength > 0 {
+		totalSize = *result.ContentLength
+		// Sanity check: don't allocate more than 5GB at once
+		if totalSize > 5*1024*1024*1024 {
+			log.Warn("object too large for single read", zap.Int64("size", totalSize))
+			return nil, fmt.Errorf("object too large: %d bytes (max 5GB)", totalSize)
+		}
+		data = make([]byte, 0, totalSize)
+		log.Info("Starting object download",
+			zap.String("key", key),
+			zap.Int64("totalSize", totalSize),
+			zap.String("sizeMB", fmt.Sprintf("%.2f MB", float64(totalSize)/(1024*1024))))
 	}
 
-	log.Debug("object retrieved", zap.Int("size", len(data)))
+	// Use a buffer to read in chunks to handle large files better
+	buf := make([]byte, 128*1024) // 128KB buffer for better performance
+	totalRead := 0
+	lastLogTime := time.Now()
+	lastLogBytes := 0
+	
+	for {
+		n, err := result.Body.Read(buf)
+		if n > 0 {
+			data = append(data, buf[:n]...)
+			totalRead += n
+			
+			// Log progress every 10MB or every 5 seconds
+			if totalRead-lastLogBytes >= 10*1024*1024 || time.Since(lastLogTime) >= 5*time.Second {
+				percentComplete := float64(0)
+				if totalSize > 0 {
+					percentComplete = float64(totalRead) / float64(totalSize) * 100
+				}
+				
+				throughputMBps := float64(totalRead-lastLogBytes) / (1024*1024) / time.Since(lastLogTime).Seconds()
+				
+				log.Info("Download progress",
+					zap.String("key", key),
+					zap.Int("bytesRead", totalRead),
+					zap.String("readMB", fmt.Sprintf("%.2f MB", float64(totalRead)/(1024*1024))),
+					zap.String("progress", fmt.Sprintf("%.1f%%", percentComplete)),
+					zap.String("throughput", fmt.Sprintf("%.2f MB/s", throughputMBps)))
+				
+				lastLogTime = time.Now()
+				lastLogBytes = totalRead
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Error("failed to read object body",
+				zap.Error(err),
+				zap.Int("bytesRead", totalRead),
+				zap.String("readMB", fmt.Sprintf("%.2f MB", float64(totalRead)/(1024*1024))),
+				zap.String("key", key))
+			return nil, fmt.Errorf("failed to read object body: %w", err)
+		}
+	}
+
+	log.Info("Object download complete",
+		zap.String("key", key),
+		zap.Int("totalBytes", len(data)),
+		zap.String("sizeMB", fmt.Sprintf("%.2f MB", float64(len(data))/(1024*1024))))
 	return data, nil
 }
 
@@ -155,7 +263,16 @@ func (c *Client) GetObjectRange(ctx context.Context, key string, offset, length 
 		zap.Int64("offset", offset),
 		zap.Int64("length", length),
 	)
-	log.Debug("getting object range")
+	
+	if length > 10*1024*1024 { // Log for ranges > 10MB
+		log.Info("Starting range download",
+			zap.String("key", key),
+			zap.Int64("offset", offset),
+			zap.Int64("length", length),
+			zap.String("sizeMB", fmt.Sprintf("%.2f MB", float64(length)/(1024*1024))))
+	} else {
+		log.Debug("getting object range")
+	}
 
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 
@@ -172,13 +289,50 @@ func (c *Client) GetObjectRange(ctx context.Context, key string, offset, length 
 	}
 	defer result.Body.Close()
 
-	data, err := io.ReadAll(result.Body)
-	if err != nil {
-		log.Error("failed to read object body", zap.Error(err))
-		return nil, fmt.Errorf("failed to read object body: %w", err)
+	// Pre-allocate buffer for expected length
+	data := make([]byte, 0, length)
+	
+	// Use buffered reading for better performance and error handling
+	buf := make([]byte, 128*1024) // 128KB buffer
+	totalRead := 0
+	lastLogTime := time.Now()
+	
+	for {
+		n, err := result.Body.Read(buf)
+		if n > 0 {
+			data = append(data, buf[:n]...)
+			totalRead += n
+			
+			// Log progress for large ranges every 5 seconds
+			if length > 10*1024*1024 && time.Since(lastLogTime) >= 5*time.Second {
+				percentComplete := float64(totalRead) / float64(length) * 100
+				log.Info("Range download progress",
+					zap.String("key", key),
+					zap.Int("bytesRead", totalRead),
+					zap.String("progress", fmt.Sprintf("%.1f%%", percentComplete)))
+				lastLogTime = time.Now()
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Error("failed to read object body",
+				zap.Error(err),
+				zap.Int("bytesRead", totalRead),
+				zap.String("readMB", fmt.Sprintf("%.2f MB", float64(totalRead)/(1024*1024))))
+			return nil, fmt.Errorf("failed to read object body: %w", err)
+		}
 	}
 
-	log.Debug("object range retrieved", zap.Int("size", len(data)))
+	if length > 10*1024*1024 {
+		log.Info("Range download complete",
+			zap.String("key", key),
+			zap.Int("totalBytes", len(data)),
+			zap.String("sizeMB", fmt.Sprintf("%.2f MB", float64(len(data))/(1024*1024))))
+	} else {
+		log.Debug("object range retrieved", zap.Int("size", len(data)))
+	}
 	return data, nil
 }
 
@@ -327,6 +481,38 @@ func (c *Client) CopyObject(ctx context.Context, sourceKey, destKey string) erro
 	}
 
 	log.Debug("object copied")
+	return nil
+}
+
+// UpdateObjectMetadata updates object metadata without rewriting the entire object
+// Uses copy-to-self with metadata-replace directive
+func (c *Client) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
+	log := logging.WithOperation("UpdateObjectMetadata").With(zap.String("key", key))
+	log.Debug("updating object metadata")
+
+	// Convert metadata to AWS format
+	awsMetadata := make(map[string]*string)
+	for k, v := range metadata {
+		awsMetadata[k] = aws.String(v)
+	}
+
+	copySource := fmt.Sprintf("%s/%s", c.bucket, key)
+
+	input := &s3.CopyObjectInput{
+		Bucket:            aws.String(c.bucket),
+		CopySource:        aws.String(copySource),
+		Key:               aws.String(key),
+		Metadata:          awsMetadata,
+		MetadataDirective: aws.String("REPLACE"),
+	}
+
+	_, err := c.s3Client.CopyObjectWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to update object metadata", zap.Error(err))
+		return fmt.Errorf("failed to update object metadata: %w", err)
+	}
+
+	log.Debug("object metadata updated")
 	return nil
 }
 

@@ -423,17 +423,8 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 		Atime: atime,
 	}
 	
-	// For files, read and rewrite with new attributes
-	if !info.IsDir() {
-		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
-		if err != nil {
-			return err
-		}
-		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
-	}
-	
-	// For directories, update the marker
-	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+	// Use efficient metadata update (no need to read/rewrite entire file)
+	return fs.ops.UpdateAttributes(context.Background(), fullPath, attrs)
 }
 
 // COSFile implements billy.File interface

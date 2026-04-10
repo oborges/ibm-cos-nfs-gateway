@@ -17,6 +17,8 @@ type Manager struct {
 	defaultTTL    time.Duration
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
+	closed        bool
+	closeMu       sync.Mutex
 }
 
 // NewManager creates a new lock manager
@@ -255,7 +257,20 @@ func (m *Manager) removeExpiredLocks() {
 
 // Close stops the lock manager
 func (m *Manager) Close() error {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	
+	if m.closed {
+		return nil // Already closed
+	}
+	
+	m.closed = true
 	close(m.stopCleanup)
+	
+	if m.cleanupTicker != nil {
+		m.cleanupTicker.Stop()
+	}
+	
 	logging.Info("Lock manager closed")
 	return nil
 }
