@@ -11,7 +11,7 @@ import (
 
 // Server wraps the NFS server functionality
 type Server struct {
-	handler  *COSHandler
+	handler  nfs.Handler
 	listener net.Listener
 	logger   *Logger
 	wg       sync.WaitGroup
@@ -20,7 +20,7 @@ type Server struct {
 }
 
 // NewServer creates a new NFS server
-func NewServer(handler *COSHandler, address string, logger *Logger) (*Server, error) {
+func NewServer(handler nfs.Handler, address string, logger *Logger) (*Server, error) {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create listener: %w", err)

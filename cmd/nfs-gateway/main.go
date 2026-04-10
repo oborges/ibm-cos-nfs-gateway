@@ -18,6 +18,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/internal/nfs"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
+	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
 
@@ -116,10 +117,13 @@ func main() {
 	// Initialize NFS handler and server
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
-	nfsHandler := nfs.NewCOSHandler(operations, nfsLogger)
+	cosHandler := nfs.NewCOSHandler(operations, nfsLogger)
+	
+	// Wrap with caching handler for file handle management
+	cachedHandler := nfshelper.NewCachingHandler(cosHandler, 1000)
 	
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
-	nfsServer, err := nfs.NewServer(nfsHandler, nfsAddress, nfsLogger)
+	nfsServer, err := nfs.NewServer(cachedHandler, nfsAddress, nfsLogger)
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
 	}
