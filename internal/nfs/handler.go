@@ -335,6 +335,107 @@ func (fs *COSFilesystem) Root() string {
 	return fs.root
 }
 
+// Chmod changes the mode of the named file
+func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
+	// COS doesn't support chmod directly, but we can update metadata
+	fullPath := fs.Join(fs.root, name)
+	
+	// Get current file info
+	info, err := fs.ops.Stat(context.Background(), fullPath)
+	if err != nil {
+		return err
+	}
+	
+	// Update with new mode
+	attrs := &types.POSIXAttributes{
+		Mode:  mode,
+		UID:   1000,
+		GID:   1000,
+		Mtime: time.Now(),
+	}
+	
+	// For files, we need to read and rewrite with new attributes
+	if !info.IsDir() {
+		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		if err != nil {
+			return err
+		}
+		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
+	}
+	
+	// For directories, just update the marker
+	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+}
+
+// Lchown changes the uid and gid of the named file (link itself)
+func (fs *COSFilesystem) Lchown(name string, uid, gid int) error {
+	// COS doesn't support symlinks, so this is the same as Chown
+	return fs.Chown(name, uid, gid)
+}
+
+// Chown changes the uid and gid of the named file
+func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
+	fullPath := fs.Join(fs.root, name)
+	
+	// Get current file info
+	info, err := fs.ops.Stat(context.Background(), fullPath)
+	if err != nil {
+		return err
+	}
+	
+	// Update with new ownership
+	attrs := &types.POSIXAttributes{
+		Mode:  info.Mode(),
+		UID:   uid,
+		GID:   gid,
+		Mtime: time.Now(),
+	}
+	
+	// For files, read and rewrite with new attributes
+	if !info.IsDir() {
+		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		if err != nil {
+			return err
+		}
+		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
+	}
+	
+	// For directories, update the marker
+	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+}
+
+// Chtimes changes the access and modification times
+func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	fullPath := fs.Join(fs.root, name)
+	
+	// Get current file info
+	info, err := fs.ops.Stat(context.Background(), fullPath)
+	if err != nil {
+		return err
+	}
+	
+	// Update with new times
+	attrs := &types.POSIXAttributes{
+		Mode:  info.Mode(),
+		UID:   1000,
+		GID:   1000,
+		Mtime: mtime,
+		Atime: atime,
+	}
+	
+	// For files, read and rewrite with new attributes
+	if !info.IsDir() {
+		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		if err != nil {
+			return err
+		}
+		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
+	}
+	
+	// For directories, update the marker
+	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
+}
+
 // COSFile implements billy.File interface
 type COSFile struct {
 	ops    *posix.OperationsHandler
