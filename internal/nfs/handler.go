@@ -470,12 +470,28 @@ func (f *COSFile) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
-	if f.offset >= int64(len(f.data)) {
-		return 0, io.EOF
+	// If data is loaded in memory (writable file), use it
+	if f.data != nil {
+		if f.offset >= int64(len(f.data)) {
+			return 0, io.EOF
+		}
+		n := copy(p, f.data[f.offset:])
+		f.offset += int64(n)
+		return n, nil
 	}
 
-	n := copy(p, f.data[f.offset:])
+	// Read-only file: fetch data on-demand using range read
+	data, err := f.ops.ReadFile(context.Background(), f.path, f.offset, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+
+	n := copy(p, data)
 	f.offset += int64(n)
+	
+	if n < len(p) {
+		return n, io.EOF
+	}
 	return n, nil
 }
 
@@ -556,11 +572,25 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 		return 0, err
 	}
 
-	if off >= int64(len(f.data)) {
-		return 0, io.EOF
+	// If data is loaded in memory (writable file), use it
+	if f.data != nil {
+		if off >= int64(len(f.data)) {
+			return 0, io.EOF
+		}
+		n := copy(p, f.data[off:])
+		if n < len(p) {
+			return n, io.EOF
+		}
+		return n, nil
 	}
 
-	n := copy(p, f.data[off:])
+	// Read-only file: fetch data on-demand using range read
+	data, err := f.ops.ReadFile(context.Background(), f.path, off, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+
+	n := copy(p, data)
 	if n < len(p) {
 		return n, io.EOF
 	}
@@ -590,6 +620,17 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
+	// For read-only files, don't load entire file into memory
+	// Instead, use lazy loading and read from COS on demand
+	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
+		// Read-only mode - mark as loaded but don't actually load data
+		// Data will be fetched on-demand in Read/ReadAt operations
+		f.loaded = true
+		f.data = nil
+		return nil
+	}
+
+	// For writable files, we need to load the data for read-modify-write
 	data, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 	if err != nil {
 		return err
