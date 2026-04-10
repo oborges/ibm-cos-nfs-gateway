@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
@@ -316,51 +317,71 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 
 	// List from COS
 	prefix := ListPrefix(path)
+	log.Debug("Listing directory", zap.String("prefix", prefix))
+	
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1000)
 	if err != nil {
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
 	}
 
+	log.Debug("Got objects from COS", zap.Int("count", len(objects)))
+
 	// Convert to FileInfo
 	entries := make([]*FileInfo, 0, len(objects))
 	seen := make(map[string]bool)
 
 	for _, obj := range objects {
+		log.Debug("Processing object", zap.String("key", obj.Key))
+		
 		// Remove prefix to get relative path
 		relPath := obj.Key
 		if prefix != "" {
-			relPath = relPath[len(prefix):]
+			relPath = strings.TrimPrefix(relPath, prefix)
 		}
 
 		// Skip if empty
 		if relPath == "" {
+			log.Debug("Skipping empty relPath")
 			continue
 		}
 
-		// Get first component
-		dir, file := SplitPath(relPath)
-		name := file
-		if name == "" {
-			name = dir
+		// For root directory, get the first path component
+		// For subdirectories, get the immediate child
+		parts := strings.Split(strings.Trim(relPath, "/"), "/")
+		if len(parts) == 0 {
+			log.Debug("Skipping - no parts")
+			continue
 		}
-
+		
+		name := parts[0]
+		isDir := len(parts) > 1 || strings.HasSuffix(obj.Key, "/")
+		
 		// Skip if already seen
 		if seen[name] {
+			log.Debug("Skipping duplicate", zap.String("name", name))
 			continue
 		}
 		seen[name] = true
 
-		isDir := IsDirectory(relPath)
 		attrs := DecodePOSIXAttributes(obj.Metadata, isDir)
+		mode := attrs.Mode
+		if isDir && (mode&os.ModeDir) == 0 {
+			mode = mode | os.ModeDir
+		}
 
 		info := &FileInfo{
 			name:    name,
 			size:    obj.Size,
-			mode:    attrs.Mode,
+			mode:    mode,
 			modTime: obj.LastModified,
 			isDir:   isDir,
 		}
+
+		log.Debug("Adding entry",
+			zap.String("name", name),
+			zap.Bool("isDir", isDir),
+			zap.Int64("size", obj.Size))
 
 		entries = append(entries, info)
 	}
