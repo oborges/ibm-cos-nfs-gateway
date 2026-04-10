@@ -180,6 +180,15 @@ type COSFilesystem struct {
 	root   string
 }
 
+// NewCOSFilesystem creates a new COS filesystem
+func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string) *COSFilesystem {
+	return &COSFilesystem{
+		ops:    ops,
+		logger: logger,
+		root:   root,
+	}
+}
+
 // Create creates a new file
 func (fs *COSFilesystem) Create(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)

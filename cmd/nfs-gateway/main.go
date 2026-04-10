@@ -114,13 +114,16 @@ func main() {
 		logging.Error("Failed to start health server", zap.Error(err))
 	}
 
-	// Initialize NFS handler and server
+	// Initialize NFS filesystem and server
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
-	cosHandler := nfs.NewCOSHandler(operations, nfsLogger)
 	
-	// Wrap with caching handler for file handle management
-	cachedHandler := nfshelper.NewCachingHandler(cosHandler, 1000)
+	// Create billy.Filesystem implementation
+	cosFilesystem := nfs.NewCOSFilesystem(operations, nfsLogger, "/")
+	
+	// Wrap with null auth handler, then caching handler
+	authHandler := nfshelper.NewNullAuthHandler(cosFilesystem)
+	cachedHandler := nfshelper.NewCachingHandler(authHandler, 1000)
 	
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
 	nfsServer, err := nfs.NewServer(cachedHandler, nfsAddress, nfsLogger)
