@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cos-nfs-gateway
+  labels:
+    app: nfs-gateway
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nfs-gateway
+  template:
+    metadata:
+      labels:
+        app: nfs-gateway
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: nfs-gateway
+      containers:
+      - name: nfs-gateway
+        image: oborges/cos-nfs-gateway:latest
+        imagePullPolicy: Always
+        ports:
+        - name: nfs
+          containerPort: 2049
+          protocol: TCP
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: health
+          containerPort: 8081
+          protocol: TCP
+        env:
+        - name: COS_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: nfs-gateway-config
+              key: cos.endpoint
+        - name: COS_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: nfs-gateway-config
+              key: cos.bucket
+        - name: COS_REGION
+          valueFrom:
+            configMapKeyRef:
+              name: nfs-gateway-config
+              key: cos.region
+        - name: IBM_CLOUD_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: nfs-gateway-secret
+              key: ibm-cloud-api-key
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nfs-gateway
+          readOnly: true
+        - name: cache
+          mountPath: /var/cache/nfs-gateway
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: health
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: health
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+      volumes:
+      - name: config
+        configMap:
+          name: nfs-gateway-config
+      - name: cache
+        emptyDir:
+          sizeLimit: 10Gi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - nfs-gateway
+              topologyKey: kubernetes.io/hostname
+
+# Made with Bob

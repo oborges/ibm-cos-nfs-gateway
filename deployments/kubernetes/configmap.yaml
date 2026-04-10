@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nfs-gateway-config
+  labels:
+    app: nfs-gateway
+data:
+  cos.endpoint: "s3.us-south.cloud-object-storage.appdomain.cloud"
+  cos.bucket: "my-nfs-bucket"
+  cos.region: "us-south"
+  
+  config.yaml: |
+    server:
+      nfs_port: 2049
+      metrics_port: 8080
+      health_port: 8081
+      max_connections: 1000
+      read_timeout: "30s"
+      write_timeout: "30s"
+
+    cos:
+      endpoint: "${COS_ENDPOINT}"
+      bucket: "${COS_BUCKET}"
+      region: "${COS_REGION}"
+      auth_type: "iam"
+      api_key: "${IBM_CLOUD_API_KEY}"
+      max_retries: 3
+      timeout: "30s"
+
+    cache:
+      metadata:
+        enabled: true
+        size_mb: 256
+        ttl_seconds: 60
+        max_entries: 10000
+      data:
+        enabled: true
+        size_gb: 10
+        path: "/var/cache/nfs-gateway"
+        chunk_size_kb: 1024
+
+    performance:
+      read_ahead_kb: 1024
+      write_buffer_kb: 4096
+      multipart_threshold_mb: 100
+      multipart_chunk_mb: 10
+      worker_pool_size: 100
+      max_concurrent_reads: 50
+      max_concurrent_writes: 25
+
+    logging:
+      level: "info"
+      format: "json"
+      output: "stdout"
+
+# Made with Bob
