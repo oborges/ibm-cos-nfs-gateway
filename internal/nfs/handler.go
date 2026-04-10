@@ -212,12 +212,17 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		offset: 0,
 	}
 
-	// If creating or truncating, handle accordingly
-	if flag&os.O_CREATE != 0 {
+	// Check if file exists
+	_, err := fs.ops.Stat(context.Background(), fullPath)
+	fileExists := err == nil
+
+	// If creating a new file
+	if flag&os.O_CREATE != 0 && !fileExists {
 		// File will be created on first write
 		file.isNew = true
 	}
 
+	// If truncating, clear the file
 	if flag&os.O_TRUNC != 0 {
 		// Truncate the file
 		attrs := &types.POSIXAttributes{
@@ -230,6 +235,20 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		if err != nil {
 			return nil, err
 		}
+		file.isNew = false
+		file.loaded = true
+		file.data = []byte{}
+	}
+
+	// If appending to existing file, load it and set offset to end
+	if flag&os.O_APPEND != 0 && fileExists && flag&os.O_TRUNC == 0 {
+		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		file.data = data
+		file.loaded = true
+		file.offset = int64(len(data))
 	}
 
 	return file, nil
