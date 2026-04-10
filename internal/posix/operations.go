@@ -51,9 +51,15 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		metrics.RecordCacheHit("metadata")
 		log.Debug("Metadata cache hit")
 		
-		// Handle nil attributes
+		// If we have FileInfo, use it directly
+		if entry.FileInfo != nil {
+			return entry.FileInfo.(*FileInfo), nil
+		}
+		
+		// Fallback: construct from attributes
 		mode := os.FileMode(0644)
 		modTime := time.Now()
+		size := int64(0)
 		if entry.Attributes != nil {
 			mode = entry.Attributes.Mode
 			modTime = entry.Attributes.Mtime
@@ -64,7 +70,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		
 		return &FileInfo{
 			name:    GetBaseName(path),
-			size:    0, // TODO: Get from entry
+			size:    size,
 			mode:    mode,
 			modTime: modTime,
 			isDir:   entry.IsDir,
