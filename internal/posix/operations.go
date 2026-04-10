@@ -49,11 +49,23 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	if entry, ok := h.metadataCache.Get(path); ok {
 		metrics.RecordCacheHit("metadata")
 		log.Debug("Metadata cache hit")
+		
+		// Handle nil attributes
+		mode := os.FileMode(0644)
+		modTime := time.Now()
+		if entry.Attributes != nil {
+			mode = entry.Attributes.Mode
+			modTime = entry.Attributes.Mtime
+		}
+		if entry.IsDir {
+			mode = mode | os.ModeDir
+		}
+		
 		return &FileInfo{
 			name:    GetBaseName(path),
 			size:    0, // TODO: Get from entry
-			mode:    entry.Attributes.Mode,
-			modTime: entry.Attributes.Mtime,
+			mode:    mode,
+			modTime: modTime,
 			isDir:   entry.IsDir,
 		}, nil
 	}
