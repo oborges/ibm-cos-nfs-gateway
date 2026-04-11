@@ -150,8 +150,9 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			isDir:   true,
 		}
 
-		// Cache the result, but mark it as implicit so it gets validated on next access
-		h.metadataCache.SetFileInfoWithFlags(path, info, attrs, true)
+		// Cache the result as a normal directory (NOT implicit)
+		// Once validated, we don't need to re-validate on every Stat() call
+		h.metadataCache.SetFileInfo(path, info, attrs)
 
 		log.Debug("Implicit directory stat successful")
 		return info, nil

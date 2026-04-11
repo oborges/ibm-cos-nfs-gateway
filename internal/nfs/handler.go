@@ -188,7 +188,7 @@ func (h *COSHandler) InvalidateHandle(fs billy.Filesystem, fh []byte) error {
 	h.handleLock.Lock()
 	defer h.handleLock.Unlock()
 
-	hashStr := string(fh)
+	hashStr := hex.EncodeToString(fh)
 	delete(h.handleMap, hashStr)
 	return nil
 }
