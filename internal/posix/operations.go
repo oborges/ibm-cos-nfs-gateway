@@ -356,7 +356,6 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		
 		// Convert children names to FileInfo by statting each one
 		entries := make([]*FileInfo, 0, len(entry.Children))
-		cacheInvalidated := false
 		
 		for _, childName := range entry.Children {
 			childPath := path
@@ -369,29 +368,28 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			// Get file info from cache or COS
 			info, err := h.Stat(ctx, childPath)
 			if err != nil {
-				log.Debug("Cached child not found, invalidating directory cache",
-					zap.String("child", childName))
+				log.Warn("Cached child not found, invalidating cache and fetching fresh listing",
+					zap.String("child", childName),
+					zap.Error(err))
 				
 				// Invalidate the entire directory cache when ANY child is missing
-				// This forces a fresh ListObjects call from COS on the next request
+				// This forces a fresh ListObjects call from COS
 				h.metadataCache.InvalidatePath(path)
-				cacheInvalidated = true
-				break
+				
+				// Fall through to fetch fresh listing from COS below
+				// DO NOT return cached entries - they are stale
+				goto fetchFromCOS
 			}
 			entries = append(entries, info)
 		}
 		
-		// If cache was invalidated, fall through to re-list from COS
-		if cacheInvalidated {
-			log.Debug("Falling through to re-list from COS after cache invalidation")
-			// Fall through to ListObjects below
-		} else {
-			// Successfully got all entries from cache
-			log.Debug("Directory listing from cache successful",
-				zap.Int("entries", len(entries)))
-			return entries, nil
-		}
+		// Successfully got all entries from cache
+		log.Debug("Directory listing from cache successful",
+			zap.Int("entries", len(entries)))
+		return entries, nil
 	}
+	
+fetchFromCOS:
 	metrics.RecordCacheMiss("metadata")
 
 	// List from COS
