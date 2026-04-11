@@ -350,13 +350,15 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 	defer func() {
 		duration := time.Since(start)
 		metrics.RecordNFSRequest("readdir", "success", duration)
-		log.Info("ListDirectory completed", zap.Duration("duration", duration))
+		// Only log slow operations to reduce overhead
+		if duration > 100*time.Millisecond {
+			log.Info("ListDirectory completed", zap.Duration("duration", duration))
+		}
 	}()
 
 	// Check cache first - NEW: Return full FileInfo entries directly (O(1) cache hit)
 	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
 		metrics.RecordCacheHit("metadata")
-		log.Info("ListDirectory cache hit", zap.Int("entries", len(entry.ChildEntries)))
 		
 		// Convert []os.FileInfo to []*FileInfo (just type assertion, no COS calls)
 		entries := make([]*FileInfo, len(entry.ChildEntries))

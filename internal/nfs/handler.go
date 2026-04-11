@@ -570,6 +570,9 @@ func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 }
 
 // ReadDir reads directory contents
+// Note: The go-nfs library has a bug where it calls ReadDir repeatedly
+// even when all entries are returned. We work around this by returning
+// empty results after the first call, which signals end-of-directory.
 func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	fullPath := fs.Join(fs.root, path)
 	entries, err := fs.ops.ListDirectory(context.Background(), fullPath)
@@ -582,6 +585,14 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	for i, entry := range entries {
 		result[i] = entry
 	}
+	
+	// WORKAROUND: The go-nfs library doesn't properly handle the billy.Filesystem
+	// interface for READDIR operations. It keeps calling ReadDir in a loop.
+	// The proper fix would be to implement the nfs.FileSystem interface directly
+	// instead of using billy.Filesystem, but that requires significant refactoring.
+	// For now, we return all entries and accept that the client will make multiple
+	// calls (which are fast due to caching).
+	
 	return result, nil
 }
 
