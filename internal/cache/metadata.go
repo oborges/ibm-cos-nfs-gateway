@@ -119,6 +119,43 @@ func (c *MetadataCache) SetDirListing(path string, children []string) {
 	)
 }
 
+// RemoveChildFromListing removes a child from a cached directory listing
+func (c *MetadataCache) RemoveChildFromListing(dirPath string, childName string) bool {
+	if !c.enabled {
+		return false
+	}
+
+	entry, ok := c.Get(dirPath)
+	if !ok || !entry.IsDir || entry.Children == nil {
+		return false
+	}
+
+	// Find and remove the child
+	newChildren := make([]string, 0, len(entry.Children)-1)
+	found := false
+	for _, child := range entry.Children {
+		if child != childName {
+			newChildren = append(newChildren, child)
+		} else {
+			found = true
+		}
+	}
+
+	if found {
+		// Update the cache with the new children list
+		entry.Children = newChildren
+		entry.CachedAt = time.Now()
+		c.cache.Set(dirPath, entry)
+		logging.Debug("Child removed from cached directory listing",
+			zap.String("dir", dirPath),
+			zap.String("child", childName),
+			zap.Int("remaining", len(newChildren)))
+		return true
+	}
+
+	return false
+}
+
 // Delete removes an entry from cache
 func (c *MetadataCache) Delete(path string) {
 	if !c.enabled {

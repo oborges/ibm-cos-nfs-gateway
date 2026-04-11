@@ -337,7 +337,11 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			info, err := h.Stat(ctx, childPath)
 			if err != nil {
 				failedStats++
-				log.Debug("Cached child not found, skipping",
+				
+				// Remove this stale child from the cached directory listing
+				h.metadataCache.RemoveChildFromListing(path, childName)
+				
+				log.Debug("Cached child not found, removed from cache",
 					zap.String("child", childName))
 				
 				// Check failure threshold AFTER incrementing - if >50% have failed, stop and re-list
