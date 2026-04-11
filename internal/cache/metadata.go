@@ -23,7 +23,8 @@ type MetadataEntry struct {
 	FileInfo   os.FileInfo
 	Attributes *types.POSIXAttributes
 	IsDir      bool
-	Children   []string // For directory listings
+	Children   []string    // DEPRECATED: Use ChildEntries instead
+	ChildEntries []os.FileInfo // Full FileInfo for directory listings (O(1) cache hit)
 	CachedAt   time.Time
 	IsImplicit bool     // True if directory has no marker object (needs validation)
 }
@@ -71,7 +72,8 @@ func (c *MetadataCache) Get(path string) (*MetadataEntry, bool) {
 		return nil, false
 	}
 
-	logging.Debug("Metadata cache hit", zap.String("path", path))
+	// Removed debug logging from hot path - was causing performance issues
+	// with repeated directory listings (O(n) log calls per readdir)
 	return entry, true
 }
 
@@ -83,7 +85,7 @@ func (c *MetadataCache) Set(path string, entry *MetadataEntry) {
 
 	entry.CachedAt = time.Now()
 	c.cache.Set(path, entry)
-	logging.Debug("Metadata cached", zap.String("path", path))
+	// Removed debug logging from hot path
 }
 
 // SetFileInfo stores file info in cache
@@ -112,7 +114,7 @@ func (c *MetadataCache) SetFileInfoWithFlags(path string, info os.FileInfo, attr
 	}
 }
 
-// SetDirListing stores directory listing in cache
+// SetDirListing stores directory listing in cache (DEPRECATED: use SetDirEntries)
 func (c *MetadataCache) SetDirListing(path string, children []string) {
 	if !c.enabled {
 		return
@@ -124,10 +126,28 @@ func (c *MetadataCache) SetDirListing(path string, children []string) {
 		CachedAt: time.Now(),
 	}
 	c.cache.Set(path, entry)
-	logging.Debug("Directory listing cached",
-		zap.String("path", path),
-		zap.Int("children", len(children)),
-	)
+	// Removed debug logging from hot path
+}
+
+// SetDirEntries stores full directory entries in cache (O(1) retrieval)
+func (c *MetadataCache) SetDirEntries(path string, entries []os.FileInfo) {
+	if !c.enabled {
+		return
+	}
+
+	entry := &MetadataEntry{
+		IsDir:        true,
+		ChildEntries: entries,
+		CachedAt:     time.Now(),
+	}
+	c.cache.Set(path, entry)
+	// Only log on initial cache, not on hot path
+	if len(entries) > 50 {
+		logging.Debug("Large directory cached",
+			zap.String("path", path),
+			zap.Int("entries", len(entries)),
+		)
+	}
 }
 
 // RemoveChildFromListing removes a child from a cached directory listing

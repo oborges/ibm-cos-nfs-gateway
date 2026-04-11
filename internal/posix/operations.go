@@ -102,7 +102,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		// Cache the result
 		h.metadataCache.SetFileInfo(path, info, attrs)
 
-		log.Debug("File stat successful", zap.Int64("size", metadata.Size))
+		// Removed debug logging from hot path
 		return info, nil
 	}
 
@@ -123,7 +123,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		// Cache the result
 		h.metadataCache.SetFileInfo(path, info, attrs)
 
-		log.Debug("Directory stat successful")
+		// Removed debug logging from hot path
 		return info, nil
 	}
 
@@ -349,44 +349,32 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		metrics.RecordNFSRequest("readdir", "success", time.Since(start))
 	}()
 
-	// Check cache first
-	if entry, ok := h.metadataCache.Get(path); ok && entry.Children != nil {
+	// Check cache first - NEW: Return full FileInfo entries directly (O(1) cache hit)
+	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
 		metrics.RecordCacheHit("metadata")
-		log.Debug("Directory listing cache hit", zap.Int("entries", len(entry.Children)))
 		
-		// Convert children names to FileInfo by statting each one
-		entries := make([]*FileInfo, 0, len(entry.Children))
-		
-		for _, childName := range entry.Children {
-			childPath := path
-			if path == "/" {
-				childPath = "/" + childName
+		// Convert []os.FileInfo to []*FileInfo (just type assertion, no COS calls)
+		entries := make([]*FileInfo, len(entry.ChildEntries))
+		for i, info := range entry.ChildEntries {
+			if fi, ok := info.(*FileInfo); ok {
+				entries[i] = fi
 			} else {
-				childPath = path + "/" + childName
-			}
-			
-			// Get file info from cache or COS
-			info, err := h.Stat(ctx, childPath)
-			if err != nil {
-				log.Warn("Cached child not found, invalidating cache and fetching fresh listing",
-					zap.String("child", childName),
-					zap.Error(err))
-				
-				// Invalidate the entire directory cache when ANY child is missing
-				// This forces a fresh ListObjects call from COS
+				// Shouldn't happen, but handle gracefully
+				log.Warn("Invalid cached entry type, refetching from COS")
 				h.metadataCache.InvalidatePath(path)
-				
-				// Fall through to fetch fresh listing from COS below
-				// DO NOT return cached entries - they are stale
 				goto fetchFromCOS
 			}
-			entries = append(entries, info)
 		}
 		
-		// Successfully got all entries from cache
-		log.Debug("Directory listing from cache successful",
-			zap.Int("entries", len(entries)))
+		// O(1) cache hit - no per-file Stat() calls!
 		return entries, nil
+	}
+	
+	// DEPRECATED: Old cache format with just names (fallback for compatibility)
+	if entry, ok := h.metadataCache.Get(path); ok && entry.Children != nil {
+		log.Warn("Using deprecated cache format, will upgrade on next fetch")
+		h.metadataCache.InvalidatePath(path)
+		// Fall through to fetch fresh listing
 	}
 	
 fetchFromCOS:
@@ -463,12 +451,12 @@ fetchFromCOS:
 		entries = append(entries, info)
 	}
 
-	// Cache the listing
-	children := make([]string, len(entries))
+	// Cache the full FileInfo entries (NEW: O(1) retrieval on cache hit)
+	osEntries := make([]os.FileInfo, len(entries))
 	for i, entry := range entries {
-		children[i] = entry.Name()
+		osEntries[i] = entry
 	}
-	h.metadataCache.SetDirListing(path, children)
+	h.metadataCache.SetDirEntries(path, osEntries)
 
 	log.Debug("Directory listed successfully", zap.Int("entries", len(entries)))
 	return entries, nil
