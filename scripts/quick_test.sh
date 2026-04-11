@@ -46,7 +46,7 @@ echo
 
 # Test 2: Sequential Read
 echo -e "${BLUE}Test 2: Sequential Read (100MB)${NC}"
-fio --name=read --directory="$TEST_DIR" --rw=read \
+fio --name=write --directory="$TEST_DIR" --rw=read \
     --bs=1M --size=100M --numjobs=1 --direct=0 2>&1 | \
     grep -E "read: IOPS=|bw=" | head -2
 echo
