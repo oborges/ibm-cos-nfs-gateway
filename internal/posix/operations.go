@@ -323,19 +323,9 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		entries := make([]*FileInfo, 0, len(entry.Children))
 		failedStats := 0
 		maxFailures := len(entry.Children) / 2
+		cacheInvalidated := false
 		
 		for i, childName := range entry.Children {
-			// Check failure threshold early - if >50% have failed, stop and re-list
-			if failedStats > maxFailures {
-				log.Warn("Too many cached children not found, invalidating cache and re-listing",
-					zap.String("path", path),
-					zap.Int("failed", failedStats),
-					zap.Int("checked", i),
-					zap.Int("total", len(entry.Children)))
-				h.metadataCache.InvalidatePath(path)
-				break
-			}
-			
 			childPath := path
 			if path == "/" {
 				childPath = "/" + childName
@@ -349,13 +339,29 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 				failedStats++
 				log.Debug("Cached child not found, skipping",
 					zap.String("child", childName))
+				
+				// Check failure threshold AFTER incrementing - if >50% have failed, stop and re-list
+				if failedStats > maxFailures {
+					log.Warn("Too many cached children not found, invalidating cache and re-listing",
+						zap.String("path", path),
+						zap.Int("failed", failedStats),
+						zap.Int("checked", i+1),
+						zap.Int("total", len(entry.Children)))
+					h.metadataCache.InvalidatePath(path)
+					cacheInvalidated = true
+					break
+				}
 				continue
 			}
 			entries = append(entries, info)
 		}
 		
-		// If we successfully got most entries, return them
-		if failedStats <= maxFailures {
+		// If cache was invalidated due to too many failures, fall through to re-list from COS
+		if cacheInvalidated {
+			log.Debug("Falling through to re-list from COS after cache invalidation")
+			// Fall through to ListObjects below
+		} else if failedStats <= maxFailures {
+			// If we successfully got most entries, return them
 			log.Debug("Directory listing from cache successful",
 				zap.Int("entries", len(entries)),
 				zap.Int("skipped", failedStats))
