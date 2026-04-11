@@ -1287,6 +1287,20 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
+	// For files using write buffer (session-based writes), don't load entire file
+	// The write buffer handles append-only operations efficiently
+	// Only load file size for metadata operations
+	if f.writeSession != nil {
+		info, err := f.ops.Stat(context.Background(), f.path)
+		if err != nil {
+			return err
+		}
+		f.size = info.Size()
+		f.loaded = true
+		f.data = nil
+		return nil
+	}
+
 	// For read-only files, don't load entire file into memory
 	// Instead, use lazy loading and read from COS on demand
 	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
@@ -1302,7 +1316,8 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
-	// For writable files, we need to load the data for read-modify-write
+	// For writable files WITHOUT write buffer (legacy path), load the data
+	// This is only used for files that don't use the session-based write buffer
 	data, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 	if err != nil {
 		return err
