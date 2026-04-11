@@ -190,10 +190,11 @@ func (h *COSHandler) HandleLimit() int {
 
 // COSFilesystem implements billy.Filesystem interface for COS
 type COSFilesystem struct {
-	ops       *posix.OperationsHandler
-	logger    *Logger
-	root      string
-	perfConfig *config.PerformanceConfig
+	ops            *posix.OperationsHandler
+	logger         *Logger
+	root           string
+	perfConfig     *config.PerformanceConfig
+	sessionManager *buffer.SessionManager
 }
 
 // NewCOSFilesystem creates a new COS filesystem (deprecated, use NewCOSFilesystemWithConfig)
@@ -215,18 +216,27 @@ func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string)
 
 // NewCOSFilesystemWithConfig creates a new COS filesystem with configuration
 func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig) *COSFilesystem {
+	bufferSize := int64(perfConfig.WriteBufferKB) * 1024
+	sessionTimeout := 5 * time.Minute // Keep sessions alive for 5 minutes after last access
+	
 	logger.Info("Initializing COS filesystem with configuration",
 		"write_buffer_kb", perfConfig.WriteBufferKB,
-		"write_buffer_bytes", perfConfig.WriteBufferKB*1024,
+		"write_buffer_bytes", bufferSize,
+		"write_buffer_mb", float64(bufferSize)/(1024*1024),
 		"multipart_threshold_mb", perfConfig.MultipartThresholdMB,
 		"multipart_chunk_mb", perfConfig.MultipartChunkMB,
-		"read_ahead_kb", perfConfig.ReadAheadKB)
+		"read_ahead_kb", perfConfig.ReadAheadKB,
+		"session_timeout", sessionTimeout)
+	
+	// Create session manager for path-scoped write buffering
+	sessionManager := buffer.NewSessionManager(bufferSize, sessionTimeout)
 	
 	return &COSFilesystem{
-		ops:        ops,
-		logger:     logger,
-		root:       root,
-		perfConfig: perfConfig,
+		ops:            ops,
+		logger:         logger,
+		root:           root,
+		perfConfig:     perfConfig,
+		sessionManager: sessionManager,
 	}
 }
 
@@ -275,14 +285,15 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		"perm", fmt.Sprintf("%o", perm))
 
 	file := &COSFile{
-		ops:        fs.ops,
-		logger:     fs.logger,
-		path:       fullPath,
-		flag:       flag,
-		perm:       perm,
-		offset:     0,
-		perfConfig: fs.perfConfig,
-		fileID:     fileID,
+		ops:            fs.ops,
+		logger:         fs.logger,
+		path:           fullPath,
+		flag:           flag,
+		perm:           perm,
+		offset:         0,
+		perfConfig:     fs.perfConfig,
+		fileID:         fileID,
+		sessionManager: fs.sessionManager,
 	}
 
 	// Check if file exists
@@ -521,22 +532,23 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 
 // COSFile implements billy.File interface
 type COSFile struct {
-	ops          *posix.OperationsHandler
-	logger       *Logger
-	path         string
-	flag         int
-	perm         os.FileMode
-	offset       int64
-	isNew        bool
-	data         []byte
-	loaded       bool
-	size         int64  // File size (for read-only files without data loaded)
-	writeBuffer  *buffer.WriteBuffer  // Write buffer for efficient writes
-	flushCount   int    // Number of flushes performed
-	totalFlushed int64  // Total bytes flushed
-	totalWrites  int    // Total number of Write() calls
-	perfConfig   *config.PerformanceConfig // Performance configuration
-	fileID       string // Unique file handle ID for tracking
+	ops            *posix.OperationsHandler
+	logger         *Logger
+	path           string
+	flag           int
+	perm           os.FileMode
+	offset         int64
+	isNew          bool
+	data           []byte
+	loaded         bool
+	size           int64  // File size (for read-only files without data loaded)
+	writeSession   *buffer.WriteSession  // Shared write session (survives handle close)
+	flushCount     int    // Number of flushes performed
+	totalFlushed   int64  // Total bytes flushed
+	totalWrites    int    // Total number of Write() calls
+	perfConfig     *config.PerformanceConfig // Performance configuration
+	fileID         string // Unique file handle ID for tracking
+	sessionManager *buffer.SessionManager // Session manager for path-scoped buffering
 }
 
 // Name returns the file name
@@ -550,14 +562,18 @@ func (f *COSFile) Read(p []byte) (int, error) {
 		return 0, err
 	}
 
-	// Check write buffer first for read-after-write consistency
-	if f.writeBuffer != nil {
-		bufferedData := f.writeBuffer.Read(f.offset, int64(len(p)))
+	// Check write session buffer first for read-after-write consistency
+	if f.writeSession != nil {
+		f.writeSession.Mu.Lock()
+		bufferedData := f.writeSession.Buffer.Read(f.offset, int64(len(p)))
+		f.writeSession.Mu.Unlock()
+		
 		if len(bufferedData) > 0 {
 			n := copy(p, bufferedData)
 			f.offset += int64(n)
-			f.logger.Debug("Read from write buffer",
+			f.logger.Debug("Read from write session buffer",
 				"path", f.path,
+				"session_id", f.writeSession.SessionID,
 				"offset", f.offset-int64(n),
 				"bytes", n)
 			return n, nil
@@ -602,27 +618,34 @@ func (f *COSFile) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Write writes data to the file with buffering
+// Write writes data to the file with session-based buffering
 func (f *COSFile) Write(p []byte) (int, error) {
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return 0, err
 	}
 
-	// Initialize write buffer if needed
-	if f.writeBuffer == nil {
-		bufferSize := int64(f.perfConfig.WriteBufferKB) * 1024
-		f.writeBuffer = buffer.NewWriteBuffer(bufferSize)
-		f.logger.Info("Initialized write buffer",
-			"path", f.path,
-			"threshold_kb", f.perfConfig.WriteBufferKB,
-			"threshold_bytes", bufferSize,
-			"threshold_mb", float64(bufferSize)/(1024*1024))
+	f.totalWrites++
+
+	// Get or create write session for this path
+	if f.writeSession == nil {
+		f.writeSession = f.sessionManager.GetOrCreateSession(f.path)
+		f.logger.Info("FILE OPEN - Write session acquired",
+			"file_id", f.fileID,
+			"session_id", f.writeSession.SessionID,
+			"path", f.path)
 	}
 
-	// Write to buffer
-	n, err := f.writeBuffer.Write(f.offset, p)
+	// Write to session buffer (thread-safe)
+	f.writeSession.Mu.Lock()
+	n, err := f.writeSession.Buffer.Write(f.offset, p)
+	shouldFlush := f.writeSession.Buffer.ShouldFlush()
+	bufferSize := f.writeSession.Buffer.Size()
+	f.writeSession.Mu.Unlock()
+
 	if err != nil {
-		f.logger.Error("Write buffer error",
+		f.logger.Error("WRITE ERROR",
+			"file_id", f.fileID,
+			"session_id", f.writeSession.SessionID,
 			"path", f.path,
 			"offset", f.offset,
 			"bytes", len(p),
@@ -632,19 +655,32 @@ func (f *COSFile) Write(p []byte) (int, error) {
 
 	f.offset += int64(n)
 
+	f.logger.Info("WRITE",
+		"file_id", f.fileID,
+		"session_id", f.writeSession.SessionID,
+		"path", f.path,
+		"offset", f.offset-int64(n),
+		"bytes", n,
+		"buffer_size_bytes", bufferSize,
+		"buffer_size_mb", float64(bufferSize)/(1024*1024),
+		"write_count", f.totalWrites)
+
 	// Check if we should flush
-	if f.writeBuffer.ShouldFlush() {
-		bufferSize := f.writeBuffer.Size()
+	if shouldFlush {
 		thresholdBytes := int64(f.perfConfig.WriteBufferKB) * 1024
-		f.logger.Info("Write buffer threshold reached, flushing",
+		f.logger.Info("FLUSH TRIGGER: threshold reached",
+			"file_id", f.fileID,
+			"session_id", f.writeSession.SessionID,
 			"path", f.path,
 			"buffer_size_bytes", bufferSize,
 			"buffer_size_mb", float64(bufferSize)/(1024*1024),
 			"threshold_bytes", thresholdBytes,
 			"threshold_mb", float64(thresholdBytes)/(1024*1024))
 		
-		if err := f.flushBuffer(); err != nil {
-			f.logger.Error("Failed to flush buffer",
+		if err := f.flushSessionBuffer(); err != nil {
+			f.logger.Error("FLUSH ERROR",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
 				"path", f.path,
 				"error", err)
 			return n, err
@@ -654,25 +690,38 @@ func (f *COSFile) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// flushBuffer flushes the write buffer to COS
-func (f *COSFile) flushBuffer() error {
-	if f.writeBuffer == nil || f.writeBuffer.Size() == 0 {
+// flushSessionBuffer flushes the write session buffer to COS
+func (f *COSFile) flushSessionBuffer() error {
+	if f.writeSession == nil {
+		return nil
+	}
+
+	f.writeSession.Mu.Lock()
+	bufferSize := f.writeSession.Buffer.Size()
+	if bufferSize == 0 {
+		f.writeSession.Mu.Unlock()
 		return nil
 	}
 
 	start := time.Now()
 	
 	// Get data to flush
-	data, startOffset, err := f.writeBuffer.GetFlushData()
+	data, startOffset, err := f.writeSession.Buffer.GetFlushData()
 	if err != nil {
+		f.writeSession.Mu.Unlock()
 		f.logger.Error("Failed to get flush data",
+			"file_id", f.fileID,
+			"session_id", f.writeSession.SessionID,
 			"path", f.path,
 			"error", err)
 		return err
 	}
 	flushSize := int64(len(data))
+	f.writeSession.Mu.Unlock()
 	
-	f.logger.Info("Flushing write buffer",
+	f.logger.Info("FLUSH START",
+		"file_id", f.fileID,
+		"session_id", f.writeSession.SessionID,
 		"path", f.path,
 		"bytes", flushSize,
 		"start_offset", startOffset,
@@ -690,6 +739,8 @@ func (f *COSFile) flushBuffer() error {
 		err := f.ops.WriteFile(context.Background(), f.path, data, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write file during flush",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
 				"path", f.path,
 				"bytes", flushSize,
 				"error", err)
@@ -701,6 +752,8 @@ func (f *COSFile) flushBuffer() error {
 		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			f.logger.Error("Failed to read existing file for merge",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
 				"path", f.path,
 				"error", err)
 			return err
@@ -725,6 +778,8 @@ func (f *COSFile) flushBuffer() error {
 		err = f.ops.WriteFile(context.Background(), f.path, existingData, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write merged file during flush",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
 				"path", f.path,
 				"bytes", len(existingData),
 				"error", err)
@@ -736,7 +791,9 @@ func (f *COSFile) flushBuffer() error {
 	f.flushCount++
 	f.totalFlushed += flushSize
 
-	f.logger.Info("Write buffer flushed successfully",
+	f.logger.Info("FLUSH COMPLETE",
+		"file_id", f.fileID,
+		"session_id", f.writeSession.SessionID,
 		"path", f.path,
 		"bytes", flushSize,
 		"duration_ms", duration.Milliseconds(),
@@ -744,40 +801,48 @@ func (f *COSFile) flushBuffer() error {
 		"total_flushes", f.flushCount,
 		"total_flushed", f.totalFlushed)
 
-	// Clear the buffer after successful flush
-	bufferSize := int64(f.perfConfig.WriteBufferKB) * 1024
-	f.writeBuffer = buffer.NewWriteBuffer(bufferSize)
+	// Clear the session buffer after successful flush
+	f.writeSession.Mu.Lock()
+	thresholdBytes := int64(f.perfConfig.WriteBufferKB) * 1024
+	f.writeSession.Buffer = buffer.NewWriteBuffer(thresholdBytes)
+	f.writeSession.Mu.Unlock()
 
 	return nil
 }
 
-// Close closes the file and flushes any remaining buffered writes
+// Close closes the file and releases the write session
 func (f *COSFile) Close() error {
-	// Flush any remaining buffered writes
-	if f.writeBuffer != nil && f.writeBuffer.Size() > 0 {
-		f.logger.Info("Flushing remaining buffer on close",
+	// Release write session (don't flush yet - let session manager handle it)
+	if f.writeSession != nil {
+		f.writeSession.Mu.Lock()
+		bufferSize := f.writeSession.Buffer.Size()
+		sessionID := f.writeSession.SessionID
+		f.writeSession.Mu.Unlock()
+
+		f.logger.Info("FILE CLOSE - Releasing write session",
+			"file_id", f.fileID,
+			"session_id", sessionID,
 			"path", f.path,
-			"bytes", f.writeBuffer.Size())
-		
-		if err := f.flushBuffer(); err != nil {
-			f.logger.Error("Failed to flush buffer on close",
-				"path", f.path,
-				"error", err)
-			return err
-		}
+			"buffer_size_bytes", bufferSize,
+			"buffer_size_mb", float64(bufferSize)/(1024*1024))
+
+		// Release session reference (session persists for other handles)
+		f.sessionManager.ReleaseSession(f.path)
 	}
 
-	// Log final statistics
+	// Log final statistics for this handle
 	if f.flushCount > 0 {
-		f.logger.Info("File closed with write statistics",
+		f.logger.Info("File handle closed with write statistics",
+			"file_id", f.fileID,
 			"path", f.path,
 			"total_flushes", f.flushCount,
 			"total_bytes", f.totalFlushed,
+			"total_writes", f.totalWrites,
 			"avg_flush_size", f.totalFlushed/int64(f.flushCount))
 	}
 
 	// Legacy path: handle old-style in-memory data if present
-	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && len(f.data) > 0 && f.writeBuffer == nil {
+	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && len(f.data) > 0 && f.writeSession == nil {
 		attrs := &types.POSIXAttributes{
 			Mode:  f.perm,
 			UID:   1000,
