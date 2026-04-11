@@ -6,7 +6,7 @@
 #   test_number: 1, 2, 3, or 4 to run a specific test, or omit to run all tests
 #   test_dir: optional test directory path (useful for running Test 2 after Test 1)
 
-set -e
+# Note: Not using 'set -e' to allow tests to continue even if one fails
 
 # Configuration
 MOUNT_POINT="${MOUNT_POINT:-/mnt/cos-nfs}"
@@ -57,24 +57,34 @@ if [ "$SPECIFIC_TEST" = "all" ] || [ "$SPECIFIC_TEST" = "1" ]; then
         grep -E "write: IOPS=|bw=" | head -2
     echo
     
-    # Wait a moment for file to be available
+    # Wait for file to be fully synced and available
     if [ "$SPECIFIC_TEST" = "all" ]; then
-        sleep 2
+        echo -e "${YELLOW}Waiting for file to be synced...${NC}"
+        sleep 5
     fi
 fi
 
 # Test 2: Sequential Read
 if [ "$SPECIFIC_TEST" = "all" ] || [ "$SPECIFIC_TEST" = "2" ]; then
     echo -e "${BLUE}Test 2: Sequential Read (100MB)${NC}"
-    echo -e "${YELLOW}Debug: Checking if write.0.0 file exists...${NC}"
-    if [ -f "$TEST_DIR/write.0.0" ]; then
-        ls -lh "$TEST_DIR/write.0.0"
+    
+    if [ "$SPECIFIC_TEST" = "2" ]; then
+        # Show debug info when running individual test
+        echo -e "${YELLOW}Debug: Checking if write.0.0 file exists...${NC}"
+        if [ -f "$TEST_DIR/write.0.0" ]; then
+            ls -lh "$TEST_DIR/write.0.0"
+        else
+            echo -e "${RED}Warning: write.0.0 file not found!${NC}"
+        fi
+        echo -e "${YELLOW}Running fio read test...${NC}"
+        fio --name=write --directory="$TEST_DIR" --rw=read \
+            --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1
     else
-        echo -e "${RED}Warning: write.0.0 file not found!${NC}"
+        # Clean output when running all tests
+        fio --name=write --directory="$TEST_DIR" --rw=read \
+            --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1 | \
+            grep -E "read: IOPS=|bw=" | head -2
     fi
-    echo -e "${YELLOW}Running fio read test...${NC}"
-    fio --name=write --directory="$TEST_DIR" --rw=read \
-        --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1
     echo
 fi
 
