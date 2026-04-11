@@ -1048,9 +1048,10 @@ func (f *COSFile) Close() error {
 			"ref_count", refCount,
 			"dirty", isDirty)
 
-		// If this is a zero-byte file that was truncated and has no active handles,
+		// If this is a zero-byte file that was truncated and this is the last handle,
 		// immediately sync it to COS to ensure it exists for NFS attribute operations
-		if sessionSize == 0 && isDirty && refCount == 0 && f.totalWrites == 0 {
+		// Note: refCount == 1 means this was the last handle (session starts at 1, we increment to 2 in Open)
+		if sessionSize == 0 && isDirty && refCount == 1 && f.totalWrites == 0 {
 			f.logger.Info("Immediately syncing zero-byte truncated file",
 				"file_id", f.fileID,
 				"path", f.path)
