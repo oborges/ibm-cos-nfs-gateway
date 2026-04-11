@@ -12,12 +12,14 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/cos"
+	"github.com/oborges/cos-nfs-gateway/internal/feature"
 	"github.com/oborges/cos-nfs-gateway/internal/health"
 	"github.com/oborges/cos-nfs-gateway/internal/lock"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/internal/nfs"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
+	"github.com/oborges/cos-nfs-gateway/internal/staging"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 	"go.uber.org/zap"
 )
@@ -128,12 +130,47 @@ func main() {
 		logging.Error("Failed to start health server", zap.Error(err))
 	}
 
+	// Initialize feature flags
+	featureFlags := feature.LoadFeatureFlags(cfg)
+	logging.Info("Feature flags loaded",
+		zap.Bool("staging_enabled", featureFlags.IsStagingEnabled()))
+
+	// Initialize staging components if enabled
+	var stagingManager *staging.StagingManager
+	var syncWorker *staging.SyncWorker
+	
+	if featureFlags.IsStagingEnabled() {
+		logging.Info("Initializing staging architecture",
+			zap.String("root_dir", cfg.Staging.RootDir),
+			zap.Int64("sync_threshold_mb", cfg.Staging.SyncThresholdMB),
+			zap.Int("sync_worker_count", cfg.Staging.SyncWorkerCount))
+		
+		// Create staging manager
+		stagingManager, err = staging.NewStagingManager(&cfg.Staging)
+		if err != nil {
+			logging.Fatal("Failed to initialize staging manager", zap.Error(err))
+		}
+		defer stagingManager.Shutdown()
+		
+		// Create COS client adapter for sync worker
+		cosClientAdapter := &staging.COSClientAdapter{Client: cosClient}
+		
+		// Create sync worker
+		syncWorker = staging.NewSyncWorker(stagingManager, cosClientAdapter, &cfg.Staging)
+		
+		// Start sync worker
+		syncWorker.Start()
+		defer syncWorker.Stop()
+		
+		logging.Info("Staging architecture initialized successfully")
+	}
+
 	// Initialize NFS filesystem and server
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
 	
 	// Create billy.Filesystem implementation with config
-	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance)
+	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
 	
 	// Wrap with null auth handler, then caching handler
 	authHandler := nfshelper.NewNullAuthHandler(cosFilesystem)

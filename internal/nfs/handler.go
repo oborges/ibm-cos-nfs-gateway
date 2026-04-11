@@ -16,7 +16,9 @@ import (
 	"github.com/go-git/go-billy/v5"
 	"github.com/oborges/cos-nfs-gateway/internal/buffer"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
+	"github.com/oborges/cos-nfs-gateway/internal/feature"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
+	"github.com/oborges/cos-nfs-gateway/internal/staging"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	nfs "github.com/willscott/go-nfs"
 	"go.uber.org/zap"
@@ -195,6 +197,10 @@ type COSFilesystem struct {
 	root           string
 	perfConfig     *config.PerformanceConfig
 	sessionManager *buffer.SessionManager
+	// Staging architecture components
+	stagingManager *staging.StagingManager
+	syncWorker     *staging.SyncWorker
+	featureFlags   *feature.FeatureFlags
 }
 
 // NewCOSFilesystem creates a new COS filesystem (deprecated, use NewCOSFilesystemWithConfig)
@@ -215,7 +221,7 @@ func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string)
 }
 
 // NewCOSFilesystemWithConfig creates a new COS filesystem with configuration
-func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig) *COSFilesystem {
+func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig, stagingManager *staging.StagingManager, syncWorker *staging.SyncWorker, featureFlags *feature.FeatureFlags) *COSFilesystem {
 	bufferSize := int64(perfConfig.WriteBufferKB) * 1024
 	sessionTimeout := 5 * time.Minute // Keep sessions alive for 5 minutes after last access
 	
@@ -226,9 +232,10 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 		"multipart_threshold_mb", perfConfig.MultipartThresholdMB,
 		"multipart_chunk_mb", perfConfig.MultipartChunkMB,
 		"read_ahead_kb", perfConfig.ReadAheadKB,
-		"session_timeout", sessionTimeout)
+		"session_timeout", sessionTimeout,
+		"staging_enabled", featureFlags.IsStagingEnabled())
 	
-	// Create session manager for path-scoped write buffering
+	// Create session manager for path-scoped write buffering (legacy path)
 	sessionManager := buffer.NewSessionManager(bufferSize, sessionTimeout)
 	
 	return &COSFilesystem{
@@ -237,6 +244,9 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 		root:           root,
 		perfConfig:     perfConfig,
 		sessionManager: sessionManager,
+		stagingManager: stagingManager,
+		syncWorker:     syncWorker,
+		featureFlags:   featureFlags,
 	}
 }
 
@@ -278,11 +288,14 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		flagStr += "APPEND|"
 	}
 	
+	useStagingPath := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled()
+	
 	fs.logger.Info("FILE OPEN",
 		"file_id", fileID,
 		"path", fullPath,
 		"flags", flagStr,
-		"perm", fmt.Sprintf("%o", perm))
+		"perm", fmt.Sprintf("%o", perm),
+		"staging_enabled", useStagingPath)
 
 	file := &COSFile{
 		ops:            fs.ops,
@@ -294,11 +307,33 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		perfConfig:     fs.perfConfig,
 		fileID:         fileID,
 		sessionManager: fs.sessionManager,
+		stagingManager: fs.stagingManager,
+		syncWorker:     fs.syncWorker,
+		featureFlags:   fs.featureFlags,
 	}
 
 	// Check if file exists
 	_, err := fs.ops.Stat(context.Background(), fullPath)
 	fileExists := err == nil
+
+	// If using staging path, get or create staging session for writable files
+	if useStagingPath && (flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0) {
+		session, err := fs.stagingManager.GetOrCreateSession(fullPath)
+		if err != nil {
+			fs.logger.Error("Failed to get staging session",
+				"file_id", fileID,
+				"path", fullPath,
+				"error", err)
+			return nil, err
+		}
+		file.stagingSession = session
+		session.IncrementRefCount()
+		
+		fs.logger.Info("Staging session acquired",
+			"file_id", fileID,
+			"path", fullPath,
+			"ref_count", session.GetRefCount())
+	}
 
 	// If creating a new file
 	if flag&os.O_CREATE != 0 && !fileExists {
@@ -308,31 +343,45 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 
 	// If truncating, clear the file
 	if flag&os.O_TRUNC != 0 {
-		// Truncate the file
-		attrs := &types.POSIXAttributes{
-			Mode:  perm,
-			UID:   1000,
-			GID:   1000,
-			Mtime: time.Now(),
+		if useStagingPath && file.stagingSession != nil {
+			// Truncate staging session
+			// This will be synced to COS later
+			file.stagingSession.Size = 0
+			file.stagingSession.Dirty = true
+			fs.stagingManager.MarkDirty(fullPath, 0)
+		} else {
+			// Legacy path: truncate directly to COS
+			attrs := &types.POSIXAttributes{
+				Mode:  perm,
+				UID:   1000,
+				GID:   1000,
+				Mtime: time.Now(),
+			}
+			err := fs.ops.WriteFile(context.Background(), fullPath, []byte{}, attrs)
+			if err != nil {
+				return nil, err
+			}
+			file.isNew = false
+			file.loaded = true
+			file.data = []byte{}
 		}
-		err := fs.ops.WriteFile(context.Background(), fullPath, []byte{}, attrs)
-		if err != nil {
-			return nil, err
-		}
-		file.isNew = false
-		file.loaded = true
-		file.data = []byte{}
 	}
 
 	// If appending to existing file, load it and set offset to end
 	if flag&os.O_APPEND != 0 && fileExists && flag&os.O_TRUNC == 0 {
-		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
-		if err != nil {
-			return nil, err
+		if useStagingPath && file.stagingSession != nil {
+			// Get size from staging session
+			file.offset = file.stagingSession.Size
+		} else {
+			// Legacy path: load from COS
+			data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
+			if err != nil {
+				return nil, err
+			}
+			file.data = data
+			file.loaded = true
+			file.offset = int64(len(data))
 		}
-		file.data = data
-		file.loaded = true
-		file.offset = int64(len(data))
 	}
 
 	return file, nil
@@ -364,8 +413,114 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	if info.IsDir() {
 		return fs.ops.DeleteDirectory(context.Background(), fullPath)
 	}
+
+	// Before deleting file, cleanup any active sessions to prevent data loss
+	// This ensures any buffered writes are flushed to COS before deletion
+	if err := fs.cleanupSessionsBeforeDelete(fullPath); err != nil {
+		fs.logger.Error("Failed to cleanup sessions before delete",
+			zap.String("path", fullPath),
+			zap.Error(err))
+		// Continue with deletion anyway - session cleanup is best-effort
+	}
+
 	return fs.ops.DeleteFile(context.Background(), fullPath)
 }
+// cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion
+func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
+	ctx := context.Background()
+
+	// Handle staging path (new architecture)
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		session, exists := fs.stagingManager.GetSession(path)
+		if exists && session.Dirty {
+			fs.logger.Info("Flushing staging session before delete",
+				zap.String("path", path),
+				zap.Int64("size", session.Size))
+
+			// Sync session to staging file
+			if err := session.Sync(); err != nil {
+				return fmt.Errorf("failed to sync staging session: %w", err)
+			}
+
+			// If sync worker is available, trigger immediate upload
+			if fs.syncWorker != nil {
+				// Read staging file
+				data, err := os.ReadFile(session.StagingPath)
+				if err != nil {
+					return fmt.Errorf("failed to read staging file: %w", err)
+				}
+
+				// Upload directly to COS
+				metadata := make(map[string]string)
+				if err := fs.syncWorker.UploadToCOS(ctx, path, data, metadata); err != nil {
+					return fmt.Errorf("failed to upload to COS: %w", err)
+				}
+
+				fs.logger.Info("Uploaded staging file to COS before delete",
+					zap.String("path", path),
+					zap.Int("size", len(data)))
+			}
+
+			// Cleanup session and staging file
+			if err := fs.stagingManager.CleanupSession(path, true); err != nil {
+				fs.logger.Error("Failed to cleanup staging session",
+					zap.String("path", path),
+					zap.Error(err))
+			}
+		}
+		return nil
+	}
+
+	// Handle legacy buffer path
+	if fs.sessionManager != nil {
+		session, exists := fs.sessionManager.GetSession(path)
+		if exists {
+			session.Mu.Lock()
+			bufferSize := session.Buffer.Size()
+			session.Mu.Unlock()
+
+			if bufferSize > 0 {
+				fs.logger.Info("Flushing legacy buffer session before delete",
+					zap.String("path", path),
+					zap.Int64("buffer_size", bufferSize))
+
+				// Get flush data from buffer
+				session.Mu.Lock()
+				data, _, err := session.Buffer.GetFlushData()
+				session.Mu.Unlock()
+
+				if err != nil {
+					return fmt.Errorf("failed to get flush data: %w", err)
+				}
+
+				if len(data) > 0 {
+					// Get current file attributes
+					attrs := &types.POSIXAttributes{
+						Mode:  0644,
+						UID:   1000,
+						GID:   1000,
+						Mtime: time.Now(),
+					}
+
+					// Upload to COS
+					if err := fs.ops.WriteFile(ctx, path, data, attrs); err != nil {
+						return fmt.Errorf("failed to flush buffer to COS: %w", err)
+					}
+
+					fs.logger.Info("Flushed legacy buffer to COS before delete",
+						zap.String("path", path),
+						zap.Int("size", len(data)))
+				}
+			}
+
+			// Close the session
+			fs.sessionManager.CloseSession(path)
+		}
+	}
+
+	return nil
+}
+
 
 // Join joins path elements
 func (fs *COSFilesystem) Join(elem ...string) string {
@@ -542,13 +697,18 @@ type COSFile struct {
 	data           []byte
 	loaded         bool
 	size           int64  // File size (for read-only files without data loaded)
-	writeSession   *buffer.WriteSession  // Shared write session (survives handle close)
+	writeSession   *buffer.WriteSession  // Shared write session (survives handle close) - LEGACY
 	flushCount     int    // Number of flushes performed
 	totalFlushed   int64  // Total bytes flushed
 	totalWrites    int    // Total number of Write() calls
 	perfConfig     *config.PerformanceConfig // Performance configuration
 	fileID         string // Unique file handle ID for tracking
-	sessionManager *buffer.SessionManager // Session manager for path-scoped buffering
+	sessionManager *buffer.SessionManager // Session manager for path-scoped buffering - LEGACY
+	// Staging architecture components
+	stagingSession *staging.WriteSession  // Staging write session
+	stagingManager *staging.StagingManager
+	syncWorker     *staging.SyncWorker
+	featureFlags   *feature.FeatureFlags
 }
 
 // Name returns the file name
@@ -558,6 +718,28 @@ func (f *COSFile) Name() string {
 
 // Read reads data from the file
 func (f *COSFile) Read(p []byte) (int, error) {
+	// STAGING PATH: Check staging session first for dirty files
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		// Read from staging session
+		n, err := f.stagingSession.Read(p, f.offset)
+		if err != nil && err != io.EOF {
+			f.logger.Error("Failed to read from staging session",
+				"path", f.path,
+				"offset", f.offset,
+				"error", err)
+			return 0, err
+		}
+		f.offset += int64(n)
+		
+		f.logger.Debug("Read from staging session",
+			"path", f.path,
+			"offset", f.offset-int64(n),
+			"bytes", n)
+		
+		return n, err
+	}
+
+	// LEGACY PATH: Original read logic
 	if err := f.ensureLoaded(); err != nil {
 		return 0, err
 	}
@@ -620,11 +802,41 @@ func (f *COSFile) Read(p []byte) (int, error) {
 
 // Write writes data to the file with session-based buffering
 func (f *COSFile) Write(p []byte) (int, error) {
+	f.totalWrites++
+
+	// STAGING PATH: Write to staging session
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		n, err := f.stagingSession.Write(p, f.offset)
+		if err != nil {
+			f.logger.Error("STAGING WRITE ERROR",
+				"file_id", f.fileID,
+				"path", f.path,
+				"offset", f.offset,
+				"bytes", len(p),
+				"error", err)
+			return 0, err
+		}
+
+		f.offset += int64(n)
+		
+		// Mark file as dirty and update size
+		f.stagingManager.MarkDirty(f.path, f.stagingSession.Size)
+
+		f.logger.Info("STAGING WRITE",
+			"file_id", f.fileID,
+			"path", f.path,
+			"offset", f.offset-int64(n),
+			"bytes", n,
+			"session_size", f.stagingSession.Size,
+			"write_count", f.totalWrites)
+
+		return n, nil
+	}
+
+	// LEGACY PATH: Original write logic
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return 0, err
 	}
-
-	f.totalWrites++
 
 	// Get or create write session for this path
 	if f.writeSession == nil {
@@ -812,7 +1024,34 @@ func (f *COSFile) flushSessionBuffer() error {
 
 // Close closes the file and releases the write session
 func (f *COSFile) Close() error {
-	// Release write session (don't flush yet - let session manager handle it)
+	// STAGING PATH: Release staging session
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		f.stagingSession.DecrementRefCount()
+		refCount := f.stagingSession.GetRefCount()
+		
+		f.logger.Info("FILE CLOSE - Releasing staging session",
+			"file_id", f.fileID,
+			"path", f.path,
+			"session_size", f.stagingSession.Size,
+			"ref_count", refCount,
+			"dirty", f.stagingSession.Dirty)
+
+		// Release session reference (session persists for other handles)
+		f.stagingManager.ReleaseSession(f.path)
+		
+		// Log final statistics for this handle
+		if f.totalWrites > 0 {
+			f.logger.Info("File handle closed with write statistics",
+				"file_id", f.fileID,
+				"path", f.path,
+				"total_writes", f.totalWrites,
+				"session_size", f.stagingSession.Size)
+		}
+		
+		return nil
+	}
+
+	// LEGACY PATH: Release write session (don't flush yet - let session manager handle it)
 	if f.writeSession != nil {
 		f.writeSession.Mu.Lock()
 		bufferSize := f.writeSession.Buffer.Size()
@@ -842,7 +1081,7 @@ func (f *COSFile) Close() error {
 	}
 
 	// Legacy path: handle old-style in-memory data if present
-	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && len(f.data) > 0 && f.writeSession == nil {
+	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && len(f.data) > 0 && f.writeSession == nil && f.stagingSession == nil {
 		attrs := &types.POSIXAttributes{
 			Mode:  f.perm,
 			UID:   1000,

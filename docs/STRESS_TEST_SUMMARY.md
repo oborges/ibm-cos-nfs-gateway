@@ -1,319 +1,337 @@
-# Stress Testing Resources Summary
+# Stress Test Summary
 
-This document provides an overview of all stress testing resources available for the COS NFS Gateway.
+## Quick Reference
 
-## 📚 Documentation
-
-### 1. Comprehensive Guide
-**File**: [`docs/STRESS_TESTING_GUIDE.md`](STRESS_TESTING_GUIDE.md)
-
-**Purpose**: Complete reference for stress testing the gateway
-
-**Contents**:
-- Prerequisites and tool installation
-- 10 different test categories (sequential, random, mixed, small files, large files, etc.)
-- Performance baselines and targets
-- Monitoring during tests
-- Troubleshooting guide
-- Validation checklist
-
-**When to use**: For detailed understanding of testing methodology and comprehensive testing
-
----
-
-### 2. Quick Start Guide
-**File**: [`docs/QUICK_START_STRESS_TEST.md`](QUICK_START_STRESS_TEST.md)
-
-**Purpose**: Fast-track guide to get started with stress testing
-
-**Contents**:
-- Quick installation steps
-- 3 testing options (full suite, quick check, individual tests)
-- Result interpretation guide
-- Common troubleshooting
-- Example test commands
-
-**When to use**: When you want to quickly validate performance without reading extensive documentation
-
----
-
-## 🔧 Testing Scripts
-
-### 1. Comprehensive Test Suite
-**File**: [`scripts/run_stress_tests.sh`](../scripts/run_stress_tests.sh)
-
-**Purpose**: Automated comprehensive stress testing
-
-**Features**:
-- 9 different test scenarios
-- Automated result collection
-- JSON output for analysis
-- Summary report generation
-- Color-coded output
-- Prerequisite checking
-
-**Tests included**:
-1. Sequential Write (100MB)
-2. Sequential Read (100MB)
-3. Random Read (4K blocks, 60s)
-4. Random Write (4K blocks, 60s)
-5. Mixed Read/Write (70/30, 60s)
-6. Small File Operations (1000 files)
-7. Large File Operations (500MB)
-8. Direct I/O
-9. Concurrent Access (8 jobs)
-
-**Duration**: ~15-20 minutes
-
-**Usage**:
+### Run Tests
 ```bash
-./scripts/run_stress_tests.sh
+# Quick test (5-10 min)
+export MOUNT_PATH="/mnt/cos-nfs"
+export QUICK_MODE=true
+./scripts/mountpoint_stress_test.sh
+
+# Full test (30-60 min)
+export MOUNT_PATH="/mnt/cos-nfs"
+./scripts/mountpoint_stress_test.sh
 ```
 
-**Output**: Results saved in `./test-results-YYYYMMDD-HHMMSS/`
-
----
-
-### 2. Quick Test Script
-**File**: [`scripts/quick_test.sh`](../scripts/quick_test.sh)
-
-**Purpose**: Fast performance validation
-
-**Features**:
-- 4 essential tests
-- Quick execution
-- Simple output
-- Minimal dependencies
-
-**Tests included**:
-1. Sequential Write (100MB)
-2. Sequential Read (100MB)
-3. Random IOPS (30s)
-4. Small File Operations (100 files)
-
-**Duration**: ~5 minutes
-
-**Usage**:
+### View Results
 ```bash
-./scripts/quick_test.sh
+cat stress-test-results-*/summary_report.txt
 ```
 
----
+## Documentation Structure
 
-## 📊 Performance Targets
+### 📚 Complete Documentation Set
 
-### Expected Performance
+1. **[`README_STRESS_TEST.md`](../README_STRESS_TEST.md)** - Main overview
+   - Test categories and modes
+   - Expected performance metrics
+   - Results analysis
+   - Best practices
 
-| Metric | Target | Acceptable | Poor |
-|--------|--------|------------|------|
-| **Sequential Read** | >100 MB/s | >50 MB/s | <20 MB/s |
-| **Sequential Write** | >50 MB/s | >20 MB/s | <5 MB/s |
-| **Random Read IOPS (4K)** | >200 | >100 | <50 |
-| **Random Write IOPS (4K)** | >100 | >50 | <20 |
-| **Small File Create (1000)** | <30s | <60s | >120s |
-| **Large File (1GB) Read** | >100 MB/s | >50 MB/s | <20 MB/s |
-| **Large File (1GB) Write** | >50 MB/s | >20 MB/s | <5 MB/s |
+2. **[`docs/QUICK_MOUNTPOINT_TEST.md`](./QUICK_MOUNTPOINT_TEST.md)** - Quick start
+   - TL;DR commands
+   - Prerequisites
+   - Common troubleshooting
+   - FAQ
 
-### Cache Performance
+3. **[`docs/MOUNTPOINT_STRESS_TEST.md`](./MOUNTPOINT_STRESS_TEST.md)** - Comprehensive guide
+   - Detailed test descriptions
+   - All test categories
+   - Advanced configuration
+   - Monitoring strategies
 
-- **Cache Hit Rate**: >50% for repeated reads
-- **Metadata Cache**: <10ms lookup time
-- **Data Cache**: Significant reduction in COS API calls
+4. **[`docs/STRESS_TEST_EXECUTION_GUIDE.md`](./STRESS_TEST_EXECUTION_GUIDE.md)** - Step-by-step
+   - Execution checklist
+   - Monitoring setup
+   - Result analysis
+   - Post-test actions
 
----
+5. **[`scripts/mountpoint_stress_test.sh`](../scripts/mountpoint_stress_test.sh)** - Automated script
+   - All tests automated
+   - Quick and full modes
+   - Automatic cleanup
+   - JSON result output
 
-## 🚀 Quick Start
+## Test Categories
 
-### Step 1: Install Prerequisites
+### 1. Sequential I/O
+**Tests:** Large file writes, concurrent writes, variable block sizes, cold/warm reads
 
+**Current Performance:**
+- Write: 1-5 MB/s
+- Read (cold): 10-50 MB/s
+- Read (warm): 100-500 MB/s
+
+**Target (MVP):**
+- Write: 20-100 MB/s (10-50x improvement)
+- Read: 50-200 MB/s
+
+### 2. Random I/O
+**Tests:** 4K random writes, reads, mixed workload
+
+**Current Performance:**
+- Write: 10-50 IOPS
+- Read: 100-500 IOPS
+
+**Target (MVP):**
+- Write: 100-500 IOPS (10x improvement)
+- Read: 500-2000 IOPS
+
+### 3. Metadata Operations
+**Tests:** File creation, directory listing, file deletion
+
+**Current Performance:**
+- Creation: 5-20 files/sec
+- Listing: 100-1000 files/sec
+- Deletion: 10-50 files/sec
+
+**Target (MVP):**
+- Creation: 50-200 files/sec (10x improvement)
+
+### 4. NFS-Specific
+**Tests:** File reopen patterns, attribute caching
+
+**Current Performance:**
+- Reopen cycles: High latency due to buffer churn
+
+**Target (MVP):**
+- Reopen cycles: Low latency with path-scoped sessions
+
+## Key Bottlenecks Identified
+
+### 1. Write Buffer Churn ⚠️ CRITICAL
+**Problem:** Handle-scoped buffers destroyed on file reopen
+**Impact:** Every small write triggers full-object GET+PUT
+**Solution:** Path-scoped write sessions (staging architecture)
+
+### 2. Full-Object Operations ⚠️ HIGH
+**Problem:** No partial object updates
+**Impact:** 16MB write requires downloading entire object first
+**Solution:** Local staging layer with async sync
+
+### 3. Metadata Overhead ⚠️ MEDIUM
+**Problem:** High NFS round-trip latency
+**Impact:** Slow file creation/deletion rates
+**Solution:** Batch operations, attribute caching
+
+### 4. Cache Inefficiency ⚠️ MEDIUM
+**Problem:** Poor hit rates on small files
+**Impact:** Repeated downloads of same data
+**Solution:** Improved chunk-based caching (already implemented)
+
+## Performance Improvement Roadmap
+
+### Phase 1: Baseline (Current) ✅
+- [x] Implement streaming reads with range requests
+- [x] Add chunk-based caching
+- [x] Fix critical bugs (truncate, stale handles, etc.)
+- [x] Create stress testing framework
+- **Result:** 1-5 MB/s write, 10-50 MB/s read
+
+### Phase 2: MVP Staging (In Progress) 🔄
+- [x] Design staging architecture
+- [x] Create MVP implementation plan
+- [x] Implement foundation (feature flags, config)
+- [ ] Implement StagingManager and WriteSession
+- [ ] Wire into NFS handler
+- [ ] Test and validate
+- **Target:** 20-100 MB/s write (10-50x improvement)
+
+### Phase 3: Production Staging (Future) ⏳
+- [ ] Add metadata persistence
+- [ ] Implement crash recovery
+- [ ] Add advanced sync strategies
+- [ ] Optimize worker pools
+- [ ] Production hardening
+- **Target:** 100-500 MB/s write (network limited)
+
+### Phase 4: Advanced Optimization (Future) ⏳
+- [ ] Parallel multipart uploads
+- [ ] Intelligent prefetching
+- [ ] Advanced caching strategies
+- [ ] Performance monitoring dashboard
+- **Target:** 200-1000 MB/s read, 500-2000 IOPS
+
+## Usage Workflow
+
+### 1. Initial Baseline
 ```bash
-# Ubuntu/Debian
-sudo apt-get install -y fio jq bc
-
-# macOS
-brew install fio jq bc
+# Run tests on current architecture
+./scripts/mountpoint_stress_test.sh
+mv stress-test-results-* baseline-current/
 ```
 
-### Step 2: Mount NFS
-
-```bash
-sudo mkdir -p /mnt/cos-nfs
-sudo mount -t nfs -o vers=3,tcp,rsize=1048576,wsize=1048576 \
-  localhost:/bucket /mnt/cos-nfs
+### 2. Enable Staging (After MVP)
+```yaml
+# configs/config.yaml
+staging:
+  enabled: true
+  root_dir: "/var/lib/cos-nfs-gateway/staging"
+  sync_threshold: 16777216  # 16MB
+  sync_interval: 30s
 ```
 
-### Step 3: Run Tests
-
-**Option A - Quick Test (5 minutes)**:
+### 3. Re-test with Staging
 ```bash
-./scripts/quick_test.sh
+# Restart gateway with staging enabled
+sudo systemctl restart cos-nfs-gateway
+
+# Run tests again
+./scripts/mountpoint_stress_test.sh
+mv stress-test-results-* baseline-staging/
 ```
 
-**Option B - Full Suite (15-20 minutes)**:
+### 4. Compare Results
 ```bash
-./scripts/run_stress_tests.sh
+# Compare write performance
+echo "Before Staging:"
+jq -r '.jobs[0].write.bw_bytes / 1048576' \
+    baseline-current/seq-write-large.json
+
+echo "After Staging:"
+jq -r '.jobs[0].write.bw_bytes / 1048576' \
+    baseline-staging/seq-write-large.json
+
+# Calculate improvement
+# Expected: 10-50x improvement in write throughput
 ```
 
-**Option C - Manual Test**:
+## Monitoring During Tests
+
+### Essential Metrics
+
+**Gateway Side:**
+- CPU usage (should be < 80%)
+- Memory usage (watch for leaks)
+- Network throughput
+- COS API calls (rate limits)
+
+**Client Side:**
+- NFS operations/sec
+- Network utilization
+- I/O wait time
+- Cache hit ratio
+
+**COS Side:**
+- Request rate
+- Bandwidth usage
+- Error rate
+- Latency
+
+### Monitoring Commands
+
 ```bash
-# Sequential write
-fio --name=test --directory=/mnt/cos-nfs \
-    --rw=write --bs=1M --size=100M --numjobs=1
+# Gateway monitoring
+ssh gateway-host 'top -bn1 | head -20'
+journalctl -u cos-nfs-gateway -f
 
-# Sequential read
-fio --name=test --directory=/mnt/cos-nfs \
-    --rw=read --bs=1M --size=100M --numjobs=1
-```
-
----
-
-## 📈 Monitoring
-
-### During Tests
-
-**Watch Gateway Logs**:
-```bash
-tail -f /var/log/cos-nfs-gateway/gateway.log
-```
-
-**Monitor Resources**:
-```bash
-# CPU and memory
-top -p $(pgrep nfs-gateway)
-
-# Network I/O
+# Client monitoring
+iostat -x 5
+nfsstat -c 5
 iftop -i eth0
 
-# NFS statistics
-nfsstat -c
+# Results monitoring
+watch -n 5 'tail -20 stress-test-results-*/seq-write-large.log'
 ```
 
-### After Tests
+## Troubleshooting Quick Reference
 
-**Check Results**:
-```bash
-# View summary
-cat ./test-results-*/SUMMARY.txt
+| Issue | Check | Solution |
+|-------|-------|----------|
+| Tests hang | `nfsstat -c` | Remount NFS |
+| Permission denied | NFS exports | Add client IP |
+| Poor performance | Mount options | Use rsize/wsize=1048576 |
+| Out of space | `df -h` | Clean up test files |
+| Gateway errors | Logs | Check config, restart |
+| Network issues | `ping gateway` | Check connectivity |
 
-# Analyze JSON results
-jq '.jobs[0].read.bw' ./test-results-*/02-seq-read.json
-```
+## Expected Test Duration
 
----
+| Mode | Duration | File Sizes | Tests |
+|------|----------|------------|-------|
+| Quick | 5-10 min | 256MB | Basic coverage |
+| Full | 30-60 min | 1GB | Comprehensive |
+| Custom | Variable | Configurable | Selective |
 
-## 🔍 Interpreting Results
-
-### Good Performance Example
-
-```
-Sequential Write: 45.2 MB/s ✓
-Sequential Read:  78.5 MB/s ✓
-Random Read:      156 IOPS  ✓
-Random Write:     89 IOPS   ✓
-```
-
-### Poor Performance Example (Needs Investigation)
+## Result Files
 
 ```
-Sequential Write: 2.1 MB/s  ✗ (Target: >20 MB/s)
-Sequential Read:  15.3 MB/s ✗ (Target: >50 MB/s)
-Random Read:      23 IOPS   ✗ (Target: >100 IOPS)
-Random Write:     12 IOPS   ✗ (Target: >50 IOPS)
+stress-test-results-YYYYMMDD-HHMMSS/
+├── summary_report.txt          # Human-readable summary
+├── seq-write-large.json        # Sequential write (large file)
+├── seq-write-concurrent.json   # Concurrent writes
+├── seq-write-4k.json          # 4K block writes
+├── seq-write-64k.json         # 64K block writes
+├── seq-write-256k.json        # 256K block writes
+├── seq-write-1m.json          # 1M block writes
+├── seq-read-cold.json         # Cold cache reads
+├── seq-read-warm.json         # Warm cache reads
+├── rand-write.json            # Random writes
+├── rand-read.json             # Random reads
+├── rand-mixed.json            # Mixed random I/O
+├── metadata-create.json       # File creation
+├── metadata-list.json         # Directory listing
+├── metadata-delete.json       # File deletion
+└── nfs-reopen.json           # Reopen patterns
 ```
 
-**Action**: Check logs, verify cache configuration, test network latency to COS
+## Success Criteria
+
+### Baseline Tests (Current)
+- ✅ All tests complete without errors
+- ✅ Results consistent across multiple runs
+- ✅ No gateway crashes or hangs
+- ✅ Performance matches expected baseline
+
+### MVP Staging Tests (Target)
+- ✅ 10-50x improvement in write throughput
+- ✅ No data loss or corruption
+- ✅ Read-after-write consistency maintained
+- ✅ Graceful handling of failures
+
+### Production Readiness
+- ✅ Sustained performance under load
+- ✅ Crash recovery without data loss
+- ✅ Monitoring and alerting functional
+- ✅ Documentation complete
+
+## Next Steps
+
+1. **Run Baseline Tests** ← START HERE
+   - Execute quick test
+   - Document results
+   - Identify bottlenecks
+
+2. **Complete MVP Implementation**
+   - Finish StagingManager
+   - Wire into NFS handler
+   - Add unit tests
+
+3. **Test MVP**
+   - Enable staging
+   - Run stress tests
+   - Measure improvement
+
+4. **Iterate and Optimize**
+   - Tune configuration
+   - Address issues
+   - Re-test
+
+5. **Production Deployment**
+   - Gradual rollout
+   - Monitor metrics
+   - Validate performance
+
+## Resources
+
+- **Main README:** [`README_STRESS_TEST.md`](../README_STRESS_TEST.md)
+- **Quick Start:** [`docs/QUICK_MOUNTPOINT_TEST.md`](./QUICK_MOUNTPOINT_TEST.md)
+- **Full Guide:** [`docs/MOUNTPOINT_STRESS_TEST.md`](./MOUNTPOINT_STRESS_TEST.md)
+- **Execution Guide:** [`docs/STRESS_TEST_EXECUTION_GUIDE.md`](./STRESS_TEST_EXECUTION_GUIDE.md)
+- **Staging Architecture:** [`docs/STAGING_ARCHITECTURE_COMPLETE.md`](./STAGING_ARCHITECTURE_COMPLETE.md)
+- **MVP Plan:** [`docs/MVP_IMPLEMENTATION_PLAN.md`](./MVP_IMPLEMENTATION_PLAN.md)
 
 ---
 
-## 🐛 Common Issues
-
-### Issue: Slow Performance
-
-**Symptoms**: All metrics below targets
-
-**Checks**:
-1. Network latency to COS: `ping s3.us-south.cloud-object-storage.appdomain.cloud`
-2. Cache enabled: `grep cache /etc/cos-nfs-gateway/config.yaml`
-3. Mount options: `mount | grep cos-nfs` (should see rsize/wsize=1048576)
-4. Gateway errors: `grep -i error /var/log/cos-nfs-gateway/gateway.log`
-
-### Issue: Test Script Fails
-
-**Symptoms**: Script exits with error
-
-**Checks**:
-1. fio installed: `which fio`
-2. NFS mounted: `mountpoint /mnt/cos-nfs`
-3. Write permissions: `touch /mnt/cos-nfs/test && rm /mnt/cos-nfs/test`
-4. Disk space: `df -h /mnt/cos-nfs`
-
-### Issue: Inconsistent Results
-
-**Symptoms**: Performance varies significantly between runs
-
-**Possible causes**:
-- Network congestion
-- COS throttling
-- Cache warming (first run slower)
-- Background processes
-
-**Solution**: Run tests multiple times, use median values
-
----
-
-## 📋 Testing Checklist
-
-Before running stress tests:
-- [ ] Gateway is running and healthy
-- [ ] NFS is mounted with correct options
-- [ ] fio, jq, bc are installed
-- [ ] Sufficient disk space available
-- [ ] No other heavy processes running
-
-After running stress tests:
-- [ ] All tests completed without errors
-- [ ] Performance meets acceptable targets
-- [ ] No errors in gateway logs
-- [ ] Cache hit rate is reasonable (>50%)
-- [ ] Memory usage is stable
-- [ ] Results documented
-
----
-
-## 🎯 Next Steps
-
-After completing stress tests:
-
-1. **Analyze Results**: Compare against baselines
-2. **Identify Bottlenecks**: Use profiling if needed
-3. **Tune Configuration**: Adjust cache sizes, chunk sizes
-4. **Re-test**: Validate improvements
-5. **Document**: Record final performance characteristics
-6. **Deploy**: Move to production if targets are met
-
----
-
-## 📞 Getting Help
-
-If you encounter issues:
-
-1. Check the [Comprehensive Guide](STRESS_TESTING_GUIDE.md) for detailed troubleshooting
-2. Review gateway logs for errors
-3. Verify network connectivity to IBM Cloud COS
-4. Check system resources (CPU, memory, network)
-5. Open an issue on GitHub with test results and logs
-
----
-
-## 📝 Additional Resources
-
-- [Main README](../README.md) - Project overview
-- [Architecture](../ARCHITECTURE.md) - System design
-- [Performance Improvements](PERFORMANCE_IMPROVEMENTS.md) - Optimization history
-- [Deployment Guide](DEPLOYMENT_AND_TESTING.md) - Production deployment
-
----
-
-**Last Updated**: 2026-04-11
-
-**Version**: 1.0
+**Ready to test?** Run: `export MOUNT_PATH="/mnt/cos-nfs" && export QUICK_MODE=true && ./scripts/mountpoint_stress_test.sh`
