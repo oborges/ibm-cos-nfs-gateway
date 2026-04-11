@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/oborges/cos-nfs-gateway/internal/buffer"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	nfs "github.com/willscott/go-nfs"
@@ -54,6 +55,19 @@ func (l *Logger) Error(msg string, keysAndValues ...interface{}) {
 		}
 	}
 	l.zap.Error(msg, fields...)
+}
+
+// Debug logs a debug message
+func (l *Logger) Debug(msg string, keysAndValues ...interface{}) {
+	fields := make([]zap.Field, 0, len(keysAndValues)/2)
+	for i := 0; i < len(keysAndValues); i += 2 {
+		if i+1 < len(keysAndValues) {
+			key := fmt.Sprint(keysAndValues[i])
+			value := keysAndValues[i+1]
+			fields = append(fields, zap.Any(key, value))
+		}
+	}
+	l.zap.Debug(msg, fields...)
 }
 
 // COSHandler implements nfs.Handler interface for IBM Cloud COS
@@ -448,16 +462,19 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 
 // COSFile implements billy.File interface
 type COSFile struct {
-	ops    *posix.OperationsHandler
-	logger *Logger
-	path   string
-	flag   int
-	perm   os.FileMode
-	offset int64
-	isNew  bool
-	data   []byte
-	loaded bool
-	size   int64  // File size (for read-only files without data loaded)
+	ops        *posix.OperationsHandler
+	logger     *Logger
+	path       string
+	flag       int
+	perm       os.FileMode
+	offset     int64
+	isNew      bool
+	data       []byte
+	loaded     bool
+	size       int64  // File size (for read-only files without data loaded)
+	writeBuffer *buffer.WriteBuffer  // Write buffer for efficient writes
+	flushCount  int    // Number of flushes performed
+	totalFlushed int64  // Total bytes flushed
 }
 
 // Name returns the file name
@@ -469,6 +486,20 @@ func (f *COSFile) Name() string {
 func (f *COSFile) Read(p []byte) (int, error) {
 	if err := f.ensureLoaded(); err != nil {
 		return 0, err
+	}
+
+	// Check write buffer first for read-after-write consistency
+	if f.writeBuffer != nil {
+		bufferedData := f.writeBuffer.Read(f.offset, int64(len(p)))
+		if len(bufferedData) > 0 {
+			n := copy(p, bufferedData)
+			f.offset += int64(n)
+			f.logger.Debug("Read from write buffer",
+				"path", f.path,
+				"offset", f.offset-int64(n),
+				"bytes", n)
+			return n, nil
+		}
 	}
 
 	// If data is loaded in memory (writable file), use it
@@ -509,29 +540,174 @@ func (f *COSFile) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Write writes data to the file
+// Write writes data to the file with buffering
 func (f *COSFile) Write(p []byte) (int, error) {
 	if err := f.ensureLoaded(); err != nil && !f.isNew {
 		return 0, err
 	}
 
-	// Extend data if necessary
-	needed := f.offset + int64(len(p))
-	if needed > int64(len(f.data)) {
-		newData := make([]byte, needed)
-		copy(newData, f.data)
-		f.data = newData
+	// Initialize write buffer if needed
+	if f.writeBuffer == nil {
+		f.writeBuffer = buffer.NewWriteBuffer(8 * 1024 * 1024) // 8MB threshold
+		f.logger.Info("Initialized write buffer",
+			"path", f.path,
+			"threshold", "8MB")
 	}
 
-	n := copy(f.data[f.offset:], p)
+	// Write to buffer
+	n, err := f.writeBuffer.Write(f.offset, p)
+	if err != nil {
+		f.logger.Error("Write buffer error",
+			"path", f.path,
+			"offset", f.offset,
+			"bytes", len(p),
+			"error", err)
+		return 0, err
+	}
+
 	f.offset += int64(n)
+
+	// Check if we should flush
+	if f.writeBuffer.ShouldFlush() {
+		f.logger.Info("Write buffer threshold reached, flushing",
+			"path", f.path,
+			"buffer_size", f.writeBuffer.Size(),
+			"threshold", "8MB")
+		
+		if err := f.flushBuffer(); err != nil {
+			f.logger.Error("Failed to flush buffer",
+				"path", f.path,
+				"error", err)
+			return n, err
+		}
+	}
+
 	return n, nil
 }
 
-// Close closes the file and writes changes back to COS
+// flushBuffer flushes the write buffer to COS
+func (f *COSFile) flushBuffer() error {
+	if f.writeBuffer == nil || f.writeBuffer.Size() == 0 {
+		return nil
+	}
+
+	start := time.Now()
+	
+	// Get data to flush
+	data, startOffset, err := f.writeBuffer.GetFlushData()
+	if err != nil {
+		f.logger.Error("Failed to get flush data",
+			"path", f.path,
+			"error", err)
+		return err
+	}
+	flushSize := int64(len(data))
+	
+	f.logger.Info("Flushing write buffer",
+		"path", f.path,
+		"bytes", flushSize,
+		"start_offset", startOffset,
+		"flush_count", f.flushCount+1)
+
+	// For new files or full rewrites, just write the data
+	if f.isNew || startOffset == 0 {
+		attrs := &types.POSIXAttributes{
+			Mode:  f.perm,
+			UID:   1000,
+			GID:   1000,
+			Mtime: time.Now(),
+		}
+		
+		err := f.ops.WriteFile(context.Background(), f.path, data, attrs)
+		if err != nil {
+			f.logger.Error("Failed to write file during flush",
+				"path", f.path,
+				"bytes", flushSize,
+				"error", err)
+			return err
+		}
+	} else {
+		// For appends/updates, we need to read existing data and merge
+		// This is a limitation of COS - we can't do partial updates
+		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
+		if err != nil && !strings.Contains(err.Error(), "not found") {
+			f.logger.Error("Failed to read existing file for merge",
+				"path", f.path,
+				"error", err)
+			return err
+		}
+
+		// Merge the data
+		needed := startOffset + int64(len(data))
+		if needed > int64(len(existingData)) {
+			newData := make([]byte, needed)
+			copy(newData, existingData)
+			existingData = newData
+		}
+		copy(existingData[startOffset:], data)
+
+		attrs := &types.POSIXAttributes{
+			Mode:  f.perm,
+			UID:   1000,
+			GID:   1000,
+			Mtime: time.Now(),
+		}
+		
+		err = f.ops.WriteFile(context.Background(), f.path, existingData, attrs)
+		if err != nil {
+			f.logger.Error("Failed to write merged file during flush",
+				"path", f.path,
+				"bytes", len(existingData),
+				"error", err)
+			return err
+		}
+	}
+
+	duration := time.Since(start)
+	f.flushCount++
+	f.totalFlushed += flushSize
+
+	f.logger.Info("Write buffer flushed successfully",
+		"path", f.path,
+		"bytes", flushSize,
+		"duration_ms", duration.Milliseconds(),
+		"throughput_mbps", float64(flushSize)/duration.Seconds()/1024/1024,
+		"total_flushes", f.flushCount,
+		"total_flushed", f.totalFlushed)
+
+	// Clear the buffer after successful flush
+	f.writeBuffer = buffer.NewWriteBuffer(8 * 1024 * 1024)
+
+	return nil
+}
+
+// Close closes the file and flushes any remaining buffered writes
 func (f *COSFile) Close() error {
-	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && (f.isNew || len(f.data) > 0) {
-		// Write the data back to COS
+	// Flush any remaining buffered writes
+	if f.writeBuffer != nil && f.writeBuffer.Size() > 0 {
+		f.logger.Info("Flushing remaining buffer on close",
+			"path", f.path,
+			"bytes", f.writeBuffer.Size())
+		
+		if err := f.flushBuffer(); err != nil {
+			f.logger.Error("Failed to flush buffer on close",
+				"path", f.path,
+				"error", err)
+			return err
+		}
+	}
+
+	// Log final statistics
+	if f.flushCount > 0 {
+		f.logger.Info("File closed with write statistics",
+			"path", f.path,
+			"total_flushes", f.flushCount,
+			"total_bytes", f.totalFlushed,
+			"avg_flush_size", f.totalFlushed/int64(f.flushCount))
+	}
+
+	// Legacy path: handle old-style in-memory data if present
+	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 && len(f.data) > 0 && f.writeBuffer == nil {
 		attrs := &types.POSIXAttributes{
 			Mode:  f.perm,
 			UID:   1000,
@@ -543,6 +719,7 @@ func (f *COSFile) Close() error {
 			return err
 		}
 	}
+	
 	return nil
 }
 
