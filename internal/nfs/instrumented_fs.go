@@ -180,9 +180,9 @@ func (ifs *InstrumentedFilesystem) GetPathStats(path string) map[string]interfac
 	return map[string]interface{}{
 		"total_calls":           callCount,
 		"duration_seconds":      duration.Seconds(),
-		"avg_call_gap_ms":       avgCallGap.Milliseconds(),
-		"avg_return_gap_ms":     avgReturnGap.Milliseconds(),
-		"max_return_gap_ms":     maxReturnGap.Milliseconds(),
+		"avg_call_gap_us":       avgCallGap.Microseconds(),
+		"avg_return_gap_us":     avgReturnGap.Microseconds(),
+		"max_return_gap_us":     maxReturnGap.Microseconds(),
 		"calls_per_second":      float64(callCount) / duration.Seconds(),
 		"gaps_measured":         len(tracker.gapTimes),
 	}
