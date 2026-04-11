@@ -244,6 +244,36 @@ func (fs *COSFilesystem) Open(filename string) (billy.File, error) {
 func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	fullPath := fs.Join(fs.root, filename)
 
+	// Generate unique file handle ID for tracking
+	fileID := fmt.Sprintf("%p", &fullPath)
+	
+	// Log file open with detailed flags
+	flagStr := ""
+	if flag&os.O_RDONLY != 0 {
+		flagStr += "RDONLY|"
+	}
+	if flag&os.O_WRONLY != 0 {
+		flagStr += "WRONLY|"
+	}
+	if flag&os.O_RDWR != 0 {
+		flagStr += "RDWR|"
+	}
+	if flag&os.O_CREATE != 0 {
+		flagStr += "CREATE|"
+	}
+	if flag&os.O_TRUNC != 0 {
+		flagStr += "TRUNC|"
+	}
+	if flag&os.O_APPEND != 0 {
+		flagStr += "APPEND|"
+	}
+	
+	fs.logger.Info("FILE OPEN",
+		"file_id", fileID,
+		"path", fullPath,
+		"flags", flagStr,
+		"perm", fmt.Sprintf("%o", perm))
+
 	file := &COSFile{
 		ops:        fs.ops,
 		logger:     fs.logger,
@@ -252,6 +282,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		perm:       perm,
 		offset:     0,
 		perfConfig: fs.perfConfig,
+		fileID:     fileID,
 	}
 
 	// Check if file exists
@@ -503,7 +534,9 @@ type COSFile struct {
 	writeBuffer  *buffer.WriteBuffer  // Write buffer for efficient writes
 	flushCount   int    // Number of flushes performed
 	totalFlushed int64  // Total bytes flushed
+	totalWrites  int    // Total number of Write() calls
 	perfConfig   *config.PerformanceConfig // Performance configuration
+	fileID       string // Unique file handle ID for tracking
 }
 
 // Name returns the file name
