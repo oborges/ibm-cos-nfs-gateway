@@ -504,11 +504,8 @@ func (f *COSFile) Read(p []byte) (int, error) {
 	n := copy(p, data)
 	f.offset += int64(n)
 	
-	// Return EOF if we're now at end of file
-	if f.offset >= f.size {
-		return n, io.EOF
-	}
-	
+	// IMPORTANT: Per io.Reader contract, don't return EOF with data
+	// Return data with nil error, EOF will be returned on next call
 	return n, nil
 }
 
@@ -630,8 +627,10 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 
 	n := copy(p, data)
 	
-	// Return EOF if this read extends to or past end of file
-	if off+int64(n) >= f.size {
+	// Per io.ReaderAt contract: return EOF only if no bytes were read
+	// If we read some bytes but less than requested, that's still success
+	// The caller will detect EOF on the next call when off >= size
+	if n < len(p) && off+int64(n) >= f.size {
 		return n, io.EOF
 	}
 	
