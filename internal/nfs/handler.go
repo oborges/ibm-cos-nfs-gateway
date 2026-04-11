@@ -515,8 +515,8 @@ func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 func (fs *COSFilesystem) Remove(filename string) error {
 	fullPath := fs.Join(fs.root, filename)
 
-	// Check if it's a directory
-	info, err := fs.ops.Stat(context.Background(), fullPath)
+	// Check if it's a directory (intercepting Staging files via fs.Stat)
+	info, err := fs.Stat(filename)
 	if err != nil {
 		return err
 	}
