@@ -1301,11 +1301,12 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
-	// For read-only files, don't load entire file into memory
-	// Instead, use lazy loading and read from COS on demand
-	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
-		// Read-only mode - get file size but don't load data
-		// Data will be fetched on-demand in Read/ReadAt operations
+	// For files opened for writing (WRONLY or RDWR), only get size
+	// The write buffer system will handle data efficiently on first write
+	// We don't need to download the file until flush time (read-modify-write)
+	if f.flag&(os.O_WRONLY|os.O_RDWR) != 0 {
+		// Writable file - get file size but don't load data
+		// Write session will be created on first Write() call
 		info, err := f.ops.Stat(context.Background(), f.path)
 		if err != nil {
 			return err
@@ -1316,16 +1317,17 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
-	// For writable files WITHOUT write buffer (legacy path), load the data
-	// This is only used for files that don't use the session-based write buffer
-	data, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
+	// For read-only files, don't load entire file into memory
+	// Instead, use lazy loading and read from COS on demand
+	// Read-only mode - get file size but don't load data
+	// Data will be fetched on-demand in Read/ReadAt operations
+	info, err := f.ops.Stat(context.Background(), f.path)
 	if err != nil {
 		return err
 	}
-
-	f.data = data
-	f.size = int64(len(data))
+	f.size = info.Size()
 	f.loaded = true
+	f.data = nil
 	return nil
 }
 
