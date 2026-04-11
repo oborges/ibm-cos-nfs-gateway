@@ -2,15 +2,20 @@
 
 # Quick 5-minute stress test for COS NFS Gateway
 # This script runs basic performance tests to quickly validate the mountpoint
-# Usage: ./quick_test.sh [test_number]
+# Usage: ./quick_test.sh [test_number] [test_dir]
 #   test_number: 1, 2, 3, or 4 to run a specific test, or omit to run all tests
+#   test_dir: optional test directory path (useful for running Test 2 after Test 1)
 
 set -e
 
 # Configuration
 MOUNT_POINT="${MOUNT_POINT:-/mnt/cos-nfs}"
-TEST_DIR="$MOUNT_POINT/quick-test-$$"
 SPECIFIC_TEST="${1:-all}"
+if [ -n "$2" ]; then
+    TEST_DIR="$2"
+else
+    TEST_DIR="$MOUNT_POINT/quick-test-$$"
+fi
 
 # Colors
 GREEN='\033[0;32m'
@@ -127,6 +132,7 @@ if [ "$SPECIFIC_TEST" = "all" ]; then
     echo
 else
     echo -e "${YELLOW}Test $SPECIFIC_TEST completed. Test directory preserved: $TEST_DIR${NC}"
+    echo -e "${YELLOW}To run another test in same directory: ./scripts/quick_test.sh <test_num> $TEST_DIR${NC}"
     echo -e "${YELLOW}To cleanup manually: rm -rf $TEST_DIR${NC}"
 fi
 echo "For full documentation, see:"
