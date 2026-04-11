@@ -86,6 +86,8 @@ sudo mount -t nfs -o vers=3,tcp localhost:/ /mnt/cos-nfs
 - [Implementation Guide](IMPLEMENTATION_GUIDE.md) - Development details
 - [Deployment Strategy](DEPLOYMENT_STRATEGY.md) - Production deployment
 - [Technical Comparison](TECHNICAL_COMPARISON.md) - vs other solutions
+- [Stress Testing Guide](docs/STRESS_TESTING_GUIDE.md) - Comprehensive performance testing
+- [Quick Start Stress Test](docs/QUICK_START_STRESS_TEST.md) - Fast performance validation
 
 ## 🏗️ Architecture
 
@@ -205,6 +207,8 @@ Prometheus metrics available at `http://localhost:9090/metrics`:
 
 ## 🧪 Testing
 
+### Unit Tests
+
 ```bash
 # Run unit tests
 make test
@@ -215,6 +219,21 @@ make test-coverage
 # Run specific test
 go test -v ./internal/posix -run TestPathTranslation
 ```
+
+### Performance/Stress Testing
+
+```bash
+# Quick performance check (5 minutes)
+./scripts/quick_test.sh
+
+# Comprehensive stress test suite (15-20 minutes)
+./scripts/run_stress_tests.sh
+
+# Manual fio tests
+fio --name=test --directory=/mnt/cos-nfs --rw=write --bs=1M --size=100M
+```
+
+See [Stress Testing Guide](docs/STRESS_TESTING_GUIDE.md) for detailed testing procedures and performance targets.
 
 ## 🔒 Security Considerations
 
@@ -231,8 +250,21 @@ For optimal performance:
 1. **Increase cache sizes** for frequently accessed data
 2. **Adjust multipart settings** based on file sizes
 3. **Use private endpoints** to reduce latency
-4. **Enable data cache** for read-heavy workloads
+4. **Enable chunk cache** for read-heavy workloads
 5. **Tune TTL values** based on data freshness requirements
+6. **Optimize NFS mount options**: Use `rsize=1048576,wsize=1048576` for better throughput
+7. **Run stress tests** to validate performance meets your requirements
+
+### Performance Targets
+
+| Metric | Target | Acceptable |
+|--------|--------|------------|
+| Sequential Read | >100 MB/s | >50 MB/s |
+| Sequential Write | >50 MB/s | >20 MB/s |
+| Random Read IOPS | >200 | >100 |
+| Random Write IOPS | >100 | >50 |
+
+Run `./scripts/quick_test.sh` to validate your deployment meets these targets.
 
 ## 🐛 Troubleshooting
 
