@@ -88,6 +88,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	objectKey := h.translator.ToObjectKey(path)
 
 	// Try as file first
+	metrics.RecordCOSHeadObject()
 	metadata, err := h.cosClient.HeadObject(ctx, objectKey)
 	if err == nil {
 		// It's a file
@@ -109,6 +110,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 
 	// Try as directory
 	dirKey := ToDirectoryKey(objectKey)
+	metrics.RecordCOSHeadObject()
 	metadata, err = h.cosClient.HeadObject(ctx, dirKey)
 	if err == nil {
 		// It's a directory
@@ -135,6 +137,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		prefix += "/"
 	}
 	
+	metrics.RecordCOSListObjects()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1)
 	if err == nil && len(objects) > 0 {
 		// It's an implicit directory - has children
@@ -347,17 +350,27 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) er
 func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*FileInfo, error) {
 	log := logging.WithOperation("ListDirectory").With(zap.String("path", path))
 	start := time.Now()
+	cacheHit := false
+	
 	defer func() {
 		duration := time.Since(start)
 		metrics.RecordNFSRequest("readdir", "success", duration)
-		// Only log slow operations to reduce overhead
-		if duration > 100*time.Millisecond {
-			log.Info("ListDirectory completed", zap.Duration("duration", duration))
+		metrics.RecordListDirectory(duration, cacheHit)
+		
+		// Log first call, cache misses, or slow operations
+		counters := metrics.GetGlobalCounters()
+		callCount := counters.ListDirCalls.Load()
+		if callCount == 1 || !cacheHit || duration > 10*time.Millisecond {
+			log.Info("ListDirectory",
+				"cache_hit", cacheHit,
+				"duration_ms", duration.Milliseconds(),
+				"call_number", callCount)
 		}
 	}()
 
 	// Check cache first - NEW: Return full FileInfo entries directly (O(1) cache hit)
 	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
+		cacheHit = true
 		metrics.RecordCacheHit("metadata")
 		
 		// Convert []os.FileInfo to []*FileInfo (just type assertion, no COS calls)
@@ -385,6 +398,7 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 	}
 	
 fetchFromCOS:
+	cacheHit = false
 	metrics.RecordCacheMiss("metadata")
 
 	// List from COS
@@ -392,6 +406,7 @@ fetchFromCOS:
 	log.Info("ListDirectory cache miss, fetching from COS", zap.String("prefix", prefix))
 	
 	cosStart := time.Now()
+	metrics.RecordCOSListObjects()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1000)
 	if err != nil {
 		log.Error("Failed to list directory", zap.Error(err))

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
 	"context"
 	"flag"
 	"fmt"
@@ -192,6 +194,28 @@ func main() {
 		zap.Int("metrics_port", cfg.Server.MetricsPort),
 		zap.Int("health_port", cfg.Server.HealthPort),
 	)
+
+	// Add performance metrics endpoint
+	http.HandleFunc("/debug/perf", func(w http.ResponseWriter, r *http.Request) {
+		counters := metrics.GetGlobalCounters()
+		report := counters.GetReport()
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(report)
+	})
+	
+	// Add reset endpoint
+	http.HandleFunc("/debug/perf/reset", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		metrics.ResetCounters()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Counters reset\n"))
+	})
+	
+	logging.Info("Performance metrics available at http://localhost:8080/debug/perf")
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

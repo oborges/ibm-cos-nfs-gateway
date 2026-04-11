@@ -17,6 +17,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/buffer"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/feature"
+	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/internal/staging"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
@@ -570,28 +571,54 @@ func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 }
 
 // ReadDir reads directory contents
-// Note: The go-nfs library has a bug where it calls ReadDir repeatedly
-// even when all entries are returned. We work around this by returning
-// empty results after the first call, which signals end-of-directory.
 func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start)
+		metrics.RecordReadDir(duration)
+		
+		// Log slow calls or first few calls
+		counters := metrics.GetGlobalCounters()
+		callCount := counters.ReadDirCalls.Load()
+		if duration > 10*time.Millisecond || callCount <= 5 {
+			fs.logger.Info("ReadDir call",
+				"path", path,
+				"duration_ms", duration.Milliseconds(),
+				"call_number", callCount)
+		}
+	}()
+	
 	fullPath := fs.Join(fs.root, path)
+	
+	// Track per-path calls
+	metrics.GetGlobalCounters().RecordPathCall(fullPath)
+	
+	listStart := time.Now()
 	entries, err := fs.ops.ListDirectory(context.Background(), fullPath)
+	listDuration := time.Since(listStart)
+	
 	if err != nil {
 		return nil, err
 	}
 
 	// Convert []*posix.FileInfo to []os.FileInfo
+	convStart := time.Now()
 	result := make([]os.FileInfo, len(entries))
 	for i, entry := range entries {
 		result[i] = entry
 	}
+	convDuration := time.Since(convStart)
+	metrics.RecordConversion(convDuration)
 	
-	// WORKAROUND: The go-nfs library doesn't properly handle the billy.Filesystem
-	// interface for READDIR operations. It keeps calling ReadDir in a loop.
-	// The proper fix would be to implement the nfs.FileSystem interface directly
-	// instead of using billy.Filesystem, but that requires significant refactoring.
-	// For now, we return all entries and accept that the client will make multiple
-	// calls (which are fast due to caching).
+	// Log timing breakdown for slow calls
+	if time.Since(start) > 10*time.Millisecond {
+		fs.logger.Info("ReadDir timing breakdown",
+			"path", path,
+			"total_ms", time.Since(start).Milliseconds(),
+			"list_ms", listDuration.Milliseconds(),
+			"conversion_ms", convDuration.Milliseconds(),
+			"entries", len(entries))
+	}
 	
 	return result, nil
 }
