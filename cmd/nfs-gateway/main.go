@@ -174,8 +174,11 @@ func main() {
 	// Create billy.Filesystem implementation with config
 	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
 	
+	// Wrap with instrumentation to track NFS-level behavior
+	instrumentedFS := nfs.NewInstrumentedFilesystem(cosFilesystem, nfsLogger)
+	
 	// Wrap with null auth handler, then caching handler
-	authHandler := nfshelper.NewNullAuthHandler(cosFilesystem)
+	authHandler := nfshelper.NewNullAuthHandler(instrumentedFS)
 	cachedHandler := nfshelper.NewCachingHandler(authHandler, 1000)
 	
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
@@ -204,6 +207,14 @@ func main() {
 		json.NewEncoder(w).Encode(report)
 	})
 	
+	// Add path-specific stats endpoint
+	http.HandleFunc("/debug/perf/paths", func(w http.ResponseWriter, r *http.Request) {
+		stats := instrumentedFS.GetAllPathStats()
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(stats)
+	})
+	
 	// Add reset endpoint
 	http.HandleFunc("/debug/perf/reset", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -215,7 +226,9 @@ func main() {
 		w.Write([]byte("Counters reset\n"))
 	})
 	
-	logging.Info("Performance metrics available at http://localhost:8080/debug/perf")
+	logging.Info("Performance metrics available at:")
+	logging.Info("  http://localhost:8080/debug/perf - Overall metrics")
+	logging.Info("  http://localhost:8080/debug/perf/paths - Per-path statistics")
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)
