@@ -322,6 +322,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	if useStagingPath {
 		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
 			// Writable file: get or create session
+			// Note: GetOrCreateSession already increments ref count
 			session, err := fs.stagingManager.GetOrCreateSession(fullPath)
 			if err != nil {
 				fs.logger.Error("Failed to get staging session",
@@ -331,7 +332,6 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 				return nil, err
 			}
 			file.stagingSession = session
-			session.IncrementRefCount()
 			
 			fs.logger.Info("Staging session acquired for write",
 				"file_id", fileID,
