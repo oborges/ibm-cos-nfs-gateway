@@ -321,11 +321,9 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		
 		// Convert children names to FileInfo by statting each one
 		entries := make([]*FileInfo, 0, len(entry.Children))
-		failedStats := 0
-		maxFailures := len(entry.Children) / 2
 		cacheInvalidated := false
 		
-		for i, childName := range entry.Children {
+		for _, childName := range entry.Children {
 			childPath := path
 			if path == "/" {
 				childPath = "/" + childName
@@ -336,8 +334,6 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			// Get file info from cache or COS
 			info, err := h.Stat(ctx, childPath)
 			if err != nil {
-				failedStats++
-				
 				log.Debug("Cached child not found, invalidating directory cache",
 					zap.String("child", childName))
 				
@@ -350,18 +346,16 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			entries = append(entries, info)
 		}
 		
-		// If cache was invalidated due to too many failures, fall through to re-list from COS
+		// If cache was invalidated, fall through to re-list from COS
 		if cacheInvalidated {
 			log.Debug("Falling through to re-list from COS after cache invalidation")
 			// Fall through to ListObjects below
-		} else if failedStats <= maxFailures {
-			// If we successfully got most entries, return them
+		} else {
+			// Successfully got all entries from cache
 			log.Debug("Directory listing from cache successful",
-				zap.Int("entries", len(entries)),
-				zap.Int("skipped", failedStats))
+				zap.Int("entries", len(entries)))
 			return entries, nil
 		}
-		// Otherwise fall through to re-list from COS
 	}
 	metrics.RecordCacheMiss("metadata")
 
