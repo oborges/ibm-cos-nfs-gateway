@@ -1117,7 +1117,7 @@ func (f *COSFile) Close() error {
 		return nil
 	}
 
-	// LEGACY PATH: Release write session and flush if this is the last reference
+	// LEGACY PATH: Release write session (don't flush yet - let session manager handle it)
 	if f.writeSession != nil {
 		f.writeSession.Mu.Lock()
 		bufferSize := f.writeSession.Buffer.Size()
@@ -1131,37 +1131,8 @@ func (f *COSFile) Close() error {
 			"buffer_size_bytes", bufferSize,
 			"buffer_size_mb", float64(bufferSize)/(1024*1024))
 
-		// Release session reference
+		// Release session reference (session persists for other handles)
 		f.sessionManager.ReleaseSession(f.path)
-		
-		// Check if this was the last reference and flush if needed
-		if session, exists := f.sessionManager.GetSession(f.path); exists {
-			session.Mu.Lock()
-			refCount := session.RefCount
-			hasData := session.Buffer.Size() > 0
-			session.Mu.Unlock()
-			
-			// If no more references and buffer has data, flush immediately
-			if refCount == 0 && hasData {
-				f.logger.Info("FILE CLOSE - Last reference, flushing buffer",
-					"file_id", f.fileID,
-					"session_id", sessionID,
-					"path", f.path,
-					"buffer_size_bytes", bufferSize)
-				
-				if err := f.flushSessionBuffer(); err != nil {
-					f.logger.Error("FILE CLOSE - Flush failed",
-						"file_id", f.fileID,
-						"session_id", sessionID,
-						"path", f.path,
-						"error", err)
-					return err
-				}
-				
-				// Close the session after successful flush
-				f.sessionManager.CloseSession(f.path)
-			}
-		}
 	}
 
 	// Log final statistics for this handle
