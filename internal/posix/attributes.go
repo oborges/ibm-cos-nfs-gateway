@@ -91,9 +91,10 @@ func DecodePOSIXAttributes(metadata map[string]string, isDir bool) *types.POSIXA
 	return attrs
 }
 
+var defaultStartupTime = time.Now()
+
 // DefaultAttributes returns default POSIX attributes
 func DefaultAttributes(isDir bool) *types.POSIXAttributes {
-	now := time.Now()
 	mode := DefaultFileMode
 	if isDir {
 		mode = DefaultDirMode | os.ModeDir
@@ -103,9 +104,9 @@ func DefaultAttributes(isDir bool) *types.POSIXAttributes {
 		Mode:  mode,
 		UID:   DefaultUID,
 		GID:   DefaultGID,
-		Atime: now,
-		Mtime: now,
-		Ctime: now,
+		Atime: defaultStartupTime,
+		Mtime: defaultStartupTime,
+		Ctime: defaultStartupTime,
 	}
 }
 

@@ -424,7 +424,7 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*types.ObjectMetad
 	return objectMeta, nil
 }
 
-// ListObjects lists objects with a given prefix
+// ListObjects lists objects with a given prefix up to maxKeys limit (or all if maxKeys <= 0)
 func (c *Client) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
 	log := logging.WithOperation("ListObjects").With(
 		zap.String("prefix", prefix),
@@ -432,26 +432,52 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, maxKeys int) ([
 	)
 	log.Debug("listing objects")
 
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(c.bucket),
-		Prefix:  aws.String(prefix),
-		MaxKeys: aws.Int64(int64(maxKeys)),
+	var objects []*types.ObjectMetadata
+	var continuationToken *string
+	
+	reqMaxKeys := int64(1000)
+	if maxKeys > 0 && maxKeys < 1000 {
+		reqMaxKeys = int64(maxKeys)
 	}
 
-	result, err := c.s3Client.ListObjectsV2WithContext(ctx, input)
-	if err != nil {
-		log.Error("failed to list objects", zap.Error(err))
-		return nil, fmt.Errorf("failed to list objects: %w", err)
-	}
+	for {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(c.bucket),
+			Prefix:            aws.String(prefix),
+			MaxKeys:           aws.Int64(reqMaxKeys),
+			ContinuationToken: continuationToken,
+		}
 
-	objects := make([]*types.ObjectMetadata, 0, len(result.Contents))
-	for _, obj := range result.Contents {
-		objects = append(objects, &types.ObjectMetadata{
-			Key:          aws.StringValue(obj.Key),
-			Size:         aws.Int64Value(obj.Size),
-			LastModified: aws.TimeValue(obj.LastModified),
-			ETag:         aws.StringValue(obj.ETag),
-		})
+		result, err := c.s3Client.ListObjectsV2WithContext(ctx, input)
+		if err != nil {
+			log.Error("failed to list objects", zap.Error(err))
+			return nil, fmt.Errorf("failed to list objects: %w", err)
+		}
+
+		for _, obj := range result.Contents {
+			objects = append(objects, &types.ObjectMetadata{
+				Key:          aws.StringValue(obj.Key),
+				Size:         aws.Int64Value(obj.Size),
+				LastModified: aws.TimeValue(obj.LastModified),
+				ETag:         aws.StringValue(obj.ETag),
+			})
+			if maxKeys > 0 && len(objects) >= maxKeys {
+				log.Debug("objects listed", zap.Int("count", len(objects)))
+				return objects, nil
+			}
+		}
+
+		if aws.BoolValue(result.IsTruncated) {
+			continuationToken = result.NextContinuationToken
+			if maxKeys > 0 {
+				rem := int64(maxKeys - len(objects))
+				if rem < reqMaxKeys {
+					reqMaxKeys = rem
+				}
+			}
+		} else {
+			break
+		}
 	}
 
 	log.Debug("objects listed", zap.Int("count", len(objects)))

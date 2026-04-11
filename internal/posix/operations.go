@@ -407,7 +407,7 @@ fetchFromCOS:
 	
 	cosStart := time.Now()
 	metrics.RecordCOSListObjects()
-	objects, err := h.cosClient.ListObjects(ctx, prefix, 1000)
+	objects, err := h.cosClient.ListObjects(ctx, prefix, 0)
 	if err != nil {
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
