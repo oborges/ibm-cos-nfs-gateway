@@ -859,11 +859,12 @@ func (f *COSFile) Write(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// LEGACY PATH: Original write logic
-	if err := f.ensureLoaded(); err != nil && !f.isNew {
-		return 0, err
-	}
-
+	// LEGACY PATH: Original write logic with write buffer
+	// NOTE: We do NOT call ensureLoaded() here because:
+	// 1. Write buffer handles append-only writes efficiently
+	// 2. We only need to download the file during flush (read-modify-write)
+	// 3. Downloading on every write causes catastrophic performance issues
+	
 	// Get or create write session for this path
 	if f.writeSession == nil {
 		f.writeSession = f.sessionManager.GetOrCreateSession(f.path)
