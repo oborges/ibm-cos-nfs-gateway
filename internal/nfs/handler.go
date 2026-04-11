@@ -199,6 +199,31 @@ func (h *COSHandler) HandleLimit() int {
 	return h.maxHandles
 }
 
+// EnableTracing enables READDIR tracing
+func (h *COSHandler) EnableTracing() {
+	EnableTracing()
+}
+
+// DisableTracing disables READDIR tracing
+func (h *COSHandler) DisableTracing() {
+	DisableTracing()
+}
+
+// GetTrace returns the trace for a specific path
+func (h *COSHandler) GetTrace(path string) *PathTrace {
+	return GetTrace(path)
+}
+
+// GetAllTraces returns all traces
+func (h *COSHandler) GetAllTraces() map[string]*PathTrace {
+	return GetAllTraces()
+}
+
+// ClearTraces clears all traces
+func (h *COSHandler) ClearTraces() {
+	ClearTraces()
+}
+
 // COSFilesystem implements billy.Filesystem interface for COS
 type COSFilesystem struct {
 	ops            *posix.OperationsHandler
@@ -573,20 +598,6 @@ func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 // ReadDir reads directory contents
 func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
-	defer func() {
-		duration := time.Since(start)
-		metrics.RecordReadDir(duration)
-		
-		// Log slow calls or first few calls
-		counters := metrics.GetGlobalCounters()
-		callCount := counters.ReadDirCalls.Load()
-		if duration > 10*time.Millisecond || callCount <= 5 {
-			fs.logger.Info("ReadDir call",
-				"path", path,
-				"duration_ms", duration.Milliseconds(),
-				"call_number", callCount)
-		}
-	}()
 	
 	fullPath := fs.Join(fs.root, path)
 	
@@ -598,6 +609,10 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	listDuration := time.Since(listStart)
 	
 	if err != nil {
+		// Record trace even on error
+		duration := time.Since(start)
+		RecordReaddirCall(fullPath, 0, duration, err)
+		metrics.RecordReadDir(duration)
 		return nil, err
 	}
 
@@ -608,13 +623,32 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		result[i] = entry
 	}
 	convDuration := time.Since(convStart)
+	
+	duration := time.Since(start)
+	
+	// Record trace with entry count
+	RecordReaddirCall(fullPath, len(result), duration, nil)
+	
+	// Record metrics
+	metrics.RecordReadDir(duration)
 	metrics.RecordConversion(convDuration)
 	
+	// Log slow calls or first few calls
+	counters := metrics.GetGlobalCounters()
+	callCount := counters.ReadDirCalls.Load()
+	if duration > 10*time.Millisecond || callCount <= 5 {
+		fs.logger.Info("ReadDir call",
+			"path", path,
+			"duration_ms", duration.Milliseconds(),
+			"call_number", callCount,
+			"entries", len(result))
+	}
+	
 	// Log timing breakdown for slow calls
-	if time.Since(start) > 10*time.Millisecond {
+	if duration > 10*time.Millisecond {
 		fs.logger.Info("ReadDir timing breakdown",
 			"path", path,
-			"total_ms", time.Since(start).Milliseconds(),
+			"total_ms", duration.Milliseconds(),
 			"list_ms", listDuration.Milliseconds(),
 			"conversion_ms", convDuration.Milliseconds(),
 			"entries", len(entries))

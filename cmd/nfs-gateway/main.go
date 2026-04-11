@@ -226,6 +226,68 @@ func main() {
 		w.Write([]byte("Counters reset\n"))
 	})
 	
+	// Add READDIR trace endpoints
+	http.HandleFunc("/debug/readdir/enable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		nfsHandler.EnableTracing()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("READDIR tracing enabled\n"))
+	})
+	
+	http.HandleFunc("/debug/readdir/disable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		nfsHandler.DisableTracing()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("READDIR tracing disabled\n"))
+	})
+	
+	http.HandleFunc("/debug/readdir/traces", func(w http.ResponseWriter, r *http.Request) {
+		traces := nfsHandler.GetAllTraces()
+		
+		// Analyze each trace
+		result := make(map[string]interface{})
+		for path, trace := range traces {
+			result[path] = trace.Analyze()
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	})
+	
+	http.HandleFunc("/debug/readdir/trace", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Query().Get("path")
+		if path == "" {
+			http.Error(w, "Missing 'path' query parameter", http.StatusBadRequest)
+			return
+		}
+		
+		trace := nfsHandler.GetTrace(path)
+		if trace == nil {
+			http.Error(w, "No trace found for path", http.StatusNotFound)
+			return
+		}
+		
+		// Return detailed trace
+		w.Header().Set("Content-Type", "text/plain")
+		trace.PrintTrace(w)
+	})
+	
+	http.HandleFunc("/debug/readdir/clear", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		nfsHandler.ClearTraces()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("READDIR traces cleared\n"))
+	})
+	
 	logging.Info("Performance metrics available at:")
 	logging.Info("  http://localhost:8080/debug/perf - Overall metrics")
 	logging.Info("  http://localhost:8080/debug/perf/paths - Per-path statistics")
