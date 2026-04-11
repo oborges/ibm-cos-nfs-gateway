@@ -1035,15 +1035,54 @@ func (f *COSFile) flushSessionBuffer() error {
 func (f *COSFile) Close() error {
 	// STAGING PATH: Release staging session
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		sessionSize := f.stagingSession.Size
+		isDirty := f.stagingSession.Dirty
+		
 		f.stagingSession.DecrementRefCount()
 		refCount := f.stagingSession.GetRefCount()
 		
 		f.logger.Info("FILE CLOSE - Releasing staging session",
 			"file_id", f.fileID,
 			"path", f.path,
-			"session_size", f.stagingSession.Size,
+			"session_size", sessionSize,
 			"ref_count", refCount,
-			"dirty", f.stagingSession.Dirty)
+			"dirty", isDirty)
+
+		// If this is a zero-byte file that was truncated and has no active handles,
+		// immediately sync it to COS to ensure it exists for NFS attribute operations
+		if sessionSize == 0 && isDirty && refCount == 0 && f.totalWrites == 0 {
+			f.logger.Info("Immediately syncing zero-byte truncated file",
+				"file_id", f.fileID,
+				"path", f.path)
+			
+			// Sync to staging file
+			if err := f.stagingSession.Sync(); err != nil {
+				f.logger.Error("Failed to sync zero-byte file to staging",
+					"file_id", f.fileID,
+					"path", f.path,
+					"error", err)
+			} else {
+				// Upload empty file to COS immediately
+				attrs := &types.POSIXAttributes{
+					Mode:  f.perm,
+					UID:   1000,
+					GID:   1000,
+					Mtime: time.Now(),
+				}
+				if err := f.ops.WriteFile(context.Background(), f.path, []byte{}, attrs); err != nil {
+					f.logger.Error("Failed to upload zero-byte file to COS",
+						"file_id", f.fileID,
+						"path", f.path,
+						"error", err)
+				} else {
+					// Mark as clean since we just synced it
+					f.stagingManager.MarkClean(f.path)
+					f.logger.Info("Successfully synced zero-byte file to COS",
+						"file_id", f.fileID,
+						"path", f.path)
+				}
+			}
+		}
 
 		// Release session reference (session persists for other handles)
 		f.stagingManager.ReleaseSession(f.path)
