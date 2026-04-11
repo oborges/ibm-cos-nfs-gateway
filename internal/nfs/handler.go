@@ -117,7 +117,9 @@ func (h *COSHandler) Mount(ctx context.Context, conn net.Conn, req nfs.MountRequ
 
 // Change returns a billy.Change interface for write operations
 func (h *COSHandler) Change(fs billy.Filesystem) billy.Change {
-	// COS filesystem doesn't support chmod operations
+	if c, ok := fs.(billy.Change); ok {
+		return c
+	}
 	return nil
 }
 
@@ -1264,8 +1266,13 @@ func (f *COSFile) Close() error {
 		return nil
 	}
 
-	// LEGACY PATH: Release write session (don't flush yet - let session manager handle it)
+	// LEGACY PATH: Release write session (flush now to prevent small data loss)
 	if f.writeSession != nil {
+		if err := f.flushSessionBuffer(); err != nil {
+			f.logger.Error("Failed to flush session buffer on close", "error", err)
+			return err
+		}
+
 		f.writeSession.Mu.Lock()
 		bufferSize := f.writeSession.Buffer.Size()
 		sessionID := f.writeSession.SessionID

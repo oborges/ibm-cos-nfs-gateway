@@ -89,4 +89,36 @@ func (cfs *CachedFilesystem) ClearCache() {
 	cfs.logger.Info("CACHE CLEAR: Cleared all cache entries")
 }
 
+// Chmod changes the mode of the named file (implements billy.Change)
+func (cfs *CachedFilesystem) Chmod(name string, mode os.FileMode) error {
+	if c, ok := cfs.Filesystem.(billy.Change); ok {
+		return c.Chmod(name, mode)
+	}
+	return nil
+}
+
+// Lchown changes the uid and gid of the named file (implements billy.Change)
+func (cfs *CachedFilesystem) Lchown(name string, uid, gid int) error {
+	if c, ok := cfs.Filesystem.(billy.Change); ok {
+		return c.Lchown(name, uid, gid)
+	}
+	return nil
+}
+
+// Chown changes the uid and gid of the named file (implements billy.Change)
+func (cfs *CachedFilesystem) Chown(name string, uid, gid int) error {
+	if c, ok := cfs.Filesystem.(billy.Change); ok {
+		return c.Chown(name, uid, gid)
+	}
+	return nil
+}
+
+// Chtimes changes the access and modification times (implements billy.Change)
+func (cfs *CachedFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	if c, ok := cfs.Filesystem.(billy.Change); ok {
+		return c.Chtimes(name, atime, mtime)
+	}
+	return nil
+}
+
 // Made with Bob
