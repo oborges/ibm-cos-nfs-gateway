@@ -178,8 +178,11 @@ func main() {
 	instrumentedFS := nfs.NewInstrumentedFilesystem(cosFilesystem, nfsLogger)
 	
 	// Wrap with null auth handler, then caching handler
+	// Use large cache to prevent verifier eviction during directory pagination
+	// Handle cache: 10000 (file handles)
+	// Verifier cache: 10000 (directory listings)
 	authHandler := nfshelper.NewNullAuthHandler(instrumentedFS)
-	cachedHandler := nfshelper.NewCachingHandler(authHandler, 1000)
+	cachedHandler := nfshelper.NewCachingHandlerWithVerifierLimit(authHandler, 10000, 10000)
 	
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
 	nfsServer, err := nfs.NewServer(cachedHandler, nfsAddress, nfsLogger)
