@@ -1260,6 +1260,15 @@ func (f *COSFile) ensureLoaded() error {
 		return nil
 	}
 
+	// STAGING PATH: If using staging, skip COS load - data is in staging file
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		// Get size from staging session
+		f.size = f.stagingSession.GetSize()
+		f.loaded = true
+		f.data = nil
+		return nil
+	}
+
 	// For read-only files, don't load entire file into memory
 	// Instead, use lazy loading and read from COS on demand
 	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
