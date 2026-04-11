@@ -89,7 +89,7 @@ func (ws *WriteSession) Read(buffer []byte, offset int64) (int, error) {
 
 	// Check bounds
 	if offset >= ws.Size {
-		return 0, nil // EOF
+		return 0, io.EOF // Return EOF when at or past end of file
 	}
 
 	// Seek to offset
@@ -105,7 +105,13 @@ func (ws *WriteSession) Read(buffer []byte, offset int64) (int, error) {
 
 	ws.LastAccess = time.Now()
 
-	return n, nil
+	// If we read some data but hit EOF, return the data with nil error
+	// The next read will return 0, io.EOF
+	if err == io.EOF && n > 0 {
+		return n, nil
+	}
+
+	return n, err
 }
 
 // Sync flushes the staging file to disk
