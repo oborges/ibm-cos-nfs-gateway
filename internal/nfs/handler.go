@@ -344,11 +344,20 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	// If truncating, clear the file
 	if flag&os.O_TRUNC != 0 {
 		if useStagingPath && file.stagingSession != nil {
-			// Truncate staging session
-			// This will be synced to COS later
-			file.stagingSession.Size = 0
-			file.stagingSession.Dirty = true
+			// Truncate staging session to size 0
+			if err := file.stagingSession.Truncate(0); err != nil {
+				fs.logger.Error("Failed to truncate staging file",
+					"file_id", fileID,
+					"path", fullPath,
+					"error", err)
+				return nil, fmt.Errorf("failed to truncate staging file: %w", err)
+			}
 			fs.stagingManager.MarkDirty(fullPath, 0)
+			
+			fs.logger.Info("Truncated staging file",
+				"file_id", fileID,
+				"path", fullPath,
+				"size", 0)
 		} else {
 			// Legacy path: truncate directly to COS
 			attrs := &types.POSIXAttributes{

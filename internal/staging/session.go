@@ -171,4 +171,23 @@ func (ws *WriteSession) GetRefCount() int32 {
 	return ws.RefCount
 }
 
+// Truncate truncates the staging file to the specified size
+func (ws *WriteSession) Truncate(size int64) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	// Truncate the file
+	if err := ws.File.Truncate(size); err != nil {
+		return fmt.Errorf("failed to truncate: %w", err)
+	}
+
+	// Update size and mark as dirty
+	ws.Size = size
+	ws.Dirty = true
+	ws.LastWrite = time.Now()
+	ws.LastAccess = time.Now()
+
+	return nil
+}
+
 // Made with Bob
