@@ -966,6 +966,23 @@ func (f *COSFile) flushSessionBuffer() error {
 		"start_offset", startOffset,
 		"flush_count", f.flushCount+1)
 
+	// Check current file size in COS
+	var currentSize int64
+	if !f.isNew {
+		info, err := f.ops.Stat(context.Background(), f.path)
+		if err != nil && !strings.Contains(err.Error(), "not found") {
+			f.logger.Error("Failed to stat file during flush",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
+				"path", f.path,
+				"error", err)
+			return err
+		}
+		if err == nil {
+			currentSize = info.Size()
+		}
+	}
+
 	// For new files or full rewrites, just write the data
 	if f.isNew || startOffset == 0 {
 		attrs := &types.POSIXAttributes{
@@ -981,13 +998,62 @@ func (f *COSFile) flushSessionBuffer() error {
 				"file_id", f.fileID,
 				"session_id", f.writeSession.SessionID,
 				"path", f.path,
-				"bytes", flushSize,
+				"bytes", len(data),
+				"error", err)
+			return err
+		}
+	} else if startOffset == currentSize && currentSize > 0 {
+		// SEQUENTIAL APPEND: startOffset equals current file size
+		// We can optimize this by reading once and appending
+		f.logger.Info("SEQUENTIAL APPEND detected",
+			"file_id", f.fileID,
+			"path", f.path,
+			"current_size", currentSize,
+			"start_offset", startOffset,
+			"append_bytes", flushSize)
+		
+		// Read existing file once
+		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
+		if err != nil {
+			f.logger.Error("Failed to read existing file for sequential append",
+				"file_id", f.fileID,
+				"path", f.path,
+				"error", err)
+			return err
+		}
+		
+		// Append new data
+		finalData := make([]byte, len(existingData)+len(data))
+		copy(finalData, existingData)
+		copy(finalData[len(existingData):], data)
+		
+		attrs := &types.POSIXAttributes{
+			Mode:  f.perm,
+			UID:   1000,
+			GID:   1000,
+			Mtime: time.Now(),
+		}
+		
+		err = f.ops.WriteFile(context.Background(), f.path, finalData, attrs)
+		if err != nil {
+			f.logger.Error("Failed to write file during sequential append",
+				"file_id", f.fileID,
+				"session_id", f.writeSession.SessionID,
+				"path", f.path,
+				"bytes", len(finalData),
 				"error", err)
 			return err
 		}
 	} else {
-		// For appends/updates, we need to read existing data and merge
+		// For random writes/updates, we need to read existing data and merge
 		// This is a limitation of COS - we can't do partial updates
+		f.logger.Info("RANDOM WRITE detected - requires full file download",
+			"file_id", f.fileID,
+			"path", f.path,
+			"current_size", currentSize,
+			"start_offset", startOffset,
+			"write_bytes", flushSize)
+		
 		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			f.logger.Error("Failed to read existing file for merge",
