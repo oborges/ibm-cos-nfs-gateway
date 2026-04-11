@@ -367,6 +367,48 @@ func (c *Client) PutObject(ctx context.Context, key string, data []byte, metadat
 	return nil
 }
 
+// PutObjectStream uploads an object to COS from an io.ReadSeeker
+func (c *Client) PutObjectStream(ctx context.Context, key string, body io.ReadSeeker, metadata map[string]string) error {
+	log := logging.WithOperation("PutObjectStream").With(
+		zap.String("key", key),
+	)
+	log.Debug("putting object stream")
+
+	awsMetadata := make(map[string]*string)
+	for k, v := range metadata {
+		awsMetadata[k] = aws.String(v)
+	}
+
+	input := &s3.PutObjectInput{
+		Bucket:   aws.String(c.bucket),
+		Key:      aws.String(key),
+		Body:     body,
+		Metadata: awsMetadata,
+	}
+
+	_, err := c.s3Client.PutObjectWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to put object stream", zap.Error(err))
+		return fmt.Errorf("failed to put object stream: %w", err)
+	}
+
+	log.Debug("object stream uploaded")
+	return nil
+}
+
+// GetObjectStream streams an object from COS
+func (c *Client) GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error) {
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	}
+	result, err := c.s3Client.GetObjectWithContext(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+	return result.Body, nil
+}
+
 // DeleteObject deletes an object from COS
 func (c *Client) DeleteObject(ctx context.Context, key string) error {
 	log := logging.WithOperation("DeleteObject").With(zap.String("key", key))

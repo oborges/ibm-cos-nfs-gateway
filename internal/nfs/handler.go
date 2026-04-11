@@ -369,6 +369,19 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 			}
 			file.stagingSession = session
 			
+			// Automatically pre-fetch existing COS objects if modifying without truncating
+			if fileExists && flag&os.O_TRUNC == 0 {
+				err := session.Prefetch(func() error {
+					fs.logger.Info("Prefetching existing COS object to local staging cache",
+						"file_id", fileID,
+						"path", fullPath)
+					return fs.ops.DownloadToFile(context.Background(), fullPath, session.StagingPath)
+				})
+				if err != nil {
+					fs.logger.Error("Prefetch error intercepted", zap.Error(err))
+				}
+			}
+
 			fs.logger.Info("Staging session acquired for write",
 				"file_id", fileID,
 				"path", fullPath,

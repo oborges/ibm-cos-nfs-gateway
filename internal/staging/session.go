@@ -16,6 +16,7 @@ type WriteSession struct {
 	File        *os.File
 	Size        int64
 	Dirty       bool
+	Prefetched  bool
 	RefCount    int32
 	LastWrite   time.Time
 	LastAccess  time.Time
@@ -45,6 +46,7 @@ func NewWriteSession(path string, stagingPath string) (*WriteSession, error) {
 		File:        file,
 		Size:        stat.Size(),
 		Dirty:       false,
+		Prefetched  : false,
 		RefCount:    1,
 		LastWrite:   now,
 		LastAccess:  now,
@@ -193,6 +195,27 @@ func (ws *WriteSession) Truncate(size int64) error {
 	ws.LastWrite = time.Now()
 	ws.LastAccess = time.Now()
 
+	return nil
+}
+
+// Prefetch runs the provided fetch function exactly once.
+func (ws *WriteSession) Prefetch(fetcher func() error) error {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	if ws.Prefetched {
+		return nil
+	}
+
+	if err := fetcher(); err != nil {
+		return err
+	}
+
+	if stat, err := ws.File.Stat(); err == nil {
+		ws.Size = stat.Size()
+	}
+	
+	ws.Prefetched = true
 	return nil
 }
 

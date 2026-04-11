@@ -166,6 +166,36 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	return nil, os.ErrNotExist
 }
 
+// DownloadToFile streams the object from COS into a local file path
+func (h *OperationsHandler) DownloadToFile(ctx context.Context, path string, localPath string) error {
+	log := logging.WithOperation("DownloadToFile").With(
+		zap.String("path", path),
+		zap.String("local_path", localPath),
+	)
+
+	objectKey := h.translator.ToObjectKey(path)
+	metrics.RecordCOSGetObject()
+
+	stream, err := h.cosClient.GetObjectStream(ctx, objectKey)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open local file for prefetch: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, stream); err != nil {
+		return fmt.Errorf("failed to copy stream body to file: %w", err)
+	}
+
+	log.Debug("Stream download to file complete")
+	return nil
+}
+
 // ReadFile reads file content
 func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, length int64) ([]byte, error) {
 	log := logging.WithOperation("ReadFile").With(

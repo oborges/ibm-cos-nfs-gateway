@@ -3,6 +3,7 @@ package staging
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -15,6 +16,8 @@ import (
 // COSClient interface for uploading objects
 type COSClient interface {
 	PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error
+	PutObjectStream(ctx context.Context, key string, body io.ReadSeeker, metadata map[string]string) error
+	GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error)
 }
 
 // SyncWorker handles background synchronization of dirty files to COS
@@ -181,14 +184,15 @@ func (sw *SyncWorker) syncFile(path string) error {
 		return fmt.Errorf("failed to sync session: %w", err)
 	}
 
-	// Read staging file
-	data, err := os.ReadFile(session.StagingPath)
+	// Read staging file using file stream to prevent OOM on large files
+	file, err := os.Open(session.StagingPath)
 	if err != nil {
-		return fmt.Errorf("failed to read staging file: %w", err)
+		return fmt.Errorf("failed to open staging file: %w", err)
 	}
+	defer file.Close()
 
 	// Upload to COS with retry
-	if err := sw.uploadWithRetry(path, data); err != nil {
+	if err := sw.uploadWithRetryStream(path, file); err != nil {
 		return fmt.Errorf("failed to upload to COS: %w", err)
 	}
 
@@ -253,6 +257,57 @@ func (sw *SyncWorker) uploadWithRetry(path string, data []byte) error {
 	}
 
 	return fmt.Errorf("upload failed after %d attempts: %w", sw.config.MaxSyncRetries, lastErr)
+}
+
+// uploadWithRetryStream uploads a file object stream to COS with exponential backoff retry
+func (sw *SyncWorker) uploadWithRetryStream(path string, body io.ReadSeeker) error {
+	var lastErr error
+
+	retryBackoff, _ := sw.config.GetRetryBackoffInitial()
+	maxRetryBackoff, _ := sw.config.GetRetryBackoffMax()
+
+	for attempt := 0; attempt < sw.config.MaxSyncRetries; attempt++ {
+		if attempt > 0 {
+			backoff := retryBackoff * time.Duration(1<<uint(attempt-1))
+			if backoff > maxRetryBackoff {
+				backoff = maxRetryBackoff
+			}
+
+			logging.Debug("Retrying upload stream after backoff",
+				zap.String("path", path),
+				zap.Int("attempt", attempt+1),
+				zap.Duration("backoff", backoff))
+
+			select {
+			case <-time.After(backoff):
+			case <-sw.ctx.Done():
+				return sw.ctx.Err()
+			}
+		}
+
+		// Ensure body is rewound before upload retry
+		if _, err := body.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to seek upload body: %w", err)
+		}
+
+		err := sw.cosClient.PutObjectStream(sw.ctx, path, body, nil)
+		if err == nil {
+			if attempt > 0 {
+				logging.Info("Upload stream succeeded after retry",
+					zap.String("path", path),
+					zap.Int("attempts", attempt+1))
+			}
+			return nil
+		}
+
+		lastErr = err
+		logging.Warn("Upload stream attempt failed",
+			zap.String("path", path),
+			zap.Int("attempt", attempt+1),
+			zap.Error(err))
+	}
+
+	return fmt.Errorf("upload stream failed after %d attempts: %w", sw.config.MaxSyncRetries, lastErr)
 }
 
 // TriggerSync manually triggers a sync for a specific file

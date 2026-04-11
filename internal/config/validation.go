@@ -28,6 +28,10 @@ func Validate(config *Config) error {
 		return fmt.Errorf("logging config: %w", err)
 	}
 
+	if err := validateStaging(&config.Staging); err != nil {
+		return fmt.Errorf("staging config: %w", err)
+	}
+
 	return nil
 }
 
@@ -205,6 +209,33 @@ func validateLogging(config *LoggingConfig) error {
 
 	if config.Output == "" {
 		return fmt.Errorf("log output is required")
+	}
+
+	return nil
+}
+
+// validateStaging validates staging layer configuration
+func validateStaging(config *StagingConfig) error {
+	if config.Enabled {
+		if config.RootDir == "" {
+			return fmt.Errorf("staging root_dir is required when enabled")
+		}
+		if config.MaxStagingSizeGB < 1 {
+			return fmt.Errorf("invalid staging max_staging_size_gb: %d (must be > 0)", config.MaxStagingSizeGB)
+		}
+		if config.SyncThresholdMB < 1 {
+			return fmt.Errorf("invalid staging sync_threshold_mb: %d (must be > 0)", config.SyncThresholdMB)
+		}
+		if config.SyncWorkerCount < 1 {
+			return fmt.Errorf("invalid staging sync_worker_count: %d (must be > 0)", config.SyncWorkerCount)
+		}
+
+		// Check if staging directory exists or can be created
+		if _, err := os.Stat(config.RootDir); os.IsNotExist(err) {
+			if err := os.MkdirAll(config.RootDir, 0755); err != nil {
+				return fmt.Errorf("cannot create staging directory %s: %w", config.RootDir, err)
+			}
+		}
 	}
 
 	return nil

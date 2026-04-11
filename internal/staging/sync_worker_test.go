@@ -2,6 +2,8 @@ package staging
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +39,22 @@ func (m *MockCOSClient) PutObject(ctx context.Context, path string, data []byte,
 
 func (m *MockCOSClient) SetError(path string, err error) {
 	m.errors[path] = err
+}
+
+func (m *MockCOSClient) PutObjectStream(ctx context.Context, path string, body io.ReadSeeker, metadata map[string]string) error {
+	data, _ := io.ReadAll(body)
+	return m.putObjectFn(ctx, path, data, metadata)
+}
+
+func (m *MockCOSClient) GetObjectStream(ctx context.Context, path string) (io.ReadCloser, error) {
+	if err, exists := m.errors[path]; exists {
+		return nil, err
+	}
+	data, exists := m.uploads[path]
+	if !exists {
+		return nil, fmt.Errorf("not found in mock")
+	}
+	return io.NopCloser(strings.NewReader(string(data))), nil
 }
 
 func (m *MockCOSClient) GetUpload(path string) ([]byte, bool) {

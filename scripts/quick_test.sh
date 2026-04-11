@@ -32,7 +32,7 @@ echo
 # Check prerequisites
 if ! command -v fio &> /dev/null; then
     echo -e "${RED}Error: fio is not installed${NC}"
-    echo "Install with: sudo apt-get install fio (Ubuntu/Debian)"
+    echo "Install with: sudo apt-get install fio (Ubuntu/Debian) or sudo dnf install fio (RHEL/CentOS)"
     exit 1
 fi
 
