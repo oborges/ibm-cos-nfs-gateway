@@ -60,7 +60,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			
 			// Fallback: construct from attributes
 			mode := os.FileMode(0644)
-			modTime := time.Now()
+			modTime := DefaultAttributes(entry.IsDir).Mtime
 			size := int64(0)
 			if entry.Attributes != nil {
 				mode = entry.Attributes.Mode
