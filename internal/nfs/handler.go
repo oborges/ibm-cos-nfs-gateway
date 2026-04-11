@@ -135,44 +135,53 @@ func (h *COSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.
 }
 
 // ToHandle converts a filesystem path to an opaque file handle
+// File handles are deterministic and based on the path itself, making them
+// persistent across server restarts (no "stale file handle" errors)
 func (h *COSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
-	h.handleLock.Lock()
-	defer h.handleLock.Unlock()
-
-	// Create a unique hash for this path
+	// Create a deterministic handle by encoding the path directly
+	// Format: path_length|path_component1|path_component2|...
 	pathStr := strings.Join(path, "/")
+	
+	// Use a simple encoding: length prefix + path
+	// This makes handles deterministic and doesn't require storage
+	handle := []byte(pathStr)
+	
+	// Store in cache for HandleLimit tracking (optional, for LRU eviction)
+	h.handleLock.Lock()
 	hash := sha256.Sum256([]byte(pathStr))
 	hashStr := hex.EncodeToString(hash[:])
-
-	// Store the mapping
 	h.handleMap[hashStr] = &handleEntry{
 		path: path,
 		hash: hashStr,
 	}
-
-	// Return the hash as the handle
-	return []byte(hashStr)
+	h.handleLock.Unlock()
+	
+	return handle
 }
 
 // FromHandle converts an opaque file handle back to a filesystem and path
+// Since handles encode the path directly, this works across server restarts
 func (h *COSHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	h.handleLock.RLock()
-	defer h.handleLock.RUnlock()
-
-	hashStr := string(fh)
-	entry, ok := h.handleMap[hashStr]
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid file handle")
+	// Decode the path from the handle
+	pathStr := string(fh)
+	if pathStr == "" {
+		return nil, []string{}, nil // Root directory
 	}
-
-	// Return a new filesystem instance with the stored path
+	
+	// Split path into components
+	var path []string
+	if pathStr != "" {
+		path = strings.Split(pathStr, "/")
+	}
+	
+	// Return a new filesystem instance with the decoded path
 	fs := &COSFilesystem{
 		ops:    h.ops,
 		logger: h.logger,
 		root:   "/",
 	}
 
-	return fs, entry.path, nil
+	return fs, path, nil
 }
 
 // InvalidateHandle removes a file handle from the cache
