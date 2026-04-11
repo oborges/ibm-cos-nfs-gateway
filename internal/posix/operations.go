@@ -322,7 +322,20 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		// Convert children names to FileInfo by statting each one
 		entries := make([]*FileInfo, 0, len(entry.Children))
 		failedStats := 0
-		for _, childName := range entry.Children {
+		maxFailures := len(entry.Children) / 2
+		
+		for i, childName := range entry.Children {
+			// Check failure threshold early - if >50% have failed, stop and re-list
+			if failedStats > maxFailures {
+				log.Warn("Too many cached children not found, invalidating cache and re-listing",
+					zap.String("path", path),
+					zap.Int("failed", failedStats),
+					zap.Int("checked", i),
+					zap.Int("total", len(entry.Children)))
+				h.metadataCache.InvalidatePath(path)
+				break
+			}
+			
 			childPath := path
 			if path == "/" {
 				childPath = "/" + childName
@@ -334,15 +347,6 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			info, err := h.Stat(ctx, childPath)
 			if err != nil {
 				failedStats++
-				// If too many children fail to stat, invalidate cache and re-list
-				if failedStats > len(entry.Children)/2 {
-					log.Warn("Too many cached children not found, invalidating cache and re-listing",
-						zap.String("path", path),
-						zap.Int("failed", failedStats),
-						zap.Int("total", len(entry.Children)))
-					h.metadataCache.InvalidatePath(path)
-					break
-				}
 				log.Debug("Cached child not found, skipping",
 					zap.String("child", childName))
 				continue
@@ -351,7 +355,7 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		}
 		
 		// If we successfully got most entries, return them
-		if failedStats <= len(entry.Children)/2 {
+		if failedStats <= maxFailures {
 			log.Debug("Directory listing from cache successful",
 				zap.Int("entries", len(entries)),
 				zap.Int("skipped", failedStats))
