@@ -35,7 +35,7 @@ func (h *StableVerifierHandler) VerifierFor(path string, contents []fs.FileInfo)
 	// Check if we already have a verifier for this path
 	if v, ok := h.verifiers.Load(path); ok {
 		verifier := v.(uint64)
-		h.logger.Debug("Reusing stable verifier",
+		h.logger.Info("STABLE VERIFIER: Reusing verifier",
 			"path", path,
 			"verifier", verifier,
 			"entries", len(contents))
@@ -52,7 +52,7 @@ func (h *StableVerifierHandler) VerifierFor(path string, contents []fs.FileInfo)
 	// Store for future use
 	h.verifiers.Store(path, verifier)
 
-	h.logger.Info("Generated stable verifier",
+	h.logger.Info("STABLE VERIFIER: Generated new verifier",
 		"path", path,
 		"verifier", verifier,
 		"entries", len(contents))
@@ -63,21 +63,39 @@ func (h *StableVerifierHandler) VerifierFor(path string, contents []fs.FileInfo)
 // DataForVerifier checks if we have cached data for a verifier
 // Since we use stable verifiers, we delegate to the wrapped handler
 func (h *StableVerifierHandler) DataForVerifier(path string, verifier uint64) []fs.FileInfo {
+	h.logger.Info("STABLE VERIFIER: DataForVerifier called",
+		"path", path,
+		"requested_verifier", verifier)
+	
 	// Check if this is our stable verifier for this path
 	if v, ok := h.verifiers.Load(path); ok {
-		if v.(uint64) == verifier {
+		storedVerifier := v.(uint64)
+		h.logger.Info("STABLE VERIFIER: Comparing verifiers",
+			"path", path,
+			"stored", storedVerifier,
+			"requested", verifier,
+			"match", storedVerifier == verifier)
+			
+		if storedVerifier == verifier {
 			// Verifier matches - delegate to wrapped handler
 			if ch, ok := h.Handler.(gonfs.CachingHandler); ok {
 				data := ch.DataForVerifier(path, verifier)
 				if data != nil {
-					h.logger.Debug("Cache hit for stable verifier",
+					h.logger.Info("STABLE VERIFIER: Cache hit",
 						"path", path,
 						"verifier", verifier,
 						"entries", len(data))
+				} else {
+					h.logger.Info("STABLE VERIFIER: Cache miss (no data)",
+						"path", path,
+						"verifier", verifier)
 				}
 				return data
 			}
 		}
+	} else {
+		h.logger.Info("STABLE VERIFIER: No stored verifier for path",
+			"path", path)
 	}
 
 	// No match or no cached data
