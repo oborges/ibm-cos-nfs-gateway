@@ -68,22 +68,27 @@ fi
 if [ "$SPECIFIC_TEST" = "all" ] || [ "$SPECIFIC_TEST" = "2" ]; then
     echo -e "${BLUE}Test 2: Sequential Read (100MB)${NC}"
     
-    if [ "$SPECIFIC_TEST" = "2" ]; then
-        # Show debug info when running individual test
-        echo -e "${YELLOW}Debug: Checking if write.0.0 file exists...${NC}"
-        if [ -f "$TEST_DIR/write.0.0" ]; then
-            ls -lh "$TEST_DIR/write.0.0"
-        else
-            echo -e "${RED}Warning: write.0.0 file not found!${NC}"
+    # Check if file exists before attempting to read
+    if [ ! -f "$TEST_DIR/write.0.0" ]; then
+        echo -e "${RED}Error: write.0.0 file not found! Skipping read test.${NC}"
+        if [ "$SPECIFIC_TEST" = "2" ]; then
+            echo -e "${YELLOW}Files in test directory:${NC}"
+            ls -la "$TEST_DIR/"
         fi
-        echo -e "${YELLOW}Running fio read test...${NC}"
-        fio --name=write --directory="$TEST_DIR" --rw=read \
-            --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1
     else
-        # Clean output when running all tests
-        fio --name=write --directory="$TEST_DIR" --rw=read \
-            --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1 | \
-            grep -E "read: IOPS=|bw=" | head -2
+        if [ "$SPECIFIC_TEST" = "2" ]; then
+            # Show debug info when running individual test
+            echo -e "${YELLOW}Debug: File exists:${NC}"
+            ls -lh "$TEST_DIR/write.0.0"
+            echo -e "${YELLOW}Running fio read test...${NC}"
+            fio --name=write --directory="$TEST_DIR" --rw=read \
+                --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1
+        else
+            # Clean output when running all tests
+            fio --name=write --directory="$TEST_DIR" --rw=read \
+                --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1 | \
+                grep -E "read: IOPS=|READ:" | head -2
+        fi
     fi
     echo
 fi
