@@ -122,6 +122,39 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		return info, nil
 	}
 
+	// Check if it's an implicit directory (has children but no marker object)
+	// This happens when directories are created implicitly by uploading files
+	prefix := objectKey
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	
+	result, err := h.cosClient.ListObjects(ctx, prefix, 1)
+	if err == nil && len(result.Contents) > 0 {
+		// It's an implicit directory - has children
+		log.Debug("Implicit directory detected", zap.String("prefix", prefix))
+		
+		// Use default directory attributes
+		attrs := &POSIXAttributes{
+			Mode:  0755 | os.ModeDir,
+			Mtime: time.Now(),
+		}
+		
+		info := &FileInfo{
+			name:    GetBaseName(path),
+			size:    0,
+			mode:    attrs.Mode,
+			modTime: attrs.Mtime,
+			isDir:   true,
+		}
+
+		// Cache the result
+		h.metadataCache.SetFileInfo(path, info, attrs)
+
+		log.Debug("Implicit directory stat successful")
+		return info, nil
+	}
+
 	log.Debug("Path not found")
 	return nil, os.ErrNotExist
 }
