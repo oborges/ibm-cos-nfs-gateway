@@ -457,6 +457,7 @@ type COSFile struct {
 	isNew  bool
 	data   []byte
 	loaded bool
+	size   int64  // File size (for read-only files without data loaded)
 }
 
 // Name returns the file name
@@ -480,6 +481,11 @@ func (f *COSFile) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
+	// Check if we're at or past EOF
+	if f.offset >= f.size {
+		return 0, io.EOF
+	}
+
 	// Read-only file: fetch data on-demand using range read
 	data, err := f.ops.ReadFile(context.Background(), f.path, f.offset, int64(len(p)))
 	if err != nil {
@@ -498,8 +504,11 @@ func (f *COSFile) Read(p []byte) (int, error) {
 	n := copy(p, data)
 	f.offset += int64(n)
 	
-	// Only return EOF if we got less data than requested AND we're likely at end of file
-	// Don't return EOF just because we got partial data - that's normal for streaming
+	// Return EOF if we're now at end of file
+	if f.offset >= f.size {
+		return n, io.EOF
+	}
+	
 	return n, nil
 }
 
@@ -546,13 +555,20 @@ func (f *COSFile) Seek(offset int64, whence int) (int64, error) {
 		return 0, err
 	}
 
+	var fileSize int64
+	if f.data != nil {
+		fileSize = int64(len(f.data))
+	} else {
+		fileSize = f.size
+	}
+
 	switch whence {
 	case io.SeekStart:
 		f.offset = offset
 	case io.SeekCurrent:
 		f.offset += offset
 	case io.SeekEnd:
-		f.offset = int64(len(f.data)) + offset
+		f.offset = fileSize + offset
 	default:
 		return 0, fmt.Errorf("invalid whence")
 	}
@@ -592,6 +608,11 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 		return n, nil
 	}
 
+	// Check if we're at or past EOF
+	if off >= f.size {
+		return 0, io.EOF
+	}
+
 	// Read-only file: fetch data on-demand using range read
 	data, err := f.ops.ReadFile(context.Background(), f.path, off, int64(len(p)))
 	if err != nil {
@@ -608,7 +629,12 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	n := copy(p, data)
-	// Don't return EOF just because we got partial data
+	
+	// Return EOF if this read extends to or past end of file
+	if off+int64(n) >= f.size {
+		return n, io.EOF
+	}
+	
 	return n, nil
 }
 
@@ -638,8 +664,13 @@ func (f *COSFile) ensureLoaded() error {
 	// For read-only files, don't load entire file into memory
 	// Instead, use lazy loading and read from COS on demand
 	if f.flag&(os.O_WRONLY|os.O_RDWR) == 0 {
-		// Read-only mode - mark as loaded but don't actually load data
+		// Read-only mode - get file size but don't load data
 		// Data will be fetched on-demand in Read/ReadAt operations
+		info, err := f.ops.Stat(context.Background(), f.path)
+		if err != nil {
+			return err
+		}
+		f.size = info.Size()
 		f.loaded = true
 		f.data = nil
 		return nil
@@ -652,6 +683,7 @@ func (f *COSFile) ensureLoaded() error {
 	}
 
 	f.data = data
+	f.size = int64(len(data))
 	f.loaded = true
 	return nil
 }
