@@ -362,9 +362,9 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		callCount := counters.ListDirCalls.Load()
 		if callCount == 1 || !cacheHit || duration > 10*time.Millisecond {
 			log.Info("ListDirectory",
-				"cache_hit", cacheHit,
-				"duration_ms", duration.Milliseconds(),
-				"call_number", callCount)
+				zap.Bool("cache_hit", cacheHit),
+				zap.Int64("duration_ms", duration.Milliseconds()),
+				zap.Int64("call_number", callCount))
 		}
 	}()
 
