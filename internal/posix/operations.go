@@ -318,7 +318,30 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 	if entry, ok := h.metadataCache.Get(path); ok && entry.Children != nil {
 		metrics.RecordCacheHit("metadata")
 		log.Debug("Directory listing cache hit", zap.Int("entries", len(entry.Children)))
-		// TODO: Convert children to FileInfo
+		
+		// Convert children names to FileInfo by statting each one
+		entries := make([]*FileInfo, 0, len(entry.Children))
+		for _, childName := range entry.Children {
+			childPath := path
+			if path == "/" {
+				childPath = "/" + childName
+			} else {
+				childPath = path + "/" + childName
+			}
+			
+			// Get file info from cache or COS
+			info, err := h.Stat(ctx, childPath)
+			if err != nil {
+				log.Warn("Failed to stat cached child",
+					zap.String("child", childName),
+					zap.Error(err))
+				continue
+			}
+			entries = append(entries, info)
+		}
+		
+		log.Debug("Directory listing from cache successful", zap.Int("entries", len(entries)))
+		return entries, nil
 	}
 	metrics.RecordCacheMiss("metadata")
 
