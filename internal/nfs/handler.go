@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/oborges/cos-nfs-gateway/internal/buffer"
+	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	nfs "github.com/willscott/go-nfs"
@@ -189,17 +190,43 @@ func (h *COSHandler) HandleLimit() int {
 
 // COSFilesystem implements billy.Filesystem interface for COS
 type COSFilesystem struct {
-	ops    *posix.OperationsHandler
-	logger *Logger
-	root   string
+	ops       *posix.OperationsHandler
+	logger    *Logger
+	root      string
+	perfConfig *config.PerformanceConfig
 }
 
-// NewCOSFilesystem creates a new COS filesystem
+// NewCOSFilesystem creates a new COS filesystem (deprecated, use NewCOSFilesystemWithConfig)
 func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string) *COSFilesystem {
+	// Use default config if not provided
+	defaultConfig := &config.PerformanceConfig{
+		WriteBufferKB:        4096,
+		MultipartThresholdMB: 100,
+		MultipartChunkMB:     10,
+		ReadAheadKB:          1024,
+	}
 	return &COSFilesystem{
-		ops:    ops,
-		logger: logger,
-		root:   root,
+		ops:        ops,
+		logger:     logger,
+		root:       root,
+		perfConfig: defaultConfig,
+	}
+}
+
+// NewCOSFilesystemWithConfig creates a new COS filesystem with configuration
+func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig) *COSFilesystem {
+	logger.Info("Initializing COS filesystem with configuration",
+		"write_buffer_kb", perfConfig.WriteBufferKB,
+		"write_buffer_bytes", perfConfig.WriteBufferKB*1024,
+		"multipart_threshold_mb", perfConfig.MultipartThresholdMB,
+		"multipart_chunk_mb", perfConfig.MultipartChunkMB,
+		"read_ahead_kb", perfConfig.ReadAheadKB)
+	
+	return &COSFilesystem{
+		ops:        ops,
+		logger:     logger,
+		root:       root,
+		perfConfig: perfConfig,
 	}
 }
 
@@ -218,12 +245,13 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	fullPath := fs.Join(fs.root, filename)
 
 	file := &COSFile{
-		ops:    fs.ops,
-		logger: fs.logger,
-		path:   fullPath,
-		flag:   flag,
-		perm:   perm,
-		offset: 0,
+		ops:        fs.ops,
+		logger:     fs.logger,
+		path:       fullPath,
+		flag:       flag,
+		perm:       perm,
+		offset:     0,
+		perfConfig: fs.perfConfig,
 	}
 
 	// Check if file exists
@@ -462,19 +490,20 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 
 // COSFile implements billy.File interface
 type COSFile struct {
-	ops        *posix.OperationsHandler
-	logger     *Logger
-	path       string
-	flag       int
-	perm       os.FileMode
-	offset     int64
-	isNew      bool
-	data       []byte
-	loaded     bool
-	size       int64  // File size (for read-only files without data loaded)
-	writeBuffer *buffer.WriteBuffer  // Write buffer for efficient writes
-	flushCount  int    // Number of flushes performed
+	ops          *posix.OperationsHandler
+	logger       *Logger
+	path         string
+	flag         int
+	perm         os.FileMode
+	offset       int64
+	isNew        bool
+	data         []byte
+	loaded       bool
+	size         int64  // File size (for read-only files without data loaded)
+	writeBuffer  *buffer.WriteBuffer  // Write buffer for efficient writes
+	flushCount   int    // Number of flushes performed
 	totalFlushed int64  // Total bytes flushed
+	perfConfig   *config.PerformanceConfig // Performance configuration
 }
 
 // Name returns the file name
@@ -548,10 +577,13 @@ func (f *COSFile) Write(p []byte) (int, error) {
 
 	// Initialize write buffer if needed
 	if f.writeBuffer == nil {
-		f.writeBuffer = buffer.NewWriteBuffer(8 * 1024 * 1024) // 8MB threshold
+		bufferSize := int64(f.perfConfig.WriteBufferKB) * 1024
+		f.writeBuffer = buffer.NewWriteBuffer(bufferSize)
 		f.logger.Info("Initialized write buffer",
 			"path", f.path,
-			"threshold", "8MB")
+			"threshold_kb", f.perfConfig.WriteBufferKB,
+			"threshold_bytes", bufferSize,
+			"threshold_mb", float64(bufferSize)/(1024*1024))
 	}
 
 	// Write to buffer
@@ -569,10 +601,14 @@ func (f *COSFile) Write(p []byte) (int, error) {
 
 	// Check if we should flush
 	if f.writeBuffer.ShouldFlush() {
+		bufferSize := f.writeBuffer.Size()
+		thresholdBytes := int64(f.perfConfig.WriteBufferKB) * 1024
 		f.logger.Info("Write buffer threshold reached, flushing",
 			"path", f.path,
-			"buffer_size", f.writeBuffer.Size(),
-			"threshold", "8MB")
+			"buffer_size_bytes", bufferSize,
+			"buffer_size_mb", float64(bufferSize)/(1024*1024),
+			"threshold_bytes", thresholdBytes,
+			"threshold_mb", float64(thresholdBytes)/(1024*1024))
 		
 		if err := f.flushBuffer(); err != nil {
 			f.logger.Error("Failed to flush buffer",
@@ -676,7 +712,8 @@ func (f *COSFile) flushBuffer() error {
 		"total_flushed", f.totalFlushed)
 
 	// Clear the buffer after successful flush
-	f.writeBuffer = buffer.NewWriteBuffer(8 * 1024 * 1024)
+	bufferSize := int64(f.perfConfig.WriteBufferKB) * 1024
+	f.writeBuffer = buffer.NewWriteBuffer(bufferSize)
 
 	return nil
 }

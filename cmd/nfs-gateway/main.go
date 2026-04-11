@@ -63,6 +63,20 @@ func main() {
 		zap.String("version", Version),
 	)
 
+	// Log effective configuration
+	logging.Info("Configuration loaded",
+		zap.Int("write_buffer_kb", cfg.Performance.WriteBufferKB),
+		zap.Int("write_buffer_bytes", cfg.Performance.WriteBufferKB*1024),
+		zap.Int("multipart_threshold_mb", cfg.Performance.MultipartThresholdMB),
+		zap.Int("multipart_chunk_mb", cfg.Performance.MultipartChunkMB),
+		zap.Int("read_ahead_kb", cfg.Performance.ReadAheadKB),
+		zap.Bool("data_cache_enabled", cfg.Cache.Data.Enabled),
+		zap.Bool("metadata_cache_enabled", cfg.Cache.Metadata.Enabled),
+		zap.Int("data_cache_size_gb", cfg.Cache.Data.SizeGB),
+		zap.Int("metadata_cache_size_mb", cfg.Cache.Metadata.SizeMB),
+		zap.String("log_level", cfg.Logging.Level),
+	)
+
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -118,8 +132,8 @@ func main() {
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
 	
-	// Create billy.Filesystem implementation
-	cosFilesystem := nfs.NewCOSFilesystem(operations, nfsLogger, "/")
+	// Create billy.Filesystem implementation with config
+	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance)
 	
 	// Wrap with null auth handler, then caching handler
 	authHandler := nfshelper.NewNullAuthHandler(cosFilesystem)
