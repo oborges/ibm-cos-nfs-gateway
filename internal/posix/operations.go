@@ -79,9 +79,10 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			}, nil
 		}
 		// Implicit directory - fall through to validate
-		log.Debug("Skipping cache for implicit directory, validating existence")
+		log.Info("Implicit directory detected, validating existence", zap.String("path", path))
 	}
 	metrics.RecordCacheMiss("metadata")
+	log.Info("Stat cache miss", zap.String("path", path))
 
 	// Translate path to object key
 	objectKey := h.translator.ToObjectKey(path)
@@ -347,12 +348,15 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 	log := logging.WithOperation("ListDirectory").With(zap.String("path", path))
 	start := time.Now()
 	defer func() {
-		metrics.RecordNFSRequest("readdir", "success", time.Since(start))
+		duration := time.Since(start)
+		metrics.RecordNFSRequest("readdir", "success", duration)
+		log.Info("ListDirectory completed", zap.Duration("duration", duration))
 	}()
 
 	// Check cache first - NEW: Return full FileInfo entries directly (O(1) cache hit)
 	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
 		metrics.RecordCacheHit("metadata")
+		log.Info("ListDirectory cache hit", zap.Int("entries", len(entry.ChildEntries)))
 		
 		// Convert []os.FileInfo to []*FileInfo (just type assertion, no COS calls)
 		entries := make([]*FileInfo, len(entry.ChildEntries))
@@ -383,15 +387,18 @@ fetchFromCOS:
 
 	// List from COS
 	prefix := ListPrefix(path)
-	log.Debug("Listing directory", zap.String("prefix", prefix))
+	log.Info("ListDirectory cache miss, fetching from COS", zap.String("prefix", prefix))
 	
+	cosStart := time.Now()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1000)
 	if err != nil {
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
 	}
 
-	log.Debug("Got objects from COS", zap.Int("count", len(objects)))
+	log.Info("Got objects from COS",
+		zap.Int("count", len(objects)),
+		zap.Duration("cos_duration", time.Since(cosStart)))
 
 	// Convert to FileInfo
 	entries := make([]*FileInfo, 0, len(objects))
@@ -459,7 +466,7 @@ fetchFromCOS:
 	}
 	h.metadataCache.SetDirEntries(path, osEntries)
 
-	log.Debug("Directory listed successfully", zap.Int("entries", len(entries)))
+	log.Info("Directory listed and cached", zap.Int("entries", len(entries)))
 	return entries, nil
 }
 
