@@ -174,8 +174,13 @@ func main() {
 	// Create billy.Filesystem implementation with config
 	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
 	
+	// Wrap with directory caching to work around go-nfs library limitation
+	// The go-nfs library doesn't use CachingHandler for READDIR, so we cache at filesystem level
+	// Use 30-second TTL - long enough to handle pagination, short enough to see updates
+	cachedFS := nfs.NewCachedFilesystem(cosFilesystem, nfsLogger, 30*time.Second)
+	
 	// Wrap with instrumentation to track NFS-level behavior
-	instrumentedFS := nfs.NewInstrumentedFilesystem(cosFilesystem, nfsLogger)
+	instrumentedFS := nfs.NewInstrumentedFilesystem(cachedFS, nfsLogger)
 	
 	// Wrap with null auth handler, then caching handler
 	// Use large cache to prevent verifier eviction during directory pagination
