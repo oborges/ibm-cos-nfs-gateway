@@ -518,6 +518,10 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	// Check if it's a directory (intercepting Staging files via fs.Stat)
 	info, err := fs.Stat(filename)
 	if err != nil {
+		if os.IsNotExist(err) {
+			fs.logger.Debug("Remove called on non-existent path (likely implicit directory), treating as success", zap.String("path", fullPath))
+			return nil
+		}
 		return err
 	}
 
