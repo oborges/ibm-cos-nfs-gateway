@@ -321,6 +321,7 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 		
 		// Convert children names to FileInfo by statting each one
 		entries := make([]*FileInfo, 0, len(entry.Children))
+		failedStats := 0
 		for _, childName := range entry.Children {
 			childPath := path
 			if path == "/" {
@@ -332,16 +333,31 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			// Get file info from cache or COS
 			info, err := h.Stat(ctx, childPath)
 			if err != nil {
-				log.Warn("Failed to stat cached child",
-					zap.String("child", childName),
-					zap.Error(err))
+				failedStats++
+				// If too many children fail to stat, invalidate cache and re-list
+				if failedStats > len(entry.Children)/2 {
+					log.Warn("Too many cached children not found, invalidating cache and re-listing",
+						zap.String("path", path),
+						zap.Int("failed", failedStats),
+						zap.Int("total", len(entry.Children)))
+					h.metadataCache.InvalidatePath(path)
+					break
+				}
+				log.Debug("Cached child not found, skipping",
+					zap.String("child", childName))
 				continue
 			}
 			entries = append(entries, info)
 		}
 		
-		log.Debug("Directory listing from cache successful", zap.Int("entries", len(entries)))
-		return entries, nil
+		// If we successfully got most entries, return them
+		if failedStats <= len(entry.Children)/2 {
+			log.Debug("Directory listing from cache successful",
+				zap.Int("entries", len(entries)),
+				zap.Int("skipped", failedStats))
+			return entries, nil
+		}
+		// Otherwise fall through to re-list from COS
 	}
 	metrics.RecordCacheMiss("metadata")
 
