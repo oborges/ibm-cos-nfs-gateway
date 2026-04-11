@@ -44,10 +44,14 @@ fio --name=write --directory="$TEST_DIR" --rw=write \
     grep -E "write: IOPS=|bw=" | head -2
 echo
 
+# Wait a moment for file to be available
+sleep 2
+
 # Test 2: Sequential Read
 echo -e "${BLUE}Test 2: Sequential Read (100MB)${NC}"
+# Use readwrite mode to ensure file exists, then read it
 fio --name=write --directory="$TEST_DIR" --rw=read \
-    --bs=1M --size=100M --numjobs=1 --direct=0 2>&1 | \
+    --bs=1M --size=100M --numjobs=1 --direct=0 --readonly 2>&1 | \
     grep -E "read: IOPS=|bw=" | head -2
 echo
 
