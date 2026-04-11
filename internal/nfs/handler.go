@@ -135,53 +135,52 @@ func (h *COSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.
 }
 
 // ToHandle converts a filesystem path to an opaque file handle
-// File handles are deterministic and based on the path itself, making them
-// persistent across server restarts (no "stale file handle" errors)
+// Uses SHA256 hash for deterministic, fixed-size handles (32 bytes)
 func (h *COSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
-	// Create a deterministic handle by encoding the path directly
-	// Format: path_length|path_component1|path_component2|...
 	pathStr := strings.Join(path, "/")
 	
-	// Use a simple encoding: length prefix + path
-	// This makes handles deterministic and doesn't require storage
-	handle := []byte(pathStr)
-	
-	// Store in cache for HandleLimit tracking (optional, for LRU eviction)
-	h.handleLock.Lock()
+	// Create deterministic hash (32 bytes, well within NFS 64-byte limit)
 	hash := sha256.Sum256([]byte(pathStr))
 	hashStr := hex.EncodeToString(hash[:])
+	
+	// Store mapping in memory
+	h.handleLock.Lock()
 	h.handleMap[hashStr] = &handleEntry{
 		path: path,
 		hash: hashStr,
 	}
 	h.handleLock.Unlock()
 	
-	return handle
+	// Return raw hash bytes (not hex string)
+	return hash[:]
 }
 
 // FromHandle converts an opaque file handle back to a filesystem and path
-// Since handles encode the path directly, this works across server restarts
 func (h *COSHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	// Decode the path from the handle
-	pathStr := string(fh)
-	if pathStr == "" {
+	if len(fh) == 0 {
 		return nil, []string{}, nil // Root directory
 	}
 	
-	// Split path into components
-	var path []string
-	if pathStr != "" {
-		path = strings.Split(pathStr, "/")
+	// Convert handle bytes to hex string for lookup
+	hashStr := hex.EncodeToString(fh)
+	
+	// Look up path in memory
+	h.handleLock.RLock()
+	entry, ok := h.handleMap[hashStr]
+	h.handleLock.RUnlock()
+	
+	if !ok {
+		return nil, nil, fmt.Errorf("invalid file handle: %s", hashStr[:16])
 	}
 	
-	// Return a new filesystem instance with the decoded path
+	// Return filesystem instance with decoded path
 	fs := &COSFilesystem{
 		ops:    h.ops,
 		logger: h.logger,
 		root:   "/",
 	}
 
-	return fs, path, nil
+	return fs, entry.path, nil
 }
 
 // InvalidateHandle removes a file handle from the cache
