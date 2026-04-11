@@ -232,7 +232,7 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfsHandler.EnableTracing()
+		nfs.EnableTracing()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing enabled\n"))
 	})
@@ -242,13 +242,13 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfsHandler.DisableTracing()
+		nfs.DisableTracing()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing disabled\n"))
 	})
 	
 	http.HandleFunc("/debug/readdir/traces", func(w http.ResponseWriter, r *http.Request) {
-		traces := nfsHandler.GetAllTraces()
+		traces := nfs.GetAllTraces()
 		
 		// Analyze each trace
 		result := make(map[string]interface{})
@@ -267,7 +267,7 @@ func main() {
 			return
 		}
 		
-		trace := nfsHandler.GetTrace(path)
+		trace := nfs.GetTrace(path)
 		if trace == nil {
 			http.Error(w, "No trace found for path", http.StatusNotFound)
 			return
@@ -283,7 +283,7 @@ func main() {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		nfsHandler.ClearTraces()
+		nfs.ClearTraces()
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR traces cleared\n"))
 	})
