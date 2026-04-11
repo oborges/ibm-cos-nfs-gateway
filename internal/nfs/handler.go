@@ -316,23 +316,40 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	_, err := fs.ops.Stat(context.Background(), fullPath)
 	fileExists := err == nil
 
-	// If using staging path, get or create staging session for writable files
-	if useStagingPath && (flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0) {
-		session, err := fs.stagingManager.GetOrCreateSession(fullPath)
-		if err != nil {
-			fs.logger.Error("Failed to get staging session",
+	// If using staging path, get or create staging session
+	// For writable files: create if needed
+	// For read-only files: get existing session if file is being staged
+	if useStagingPath {
+		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+			// Writable file: get or create session
+			session, err := fs.stagingManager.GetOrCreateSession(fullPath)
+			if err != nil {
+				fs.logger.Error("Failed to get staging session",
+					"file_id", fileID,
+					"path", fullPath,
+					"error", err)
+				return nil, err
+			}
+			file.stagingSession = session
+			session.IncrementRefCount()
+			
+			fs.logger.Info("Staging session acquired for write",
 				"file_id", fileID,
 				"path", fullPath,
-				"error", err)
-			return nil, err
+				"ref_count", session.GetRefCount())
+		} else {
+			// Read-only file: check if there's an existing staging session
+			session, exists := fs.stagingManager.GetSession(fullPath)
+			if exists {
+				file.stagingSession = session
+				session.IncrementRefCount()
+				
+				fs.logger.Info("Staging session acquired for read",
+					"file_id", fileID,
+					"path", fullPath,
+					"ref_count", session.GetRefCount())
+			}
 		}
-		file.stagingSession = session
-		session.IncrementRefCount()
-		
-		fs.logger.Info("Staging session acquired",
-			"file_id", fileID,
-			"path", fullPath,
-			"ref_count", session.GetRefCount())
 	}
 
 	// If creating a new file
