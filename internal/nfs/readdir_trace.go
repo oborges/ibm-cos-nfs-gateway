@@ -2,7 +2,7 @@ package nfs
 
 import (
 	"fmt"
-	"os"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -208,7 +208,7 @@ func (pt *PathTrace) getFirstN(n int) []int {
 }
 
 // PrintTrace prints a human-readable trace
-func (pt *PathTrace) PrintTrace(w *os.File) {
+func (pt *PathTrace) PrintTrace(w io.Writer) {
 	if pt == nil {
 		fmt.Fprintf(w, "No trace data\n")
 		return
