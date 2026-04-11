@@ -138,8 +138,9 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 		metrics.RecordNFSRequest("read", "success", time.Since(start))
 	}()
 
-	// Try cache first
-	if h.dataCache.IsEnabled() {
+	// Try cache first - but only for full file reads
+	// The cache is designed for complete files, not partial ranges
+	if h.dataCache.IsEnabled() && offset == 0 && length == 0 {
 		if data, err := h.dataCache.Read(path, offset, length); err == nil {
 			metrics.RecordCacheHit("data")
 			metrics.RecordBytesRead(int64(len(data)))
@@ -156,10 +157,10 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 	var err error
 	
 	if length > 0 {
-		// Range read
+		// Range read - don't cache partial reads
 		data, err = h.cosClient.GetObjectRange(ctx, objectKey, offset, length)
 	} else {
-		// Full read
+		// Full read - can be cached
 		data, err = h.cosClient.GetObject(ctx, objectKey)
 	}
 
@@ -168,8 +169,8 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 		return nil, err
 	}
 
-	// Cache the data
-	if h.dataCache.IsEnabled() && len(data) > 0 {
+	// Cache the data - but only for full file reads
+	if h.dataCache.IsEnabled() && len(data) > 0 && offset == 0 && length == 0 {
 		if err := h.dataCache.Write(path, data); err != nil {
 			log.Warn("Failed to cache data", zap.Error(err))
 		}
