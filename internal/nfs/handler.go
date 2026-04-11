@@ -483,15 +483,23 @@ func (f *COSFile) Read(p []byte) (int, error) {
 	// Read-only file: fetch data on-demand using range read
 	data, err := f.ops.ReadFile(context.Background(), f.path, f.offset, int64(len(p)))
 	if err != nil {
+		// Check if it's EOF (no more data to read)
+		if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
+			return 0, io.EOF
+		}
 		return 0, err
+	}
+
+	// If we got no data, we're at EOF
+	if len(data) == 0 {
+		return 0, io.EOF
 	}
 
 	n := copy(p, data)
 	f.offset += int64(n)
 	
-	if n < len(p) {
-		return n, io.EOF
-	}
+	// Only return EOF if we got less data than requested AND we're likely at end of file
+	// Don't return EOF just because we got partial data - that's normal for streaming
 	return n, nil
 }
 
@@ -587,13 +595,20 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 	// Read-only file: fetch data on-demand using range read
 	data, err := f.ops.ReadFile(context.Background(), f.path, off, int64(len(p)))
 	if err != nil {
+		// Check if it's EOF (no more data to read)
+		if err.Error() == "EOF" || strings.Contains(err.Error(), "EOF") {
+			return 0, io.EOF
+		}
 		return 0, err
 	}
 
-	n := copy(p, data)
-	if n < len(p) {
-		return n, io.EOF
+	// If we got no data, we're at EOF
+	if len(data) == 0 {
+		return 0, io.EOF
 	}
+
+	n := copy(p, data)
+	// Don't return EOF just because we got partial data
 	return n, nil
 }
 
