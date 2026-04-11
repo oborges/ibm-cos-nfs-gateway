@@ -129,16 +129,13 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		prefix += "/"
 	}
 	
-	result, err := h.cosClient.ListObjects(ctx, prefix, 1)
-	if err == nil && len(result.Contents) > 0 {
+	objects, err := h.cosClient.ListObjects(ctx, prefix, 1)
+	if err == nil && len(objects) > 0 {
 		// It's an implicit directory - has children
 		log.Debug("Implicit directory detected", zap.String("prefix", prefix))
 		
 		// Use default directory attributes
-		attrs := &POSIXAttributes{
-			Mode:  0755 | os.ModeDir,
-			Mtime: time.Now(),
-		}
+		attrs := DefaultAttributes(true)
 		
 		info := &FileInfo{
 			name:    GetBaseName(path),
