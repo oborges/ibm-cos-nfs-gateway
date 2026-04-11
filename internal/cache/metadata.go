@@ -25,6 +25,7 @@ type MetadataEntry struct {
 	IsDir      bool
 	Children   []string // For directory listings
 	CachedAt   time.Time
+	IsImplicit bool     // True if directory has no marker object (needs validation)
 }
 
 // NewMetadataCache creates a new metadata cache
@@ -87,6 +88,11 @@ func (c *MetadataCache) Set(path string, entry *MetadataEntry) {
 
 // SetFileInfo stores file info in cache
 func (c *MetadataCache) SetFileInfo(path string, info os.FileInfo, attrs *types.POSIXAttributes) {
+	c.SetFileInfoWithFlags(path, info, attrs, false)
+}
+
+// SetFileInfoWithFlags stores file info in cache with additional flags
+func (c *MetadataCache) SetFileInfoWithFlags(path string, info os.FileInfo, attrs *types.POSIXAttributes, isImplicit bool) {
 	if !c.enabled {
 		return
 	}
@@ -96,9 +102,14 @@ func (c *MetadataCache) SetFileInfo(path string, info os.FileInfo, attrs *types.
 		Attributes: attrs,
 		IsDir:      info.IsDir(),
 		CachedAt:   time.Now(),
+		IsImplicit: isImplicit,
 	}
 	c.cache.Set(path, entry)
-	logging.Debug("File info cached", zap.String("path", path))
+	if isImplicit {
+		logging.Debug("Implicit directory cached (will be validated on next access)", zap.String("path", path))
+	} else {
+		logging.Debug("File info cached", zap.String("path", path))
+	}
 }
 
 // SetDirListing stores directory listing in cache

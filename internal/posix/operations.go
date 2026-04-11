@@ -46,35 +46,40 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		metrics.RecordNFSRequest("stat", "success", time.Since(start))
 	}()
 
-	// Check cache first
+	// Check cache first, but skip if it's an implicit directory (needs validation)
 	if entry, ok := h.metadataCache.Get(path); ok {
-		metrics.RecordCacheHit("metadata")
-		log.Debug("Metadata cache hit")
-		
-		// If we have FileInfo, use it directly
-		if entry.FileInfo != nil {
-			return entry.FileInfo.(*FileInfo), nil
+		// If it's an implicit directory, don't trust the cache - validate it exists
+		if !entry.IsImplicit {
+			metrics.RecordCacheHit("metadata")
+			log.Debug("Metadata cache hit")
+			
+			// If we have FileInfo, use it directly
+			if entry.FileInfo != nil {
+				return entry.FileInfo.(*FileInfo), nil
+			}
+			
+			// Fallback: construct from attributes
+			mode := os.FileMode(0644)
+			modTime := time.Now()
+			size := int64(0)
+			if entry.Attributes != nil {
+				mode = entry.Attributes.Mode
+				modTime = entry.Attributes.Mtime
+			}
+			if entry.IsDir {
+				mode = mode | os.ModeDir
+			}
+			
+			return &FileInfo{
+				name:    GetBaseName(path),
+				size:    size,
+				mode:    mode,
+				modTime: modTime,
+				isDir:   entry.IsDir,
+			}, nil
 		}
-		
-		// Fallback: construct from attributes
-		mode := os.FileMode(0644)
-		modTime := time.Now()
-		size := int64(0)
-		if entry.Attributes != nil {
-			mode = entry.Attributes.Mode
-			modTime = entry.Attributes.Mtime
-		}
-		if entry.IsDir {
-			mode = mode | os.ModeDir
-		}
-		
-		return &FileInfo{
-			name:    GetBaseName(path),
-			size:    size,
-			mode:    mode,
-			modTime: modTime,
-			isDir:   entry.IsDir,
-		}, nil
+		// Implicit directory - fall through to validate
+		log.Debug("Skipping cache for implicit directory, validating existence")
 	}
 	metrics.RecordCacheMiss("metadata")
 
@@ -145,8 +150,8 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			isDir:   true,
 		}
 
-		// Cache the result
-		h.metadataCache.SetFileInfo(path, info, attrs)
+		// Cache the result, but mark it as implicit so it gets validated on next access
+		h.metadataCache.SetFileInfoWithFlags(path, info, attrs, true)
 
 		log.Debug("Implicit directory stat successful")
 		return info, nil
