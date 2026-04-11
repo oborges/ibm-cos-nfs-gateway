@@ -184,8 +184,12 @@ func main() {
 	authHandler := nfshelper.NewNullAuthHandler(instrumentedFS)
 	cachedHandler := nfshelper.NewCachingHandlerWithVerifierLimit(authHandler, 10000, 10000)
 	
+	// Wrap with stable verifier handler to prevent BadCookie errors
+	// This ensures the same verifier is returned for a directory across all pagination requests
+	stableHandler := nfs.NewStableVerifierHandler(cachedHandler, nfsLogger)
+	
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
-	nfsServer, err := nfs.NewServer(cachedHandler, nfsAddress, nfsLogger)
+	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger)
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
 	}
