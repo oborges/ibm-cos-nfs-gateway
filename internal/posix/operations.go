@@ -338,24 +338,14 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 			if err != nil {
 				failedStats++
 				
-				// Remove this stale child from the cached directory listing
-				h.metadataCache.RemoveChildFromListing(path, childName)
-				
-				log.Debug("Cached child not found, removed from cache",
+				log.Debug("Cached child not found, invalidating directory cache",
 					zap.String("child", childName))
 				
-				// Check failure threshold AFTER incrementing - if >50% have failed, stop and re-list
-				if failedStats > maxFailures {
-					log.Warn("Too many cached children not found, invalidating cache and re-listing",
-						zap.String("path", path),
-						zap.Int("failed", failedStats),
-						zap.Int("checked", i+1),
-						zap.Int("total", len(entry.Children)))
-					h.metadataCache.InvalidatePath(path)
-					cacheInvalidated = true
-					break
-				}
-				continue
+				// Invalidate the entire directory cache when ANY child is missing
+				// This forces a fresh ListObjects call from COS on the next request
+				h.metadataCache.InvalidatePath(path)
+				cacheInvalidated = true
+				break
 			}
 			entries = append(entries, info)
 		}
