@@ -462,9 +462,45 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	return file, nil
 }
 
+// stagingFileInfo implements os.FileInfo for dirty staging files
+type stagingFileInfo struct {
+	name    string
+	size    int64
+	modTime time.Time
+}
+
+func (s *stagingFileInfo) Name() string       { return s.name }
+func (s *stagingFileInfo) Size() int64        { return s.size }
+func (s *stagingFileInfo) Mode() os.FileMode  { return 0644 }
+func (s *stagingFileInfo) ModTime() time.Time { return s.modTime }
+func (s *stagingFileInfo) IsDir() bool        { return false }
+func (s *stagingFileInfo) Sys() interface{}   { return nil }
+
+func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
+			// If session has any modifications not fully uploaded
+			return session.Dirty || session.Size == 0
+		}
+	}
+	return false
+}
+
 // Stat returns file information
 func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 	fullPath := fs.Join(fs.root, filename)
+
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		if session, exists := fs.stagingManager.GetSession(fullPath); exists && (session.Dirty || session.Size == 0 || session.Prefetched) {
+			fs.logger.Debug("Stat intercepted by dirty staging session", zap.String("path", fullPath))
+			return &stagingFileInfo{
+				name:    filepath.Base(fullPath),
+				size:    session.Size,
+				modTime: session.LastWrite,
+			}, nil
+		}
+	}
+
 	return fs.ops.Stat(context.Background(), fullPath)
 }
 
@@ -718,6 +754,10 @@ func (fs *COSFilesystem) Root() string {
 func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 	// COS doesn't support chmod directly, but we can update metadata
 	fullPath := fs.Join(fs.root, name)
+
+	if fs.isStagingDirty(fullPath) {
+		return nil // Staged files bypass COS metadata swaps
+	}
 	
 	// Get current file info
 	info, err := fs.ops.Stat(context.Background(), fullPath)
@@ -756,6 +796,10 @@ func (fs *COSFilesystem) Lchown(name string, uid, gid int) error {
 func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 	fullPath := fs.Join(fs.root, name)
 	
+	if fs.isStagingDirty(fullPath) {
+		return nil // Staged files bypass COS metadata swaps
+	}
+
 	// Get current file info
 	info, err := fs.ops.Stat(context.Background(), fullPath)
 	if err != nil {
@@ -787,6 +831,10 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	fullPath := fs.Join(fs.root, name)
 	
+	if fs.isStagingDirty(fullPath) {
+		return nil // Staged files bypass COS metadata swaps
+	}
+
 	// Get current file info
 	info, err := fs.ops.Stat(context.Background(), fullPath)
 	if err != nil {
