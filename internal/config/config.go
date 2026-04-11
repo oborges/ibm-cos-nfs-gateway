@@ -14,6 +14,7 @@ type Config struct {
 	Cache       CacheConfig       `mapstructure:"cache"`
 	Performance PerformanceConfig `mapstructure:"performance"`
 	Logging     LoggingConfig     `mapstructure:"logging"`
+	Staging     StagingConfig     `mapstructure:"staging"`
 }
 
 // ServerConfig represents NFS server configuration
@@ -78,6 +79,25 @@ type LoggingConfig struct {
 	Level  string `mapstructure:"level"`  // debug, info, warn, error
 	Format string `mapstructure:"format"` // json, text
 	Output string `mapstructure:"output"` // stdout, stderr, file path
+}
+
+// StagingConfig represents staging layer configuration
+type StagingConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	RootDir           string `mapstructure:"root_dir"`
+	SyncInterval      string `mapstructure:"sync_interval"`
+	SyncThresholdMB   int64  `mapstructure:"sync_threshold_mb"`
+	MaxDirtyAge       string `mapstructure:"max_dirty_age"`
+	SyncOnClose       bool   `mapstructure:"sync_on_close"`
+	MaxStagingSizeGB  int64  `mapstructure:"max_staging_size_gb"`
+	MaxDirtyFiles     int    `mapstructure:"max_dirty_files"`
+	SyncWorkerCount   int    `mapstructure:"sync_worker_count"`
+	SyncQueueSize     int    `mapstructure:"sync_queue_size"`
+	MaxSyncRetries    int    `mapstructure:"max_sync_retries"`
+	RetryBackoffInit  string `mapstructure:"retry_backoff_initial"`
+	RetryBackoffMax   string `mapstructure:"retry_backoff_max"`
+	CleanAfterSync    bool   `mapstructure:"clean_after_sync"`
+	StaleFileAge      string `mapstructure:"stale_file_age"`
 }
 
 // Load loads configuration from file and environment variables
@@ -165,6 +185,23 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
 	v.SetDefault("logging.output", "stdout")
+
+	// Staging defaults (disabled by default for safety)
+	v.SetDefault("staging.enabled", false)
+	v.SetDefault("staging.root_dir", "/var/staging/nfs-gateway")
+	v.SetDefault("staging.sync_interval", "30s")
+	v.SetDefault("staging.sync_threshold_mb", 10)
+	v.SetDefault("staging.max_dirty_age", "5m")
+	v.SetDefault("staging.sync_on_close", false)
+	v.SetDefault("staging.max_staging_size_gb", 10)
+	v.SetDefault("staging.max_dirty_files", 1000)
+	v.SetDefault("staging.sync_worker_count", 4)
+	v.SetDefault("staging.sync_queue_size", 100)
+	v.SetDefault("staging.max_sync_retries", 3)
+	v.SetDefault("staging.retry_backoff_initial", "1s")
+	v.SetDefault("staging.retry_backoff_max", "60s")
+	v.SetDefault("staging.clean_after_sync", true)
+	v.SetDefault("staging.stale_file_age", "24h")
 }
 
 // GetReadTimeout returns the parsed read timeout duration
@@ -185,6 +222,31 @@ func (c *COSConfig) GetTimeout() (time.Duration, error) {
 // GetTTL returns the metadata cache TTL as a duration
 func (c *MetadataCacheConfig) GetTTL() time.Duration {
 	return time.Duration(c.TTLSeconds) * time.Second
+}
+
+// GetSyncInterval returns the parsed sync interval duration
+func (c *StagingConfig) GetSyncInterval() (time.Duration, error) {
+	return time.ParseDuration(c.SyncInterval)
+}
+
+// GetMaxDirtyAge returns the parsed max dirty age duration
+func (c *StagingConfig) GetMaxDirtyAge() (time.Duration, error) {
+	return time.ParseDuration(c.MaxDirtyAge)
+}
+
+// GetRetryBackoffInitial returns the parsed initial retry backoff duration
+func (c *StagingConfig) GetRetryBackoffInitial() (time.Duration, error) {
+	return time.ParseDuration(c.RetryBackoffInit)
+}
+
+// GetRetryBackoffMax returns the parsed max retry backoff duration
+func (c *StagingConfig) GetRetryBackoffMax() (time.Duration, error) {
+	return time.ParseDuration(c.RetryBackoffMax)
+}
+
+// GetStaleFileAge returns the parsed stale file age duration
+func (c *StagingConfig) GetStaleFileAge() (time.Duration, error) {
+	return time.ParseDuration(c.StaleFileAge)
 }
 
 // Made with Bob
