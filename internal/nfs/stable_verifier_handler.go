@@ -15,7 +15,7 @@ import (
 // StableVerifierHandler wraps a CachingHandler to provide stable verifiers
 // This prevents BadCookie errors that cause clients to restart enumeration
 type StableVerifierHandler struct {
-	gonfs.Handler
+	handler   gonfs.Handler
 	verifiers sync.Map // map[string]uint64 - path -> stable verifier
 	logger    *Logger
 }
@@ -23,7 +23,7 @@ type StableVerifierHandler struct {
 // NewStableVerifierHandler creates a handler that returns stable verifiers per directory
 func NewStableVerifierHandler(handler gonfs.Handler, logger *Logger) gonfs.Handler {
 	return &StableVerifierHandler{
-		Handler: handler,
+		handler: handler,
 		logger:  logger,
 	}
 }
@@ -77,8 +77,8 @@ func (h *StableVerifierHandler) DataForVerifier(path string, verifier uint64) []
 			"match", storedVerifier == verifier)
 			
 		if storedVerifier == verifier {
-			// Verifier matches - delegate to wrapped handler
-			if ch, ok := h.Handler.(gonfs.CachingHandler); ok {
+			// Verifier matches - delegate to wrapped handler if it's a CachingHandler
+			if ch, ok := h.handler.(gonfs.CachingHandler); ok {
 				data := ch.DataForVerifier(path, verifier)
 				if data != nil {
 					h.logger.Info("STABLE VERIFIER: Cache hit",
@@ -112,32 +112,32 @@ func (h *StableVerifierHandler) InvalidateHandle(fs billy.Filesystem, handle []b
 	}
 
 	// Delegate to wrapped handler
-	return h.Handler.InvalidateHandle(fs, handle)
+	return h.handler.InvalidateHandle(fs, handle)
 }
 
 // All other Handler methods are delegated to the wrapped handler
 func (h *StableVerifierHandler) Mount(ctx context.Context, conn net.Conn, req gonfs.MountRequest) (gonfs.MountStatus, billy.Filesystem, []gonfs.AuthFlavor) {
-	return h.Handler.Mount(ctx, conn, req)
+	return h.handler.Mount(ctx, conn, req)
 }
 
 func (h *StableVerifierHandler) Change(fs billy.Filesystem) billy.Change {
-	return h.Handler.Change(fs)
+	return h.handler.Change(fs)
 }
 
 func (h *StableVerifierHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *gonfs.FSStat) error {
-	return h.Handler.FSStat(ctx, fs, stat)
+	return h.handler.FSStat(ctx, fs, stat)
 }
 
 func (h *StableVerifierHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
-	return h.Handler.ToHandle(fs, path)
+	return h.handler.ToHandle(fs, path)
 }
 
 func (h *StableVerifierHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
-	return h.Handler.FromHandle(fh)
+	return h.handler.FromHandle(fh)
 }
 
 func (h *StableVerifierHandler) HandleLimit() int {
-	return h.Handler.HandleLimit()
+	return h.handler.HandleLimit()
 }
 
 // Made with Bob
