@@ -211,9 +211,17 @@ func (sw *SyncWorker) syncFile(path string) error {
 		finalSize := session.Size - start
 		
 		if finalSize > 0 {
-			section := io.NewSectionReader(file, start, finalSize)
+			var uploadReader io.ReadSeeker
+			mmapReader, err := NewMMapReader(file, start, finalSize)
+			if err == nil {
+				defer mmapReader.Close()
+				uploadReader = mmapReader
+			} else {
+				uploadReader = io.NewSectionReader(file, start, finalSize)
+			}
+
 			partNumber := int64(len(session.Multipart.CompletedParts)) + 1
-			etag, err := sw.cosClient.UploadPart(sw.ctx, path, session.Multipart.UploadID, partNumber, section)
+			etag, err := sw.cosClient.UploadPart(sw.ctx, path, session.Multipart.UploadID, partNumber, uploadReader)
 			if err != nil {
 				return fmt.Errorf("failed to upload final part: %w", err)
 			}
@@ -226,8 +234,15 @@ func (sw *SyncWorker) syncFile(path string) error {
 		}
 		logging.Info("Successfully completed S3 multipart payload", zap.String("path", path))
 	} else {
+		var monolithicReader io.ReadSeeker = file
+		mmapReader, err := NewMMapReader(file, 0, session.Size)
+		if err == nil && session.Size > 0 {
+			defer mmapReader.Close()
+			monolithicReader = mmapReader
+		}
+
 		// Upload to COS with retry (monolithic loop)
-		if err := sw.uploadWithRetryStream(path, file); err != nil {
+		if err := sw.uploadWithRetryStream(path, monolithicReader); err != nil {
 			return fmt.Errorf("failed to upload to COS: %w", err)
 		}
 	}
@@ -415,10 +430,18 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 					break
 				}
 				
-				section := io.NewSectionReader(file, start, end-start)
+				var uploadReader io.ReadSeeker
+				mmapReader, err := NewMMapReader(file, start, end-start)
+				if err == nil {
+					defer mmapReader.Close()
+					uploadReader = mmapReader
+				} else {
+					uploadReader = io.NewSectionReader(file, start, end-start)
+				}
+
 				partNumber := int64(len(session.Multipart.CompletedParts)) + 1
 				
-				etag, err := sw.cosClient.UploadPart(sw.ctx, metadata.Path, session.Multipart.UploadID, partNumber, section)
+				etag, err := sw.cosClient.UploadPart(sw.ctx, metadata.Path, session.Multipart.UploadID, partNumber, uploadReader)
 				file.Close()
 				
 				if err == nil {
