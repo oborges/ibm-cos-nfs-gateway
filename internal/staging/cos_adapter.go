@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/oborges/cos-nfs-gateway/internal/cos"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
@@ -64,6 +65,39 @@ func (a *COSClientAdapter) PutObjectStream(ctx context.Context, key string, body
 // GetObjectStream downloads an object stream from COS
 func (a *COSClientAdapter) GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error) {
 	return a.Client.GetObjectStream(ctx, key)
+}
+
+// CreateMultipartUpload overrides and initiates a multipart upload stream
+func (a *COSClientAdapter) CreateMultipartUpload(ctx context.Context, key string, metadata map[string]string) (string, error) {
+	now := time.Now()
+	attrs := &types.POSIXAttributes{
+		Mode:  0644,
+		UID:   1000,
+		GID:   1000,
+		Atime: now,
+		Mtime: now,
+		Ctime: now,
+	}
+	cosMetadata := posix.EncodePOSIXAttributes(attrs)
+	for k, v := range metadata {
+		cosMetadata[k] = v
+	}
+	return a.Client.CreateMultipartUpload(ctx, key, cosMetadata)
+}
+
+// UploadPart uploads a part in a multipart upload and returns the ETag
+func (a *COSClientAdapter) UploadPart(ctx context.Context, key, uploadID string, partNumber int64, body io.ReadSeeker) (string, error) {
+	return a.Client.UploadPart(ctx, key, uploadID, partNumber, body)
+}
+
+// CompleteMultipartUpload completes a multipart upload by assembling previously uploaded parts
+func (a *COSClientAdapter) CompleteMultipartUpload(ctx context.Context, key, uploadID string, completedParts []*s3.CompletedPart) error {
+	return a.Client.CompleteMultipartUpload(ctx, key, uploadID, completedParts)
+}
+
+// AbortMultipartUpload aborts a multipart upload
+func (a *COSClientAdapter) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	return a.Client.AbortMultipartUpload(ctx, key, uploadID)
 }
 
 // Made with Bob

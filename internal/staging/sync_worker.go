@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
 	"go.uber.org/zap"
@@ -18,6 +19,10 @@ type COSClient interface {
 	PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error
 	PutObjectStream(ctx context.Context, key string, body io.ReadSeeker, metadata map[string]string) error
 	GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error)
+	CreateMultipartUpload(ctx context.Context, key string, metadata map[string]string) (string, error)
+	UploadPart(ctx context.Context, key, uploadID string, partNumber int64, body io.ReadSeeker) (string, error)
+	CompleteMultipartUpload(ctx context.Context, key, uploadID string, completedParts []*s3.CompletedPart) error
+	AbortMultipartUpload(ctx context.Context, key, uploadID string) error
 }
 
 // SyncWorker handles background synchronization of dirty files to COS
@@ -89,6 +94,7 @@ func (sw *SyncWorker) workerLoop(workerID int) {
 			return
 
 		case <-sw.syncTicker.C:
+			sw.processMultipartFiles(workerID)
 			sw.processDirtyFiles(workerID)
 		}
 	}
@@ -191,9 +197,31 @@ func (sw *SyncWorker) syncFile(path string) error {
 	}
 	defer file.Close()
 
-	// Upload to COS with retry
-	if err := sw.uploadWithRetryStream(path, file); err != nil {
-		return fmt.Errorf("failed to upload to COS: %w", err)
+	if session.Multipart != nil && session.Multipart.Active && session.Multipart.IsSequential() {
+		// Upload the final remaining bytes as the last part
+		start, _ := session.Multipart.GetNextUploadRange()
+		finalSize := session.Size - start
+		
+		if finalSize > 0 {
+			section := io.NewSectionReader(file, start, finalSize)
+			partNumber := int64(len(session.Multipart.CompletedParts)) + 1
+			etag, err := sw.cosClient.UploadPart(sw.ctx, path, session.Multipart.UploadID, partNumber, section)
+			if err != nil {
+				return fmt.Errorf("failed to upload final part: %w", err)
+			}
+			session.Multipart.AddCompletedPart(partNumber, etag)
+		}
+		
+		err := sw.cosClient.CompleteMultipartUpload(sw.ctx, path, session.Multipart.UploadID, session.Multipart.CompletedParts)
+		if err != nil {
+			return fmt.Errorf("failed to complete multipart upload: %w", err)
+		}
+		logging.Info("Successfully completed S3 multipart payload", zap.String("path", path))
+	} else {
+		// Upload to COS with retry (monolithic loop)
+		if err := sw.uploadWithRetryStream(path, file); err != nil {
+			return fmt.Errorf("failed to upload to COS: %w", err)
+		}
 	}
 
 	// Mark as clean
@@ -347,6 +375,56 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// processMultipartFiles processes progressive multi-part chunk streaming 
+func (sw *SyncWorker) processMultipartFiles(workerID int) {
+	for _, metadata := range sw.manager.GetDirtyFiles() {
+		session, exists := sw.manager.GetSession(metadata.Path)
+		if !exists || session.Multipart == nil {
+			continue
+		}
+		
+		// Attempt progressive chunk boundaries
+		for {
+			start, end := session.Multipart.GetNextUploadRange()
+			
+			// Limit uploads sequentially against full boundary
+			if session.Size >= end && session.Multipart.IsSequential() {
+				if session.Multipart.UploadID == "" {
+					uploadID, err := sw.cosClient.CreateMultipartUpload(sw.ctx, metadata.Path, nil)
+					if err != nil {
+						logging.Error("Failed to initiate multipart", zap.Error(err))
+						break
+					}
+					session.Multipart.UploadID = uploadID
+					session.Multipart.Active = true
+				}
+				
+				session.Sync() 
+				file, err := os.Open(session.StagingPath)
+				if err != nil {
+					break
+				}
+				
+				section := io.NewSectionReader(file, start, end-start)
+				partNumber := int64(len(session.Multipart.CompletedParts)) + 1
+				
+				etag, err := sw.cosClient.UploadPart(sw.ctx, metadata.Path, session.Multipart.UploadID, partNumber, section)
+				file.Close()
+				
+				if err == nil {
+					session.Multipart.AddCompletedPart(partNumber, etag)
+					logging.Info("Uploaded progressive part chunk", zap.Int64("part", partNumber), zap.String("path", metadata.Path))
+				} else {
+					logging.Error("Failed progressive upload", zap.Error(err))
+					break
+				}
+			} else {
+				break
+			}
+		}
+	}
 }
 
 // Made with Bob

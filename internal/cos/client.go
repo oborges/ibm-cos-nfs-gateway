@@ -610,6 +610,111 @@ func isNotFoundError(err error) bool {
 	return false
 }
 
+// CreateMultipartUpload initiates a multipart upload and returns an upload ID
+func (c *Client) CreateMultipartUpload(ctx context.Context, key string, metadata map[string]string) (string, error) {
+	log := logging.WithOperation("CreateMultipartUpload").With(zap.String("key", key))
+	log.Debug("initiating multipart upload")
+
+	awsMetadata := make(map[string]*string)
+	for k, v := range metadata {
+		awsMetadata[k] = aws.String(v)
+	}
+
+	input := &s3.CreateMultipartUploadInput{
+		Bucket:   aws.String(c.bucket),
+		Key:      aws.String(key),
+		Metadata: awsMetadata,
+	}
+
+	result, err := c.s3Client.CreateMultipartUploadWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to initiate multipart upload", zap.Error(err))
+		return "", fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	log.Debug("multipart upload initiated", zap.String("uploadId", aws.StringValue(result.UploadId)))
+	return aws.StringValue(result.UploadId), nil
+}
+
+// UploadPart uploads a part in a multipart upload and returns the ETag
+func (c *Client) UploadPart(ctx context.Context, key, uploadID string, partNumber int64, body io.ReadSeeker) (string, error) {
+	log := logging.WithOperation("UploadPart").With(
+		zap.String("key", key),
+		zap.String("uploadId", uploadID),
+		zap.Int64("partNumber", partNumber),
+	)
+	log.Debug("uploading part")
+
+	input := &s3.UploadPartInput{
+		Bucket:     aws.String(c.bucket),
+		Key:        aws.String(key),
+		UploadId:   aws.String(uploadID),
+		PartNumber: aws.Int64(partNumber),
+		Body:       body,
+	}
+
+	result, err := c.s3Client.UploadPartWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to upload part", zap.Error(err))
+		return "", fmt.Errorf("failed to upload part: %w", err)
+	}
+
+	log.Debug("part uploaded", zap.String("etag", aws.StringValue(result.ETag)))
+	return aws.StringValue(result.ETag), nil
+}
+
+// CompleteMultipartUpload completes a multipart upload by assembling previously uploaded parts
+func (c *Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, completedParts []*s3.CompletedPart) error {
+	log := logging.WithOperation("CompleteMultipartUpload").With(
+		zap.String("key", key),
+		zap.String("uploadId", uploadID),
+		zap.Int("partsCount", len(completedParts)),
+	)
+	log.Debug("completing multipart upload")
+
+	input := &s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(c.bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	}
+
+	_, err := c.s3Client.CompleteMultipartUploadWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to complete multipart upload", zap.Error(err))
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
+
+	log.Debug("multipart upload completed")
+	return nil
+}
+
+// AbortMultipartUpload aborts a multipart upload
+func (c *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	log := logging.WithOperation("AbortMultipartUpload").With(
+		zap.String("key", key),
+		zap.String("uploadId", uploadID),
+	)
+	log.Debug("aborting multipart upload")
+
+	input := &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(c.bucket),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	}
+
+	_, err := c.s3Client.AbortMultipartUploadWithContext(ctx, input)
+	if err != nil {
+		log.Error("failed to abort multipart upload", zap.Error(err))
+		return fmt.Errorf("failed to abort multipart upload: %w", err)
+	}
+
+	log.Debug("multipart upload aborted")
+	return nil
+}
+
 // Close closes the client (cleanup if needed)
 func (c *Client) Close() error {
 	logging.Info("COS client closed")

@@ -21,6 +21,7 @@ type WriteSession struct {
 	LastWrite   time.Time
 	LastAccess  time.Time
 	CreatedAt   time.Time
+	Multipart   *S3MultipartState
 	mu          sync.Mutex
 }
 
@@ -51,6 +52,7 @@ func NewWriteSession(path string, stagingPath string) (*WriteSession, error) {
 		LastWrite:   now,
 		LastAccess:  now,
 		CreatedAt:   now,
+		Multipart:   NewS3MultipartState(20), // Default 20MB part chunks
 	}, nil
 }
 
@@ -75,6 +77,8 @@ func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	if newSize > ws.Size {
 		ws.Size = newSize
 	}
+
+	ws.Multipart.MarkModified(offset)
 
 	now := time.Now()
 	ws.Dirty = true

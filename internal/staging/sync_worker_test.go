@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 )
 
 // MockCOSClient for testing
@@ -60,6 +62,22 @@ func (m *MockCOSClient) GetObjectStream(ctx context.Context, path string) (io.Re
 func (m *MockCOSClient) GetUpload(path string) ([]byte, bool) {
 	data, exists := m.uploads[path]
 	return data, exists
+}
+
+func (m *MockCOSClient) CreateMultipartUpload(ctx context.Context, key string, metadata map[string]string) (string, error) {
+	return "mock-upload-id", nil
+}
+
+func (m *MockCOSClient) UploadPart(ctx context.Context, key, uploadID string, partNumber int64, body io.ReadSeeker) (string, error) {
+	return "mock-etag", nil
+}
+
+func (m *MockCOSClient) CompleteMultipartUpload(ctx context.Context, key, uploadID string, completedParts []*s3.CompletedPart) error {
+	return nil
+}
+
+func (m *MockCOSClient) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	return nil
 }
 
 func TestSyncWorker_New(t *testing.T) {
