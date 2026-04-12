@@ -132,8 +132,8 @@ main() {
     echo "=========================================="
     echo "Advanced Gateway Profiling Configuration"
     echo "=========================================="
-    check_prerequisites
     setup_environment
+    check_prerequisites
     setup_monitoring
     run_tests
     generate_cpu_analysis
