@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -118,6 +119,10 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 			continue
 		}
 
+		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
+			continue
+		}
+
 		// Sync the file
 		if err := sw.syncFile(metadata.Path); err != nil {
 			logging.Error("Failed to sync file",
@@ -133,6 +138,7 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 				zap.String("path", metadata.Path),
 				zap.Int64("size", metadata.Size))
 		}
+		sw.manager.dirtyIndex.UnlockFile(metadata.Path)
 	}
 }
 
@@ -228,6 +234,12 @@ func (sw *SyncWorker) syncFile(path string) error {
 			session.Multipart.AddCompletedPart(partNumber, etag)
 		}
 		
+		// Ensure strictly ascending chunk part sequences for IBM COS API limitations
+		sort.Slice(session.Multipart.CompletedParts, func(i, j int) bool {
+			return *session.Multipart.CompletedParts[i].PartNumber < *session.Multipart.CompletedParts[j].PartNumber
+		})
+
+		// Complete the multipart upload
 		err := sw.cosClient.CompleteMultipartUpload(sw.ctx, path, session.Multipart.UploadID, session.Multipart.CompletedParts)
 		if err != nil {
 			return fmt.Errorf("failed to complete multipart upload: %w", err)
@@ -408,6 +420,10 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 			continue
 		}
 		
+		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
+			continue
+		}
+
 		// Attempt progressive chunk boundaries
 		for {
 			start, end := session.Multipart.GetNextUploadRange()
@@ -448,13 +464,14 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 					session.Multipart.AddCompletedPart(partNumber, etag)
 					logging.Info("Uploaded progressive part chunk", zap.Int64("part", partNumber), zap.String("path", metadata.Path))
 				} else {
-					logging.Error("Failed progressive upload", zap.Error(err))
+					logging.Error("Failed to upload progressive multipart", zap.Error(err))
 					break
 				}
 			} else {
 				break
 			}
 		}
+		sw.manager.dirtyIndex.UnlockFile(metadata.Path)
 	}
 }
 

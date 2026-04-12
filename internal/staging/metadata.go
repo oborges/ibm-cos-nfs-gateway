@@ -7,8 +7,9 @@ import (
 
 // DirtyFileIndex tracks which files are dirty (not yet synced to COS)
 type DirtyFileIndex struct {
-	dirty map[string]*DirtyFileMetadata
-	mu    sync.RWMutex
+	dirty   map[string]*DirtyFileMetadata
+	syncing map[string]bool
+	mu      sync.RWMutex
 }
 
 // DirtyFileMetadata contains metadata about a dirty file
@@ -24,7 +25,8 @@ type DirtyFileMetadata struct {
 // NewDirtyFileIndex creates a new dirty file index
 func NewDirtyFileIndex() *DirtyFileIndex {
 	return &DirtyFileIndex{
-		dirty: make(map[string]*DirtyFileMetadata),
+		dirty:   make(map[string]*DirtyFileMetadata),
+		syncing: make(map[string]bool),
 	}
 }
 
@@ -54,6 +56,26 @@ func (dfi *DirtyFileIndex) MarkClean(path string) {
 	defer dfi.mu.Unlock()
 
 	delete(dfi.dirty, path)
+}
+
+// LockFile securely claims the file for syncing by a background worker natively isolating multiple loops
+func (dfi *DirtyFileIndex) LockFile(path string) bool {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+	
+	if dfi.syncing[path] {
+		return false // Activity bound globally to another worker
+	}
+	dfi.syncing[path] = true
+	return true
+}
+
+// UnlockFile securely releases the file sync bounds natively out of IBM pipelines
+func (dfi *DirtyFileIndex) UnlockFile(path string) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+	
+	delete(dfi.syncing, path)
 }
 
 // IsDirty returns true if the file is dirty
