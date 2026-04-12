@@ -71,14 +71,14 @@ graph TB
   - Configurable TTL (default: 60 seconds)
   - Cache invalidation on write operations
 
-### 4. File Cache
-- **Purpose**: Cache file content for read performance
-- **Implementation**: Disk-based cache with LRU eviction
+### 4. Enterprise Staging Layer (File Cache)
+- **Purpose**: Abstract file streaming via Native caching limits!
+- **Deep Dive**: Refer to [docs/STAGING_ARCHITECTURE.md](docs/STAGING_ARCHITECTURE.md)
+- **Implementation**: Real-time OS limits enforcing Memory-Mapped (`syscall.Mmap`) abstractions alongside Quota bounds.
 - **Features**:
-  - Configurable cache size limit
-  - Chunk-based caching for large files
-  - Read-ahead prefetching
-  - Write-through or write-back modes
+  - Configurable `MaxStagingSizeGB` Quota eviction triggers natively checking `syscall.ENOSPC`.
+  - Aggressive 80% Idle threshold flushing asynchronous pipelines.
+  - Zero-Copy mapped read boundaries bypassing standard OS string duplication natively!
 
 ### 5. Lock Manager
 - **Purpose**: Implement distributed file locking
