@@ -13,7 +13,7 @@ func TestWriteSession_New(t *testing.T) {
 	stagingPath := "/tmp/staging-test.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestWriteSession_Write(t *testing.T) {
 	stagingPath := "/tmp/staging-test-write.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestWriteSession_WriteAtOffset(t *testing.T) {
 	stagingPath := "/tmp/staging-test-offset.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestWriteSession_Read(t *testing.T) {
 	stagingPath := "/tmp/staging-test-read.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestWriteSession_ReadPartial(t *testing.T) {
 	stagingPath := "/tmp/staging-test-partial.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestWriteSession_Sync(t *testing.T) {
 	stagingPath := "/tmp/staging-test-sync.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestWriteSession_RefCount(t *testing.T) {
 	stagingPath := "/tmp/staging-test-refcount.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestWriteSession_ThreadSafety(t *testing.T) {
 	stagingPath := "/tmp/staging-test-threadsafe.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestWriteSession_LastWrite(t *testing.T) {
 	stagingPath := "/tmp/staging-test-lastwrite.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestWriteSession_Close(t *testing.T) {
 	stagingPath := "/tmp/staging-test-close.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestWriteSession_MultipleWrites(t *testing.T) {
 	stagingPath := "/tmp/staging-test-multiple.dat"
 	defer os.Remove(stagingPath)
 
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(nil, path, stagingPath)
 	if err != nil {
 		t.Fatalf("Failed to create session: %v", err)
 	}

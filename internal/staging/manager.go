@@ -66,7 +66,7 @@ func (sm *StagingManager) GetOrCreateSession(path string) (*WriteSession, error)
 
 	// Create new session
 	stagingPath := sm.stagingFilePath(path)
-	session, err := NewWriteSession(path, stagingPath)
+	session, err := NewWriteSession(sm, path, stagingPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
@@ -131,6 +131,18 @@ func (sm *StagingManager) GetSession(path string) (*WriteSession, bool) {
 
 	session, exists := sm.sessions[path]
 	return session, exists
+}
+
+// GetTotalStagingSize calculates the total byte quota utilized by active tracing sessions
+func (sm *StagingManager) GetTotalStagingSize() int64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var total int64
+	for _, session := range sm.sessions {
+		total += session.GetSize()
+	}
+	return total
 }
 
 // GetDirtyFiles returns a list of all dirty files

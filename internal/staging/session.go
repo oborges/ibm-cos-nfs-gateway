@@ -5,12 +5,14 @@ import (
 	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // WriteSession represents an active write session for a file path
 // Sessions are path-scoped and survive file handle open/close cycles
 type WriteSession struct {
+	Manager     *StagingManager
 	Path        string
 	StagingPath string
 	File        *os.File
@@ -26,7 +28,7 @@ type WriteSession struct {
 }
 
 // NewWriteSession creates a new write session
-func NewWriteSession(path string, stagingPath string) (*WriteSession, error) {
+func NewWriteSession(manager *StagingManager, path string, stagingPath string) (*WriteSession, error) {
 	// Open or create staging file
 	file, err := os.OpenFile(stagingPath, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
@@ -42,6 +44,7 @@ func NewWriteSession(path string, stagingPath string) (*WriteSession, error) {
 
 	now := time.Now()
 	return &WriteSession{
+		Manager:     manager,
 		Path:        path,
 		StagingPath: stagingPath,
 		File:        file,
@@ -58,6 +61,14 @@ func NewWriteSession(path string, stagingPath string) (*WriteSession, error) {
 
 // Write writes data to the staging file at the specified offset
 func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
+	// Check Disk Quota limit enforcing Linux native errors
+	if ws.Manager != nil && ws.Manager.config != nil && ws.Manager.config.MaxStagingSizeGB > 0 {
+		maxSize := ws.Manager.config.MaxStagingSizeGB * 1024 * 1024 * 1024
+		if ws.Manager.GetTotalStagingSize()+int64(len(data)) >= maxSize {
+			return 0, syscall.ENOSPC
+		}
+	}
+
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 

@@ -140,6 +140,14 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 func (sw *SyncWorker) shouldSync(metadata *DirtyFileMetadata) bool {
 	now := time.Now()
 
+	// Quick-Flush 80% Buffer Disk Quotas
+	totalSize := sw.manager.GetTotalStagingSize()
+	maxSize := sw.manager.config.MaxStagingSizeGB * 1024 * 1024 * 1024
+	if maxSize > 0 && float64(totalSize) >= float64(maxSize)*0.8 {
+		logging.Warn("Disk Quota at 80%, actively forcing flush", zap.String("path", metadata.Path))
+		return true
+	}
+
 	// Check size threshold (convert MB to bytes)
 	syncThreshold := sw.config.SyncThresholdMB * 1024 * 1024
 	if metadata.Size >= syncThreshold {
