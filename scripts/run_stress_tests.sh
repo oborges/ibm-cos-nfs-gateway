@@ -91,11 +91,11 @@ run_fio() {
 }
 
 run_tests() {
-    # Test 1: Standard MMap Sequential Read tests cache bounds efficiently
-    run_fio "mmap_seq_read" "read" "500M" "--bs=1M --numjobs=1" 50
+    # Test 1: Sequential Write caching IBM S3 chunks sequentially!
+    run_fio "cache_throughput" "write" "500M" "--bs=1M --numjobs=1" 20
     
-    # Test 2: Standard Multiparts Chunk appending scaling
-    run_fio "multipart_seq_write" "write" "500M" "--bs=1M --numjobs=1" 20
+    # Test 2: Sequential Read (leveraging Memory Mapped Page cache against Test 1 data)
+    run_fio "cache_throughput" "read" "500M" "--bs=1M --numjobs=1" 50
     
     # Test 3: Large Monolithic 1GB Payload scaling S3 Stream pipelines explicitly without timing out!
     run_fio "massive_s3_chunk_burst" "write" "1G" "--bs=4M --numjobs=1 --fallocate=none" 30
