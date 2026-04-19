@@ -1441,6 +1441,17 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 		return n, nil
 	}
 
+	// Read from local staging session natively to support FIO caching guarantees
+	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
+		n, err := f.stagingSession.Read(p, off)
+		if err == nil || (err == io.EOF && n > 0) {
+			return n, err
+		}
+		if err == io.EOF && n == 0 {
+			return 0, io.EOF
+		}
+	}
+
 	// Check if we're at or past EOF
 	if off >= f.size {
 		return 0, io.EOF
