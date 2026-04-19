@@ -123,6 +123,12 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 			continue
 		}
 
+		// Double-check the file is still dirty after acquiring the lock (avoids snapshot race conditions between workers)
+		if !sw.manager.dirtyIndex.IsDirty(metadata.Path) {
+			sw.manager.dirtyIndex.UnlockFile(metadata.Path)
+			continue
+		}
+
 		// Sync the file
 		if err := sw.syncFile(metadata.Path); err != nil {
 			logging.Error("Failed to sync file",
@@ -415,12 +421,13 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 // processMultipartFiles processes progressive multi-part chunk streaming 
 func (sw *SyncWorker) processMultipartFiles(workerID int) {
 	for _, metadata := range sw.manager.GetDirtyFiles() {
-		session, exists := sw.manager.GetSession(metadata.Path)
-		if !exists || session.Multipart == nil {
+		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
 			continue
 		}
-		
-		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
+
+		session, exists := sw.manager.GetSession(metadata.Path)
+		if !exists || session.Multipart == nil {
+			sw.manager.dirtyIndex.UnlockFile(metadata.Path)
 			continue
 		}
 
