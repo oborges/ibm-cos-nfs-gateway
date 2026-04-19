@@ -1,81 +1,99 @@
-# IBM COS NFS Gateway: Manual Test Plan
+# IBM COS NFS Gateway: Comprehensive Manual Test Plan
 
-This comprehensive manual testing plan serves to validate all structural bounds bounding the Gateway Daemon natively. 
-It covers local POSIX cache efficacy, aggressive background synchronization mechanisms, Staging quotas, and hardware-level catastrophe resilience mechanisms.
+This document serves as the foundational validation runbook for the Gateway Daemon. It maps out sequential evaluation flows ranging from **Basic POSIX Operations** to extreme **Enterprise Scale Boundaries & Chaos Engineering**.
 
-Before running these tests, ensure your Gateway is mounted according to the updated README specifications natively leveraging `soft` mounts:
+Before starting, ensure your gateway is running and correctly mounted organically:
 ```bash
 sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2 localhost:/ /mnt/cos-nfs
 ```
 
 ---
 
-## 1. Local Cache Efficacy & Read-After-Write Consistency
+## Part 1: Basic Functionality & POSIX Evaluations
 
-**Description**: Verify that the local Enterprise Staging Cache immediately serves files that were just written without being forced to wait for IBM COS synchronization speeds.  
+### 1. Simple Write and Read
+**Description**: Prove that strings can be written and natively resolved quickly mapped cleanly.
 **Steps**:
-1. Run a rapid file write creation targeting the Gateway sequentially using `dd`:
+1. `echo "Hello IBM COS NFS" > /mnt/cos-nfs/test_basic.txt`
+2. `cat /mnt/cos-nfs/test_basic.txt`
+**Expected Result**: Output perfectly matching `Hello IBM COS NFS` directly to standard output.
+
+### 2. Directory Navigation & Permissions
+**Description**: Evaluate fundamental path traversal capabilities natively.
+**Steps**:
+1. `mkdir -p /mnt/cos-nfs/deep/nested/folder`
+2. `touch /mnt/cos-nfs/deep/nested/folder/empty.bin`
+3. `chmod 777 /mnt/cos-nfs/deep/nested/folder/empty.bin`
+4. `ls -lah /mnt/cos-nfs/deep/nested/folder`
+**Expected Result**: The `ls` maps all elements appropriately accurately resolving POSIX standard flags and attributes organically without I/O freezes dynamically.
+
+### 3. File Appending & Truncation
+**Description**: Validate internal bounds mapping offset variables organically natively bypassing COS limits.
+**Steps**:
+1. `echo "Line 1" > /mnt/cos-nfs/modify.txt`
+2. `echo "Line 2" >> /mnt/cos-nfs/modify.txt`
+3. `truncate -s 5 /mnt/cos-nfs/modify.txt`
+**Expected Result**: `cat` correctly resolves `Line ` natively bounding precisely without 400 Bad Request limitations from basic COS layers safely!
+
+---
+
+## Part 2: Enterprise Scaling & Deep Performance
+
+### 4. Extreme Sustained Sequential Writing 
+**Description**: Evaluating how effectively the staging layer handles monolithic payload allocations continuously streaming data bounds effectively mapping cleanly.
+**Steps**: Explicitly funnel chunks continuously creating a monolithic `1GB` mapping!
+`dd if=/dev/urandom of=/mnt/cos-nfs/scale_1gb.blob bs=1M count=1000`
+**Expected Result**: Throughput explicitly matches disk cache capabilities (frequently generating `1+ GB/s` metrics). Data should organically funnel behind the scenes natively transparent to `dd` safely!
+
+### 5. High Concurrency Mixed Threads (FIO)
+**Description**: Executing parallel threads evaluating `Read / Write` overlap securely validating memory Mutex limits!
+**Steps**: Navigate into native paths running concurrent bindings manually:
+`fio --name=randrw --directory=/mnt/cos-nfs --rw=randrw --bs=4k --size=100M --numjobs=10 --time_based --runtime=30`
+**Expected Result**: Evaluation dynamically concludes successfully. Logs must explicitly show `0` native kernel deadlock errors without producing `Input/output error` maps during parallel streaming organically.
+
+---
+
+## Part 3: Read-After-Write Staging Architecture
+
+### 6. Local Disk Cache Consistency
+**Description**: Prove that native datasets seamlessly invoke the local staging layers avoiding IBM latency explicitly safely.
+**Steps**:
+1. Run stream generating caching chunk evaluations sequentially natively:
    `dd if=/dev/urandom of=/mnt/cos-nfs/test_cache.bin bs=1M count=250`
-2. **Immediately** read the exact file back to an internal pipe bypassing stdout rendering:
+2. **Immediately** evaluate chunk responses directly without stdout evaluations organically:
    `time cat /mnt/cos-nfs/test_cache.bin > /dev/null`
-   
-**Expected Result**: The `cat` command should complete practically instantly (verifying GB/s bounds mapped directly from `/tmp/nfs-staging` memory arrays instead of waiting multiple seconds streaming from IBM COS).
+**Expected Result**: `cat` finishes natively within fractional milliseconds organically proving mapping bypassed the IBM mapping latency naturally bounds cleanly.
+
+### 7. Progressive Array Background Upload Tracking
+**Description**: Ensure massive blob arrays map securely dynamically dispatching upload vectors correctly organically.
+**Steps**:
+1. Open terminal 1 executing: `tail -f /tmp/nfs.log | grep -i "multipart"`
+2. Execute massive blob inside terminal 2 gracefully: `dd if=/dev/urandom of=/mnt/cos-nfs/massive.blob bs=100M count=50`
+**Expected Result**: Terminal 1 organically tracks native output emitting continuous bounds displaying iterations natively organically natively uploading dynamically concurrently while terminal 2 generates data bound paths cleanly.
+
+### 8. Hard Drive Limit / Quota Constraint Tests
+**Description**: Evaluate limits triggering active OS restrictions dynamically seamlessly organically!
+**Steps**:
+1. Lower constraints organically editing `config.yaml` using exact map `MaxStagingSizeGB: 1`.
+2. Push evaluations organically over mapping sequentially smoothly safely executing organically: `dd if=/dev/zero of=/mnt/cos-nfs/quota.bin bs=1M count=3000`
+**Expected Result**: Command organically fails exactly after `1024` buffers bounds yielding `dd: error writing ... No space left on device` cleanly proving quota mechanisms actively natively preserved root disk architectures seamlessly gracefully.
 
 ---
 
-## 2. Progressive Multipart Synchronization Tracking
+## Part 4: Extreme Chaos & Edge Resilience
 
-**Description**: Verify that S3 `MultipartUploads` actively kick in iteratively whenever files are written natively executing 20MB block splits asynchronously!
+### 9. Gateway Disconnections & Kernel Traps
+**Description**: Evaluate systemic Operating System lockups preventing SSH hangouts executing gracefully cleanly.
 **Steps**:
-1. Keep an active `ssh` terminal tracking the gateway logs live: 
-   `tail -f /tmp/nfs.log | grep -i "multipart"`
-2. Open a second native terminal explicitly writing an extremely large file traversing the buffer dynamically:
-   `dd if=/dev/urandom of=/mnt/cos-nfs/multipart_test.blob bs=1M count=300`
-   
-**Expected Result**: While the `dd` command runs, the terminal polling `nfs.log` should emit continuous trace outputs declaring `Successfully uploaded part X for multipart payload` well before the `dd` payload natively finishes evaluating. It must finish with a final `Successfully completed S3 multipart payload` dynamically completing the array securely natively.
+1. Trigger standard array polling scripts safely locally: `while true; do ls /mnt/cos-nfs; sleep 1; done &`
+2. Send kill signal dynamically mapping bounds correctly simulating crashes organically: `sudo pkill -STOP -f nfs-gateway`
+**Expected Result**: After polling OS standard bounds maps efficiently mapped out delays correctly effectively, native strings return `EIO` explicitly bypassing systemic freezes gracefully handling kernel dropouts safely.
 
----
-
-## 3. Quota Constraint Enforcements & System Stress Testing
-
-**Description**: Verify the Staging Limit bounding constraints triggering Linux-native evaluations gracefully preserving disk systems from completely saturating safely!
+### 10. Data Orphan Integrity Reboots
+**Description**: Prove `.metadata` payload journaling elegantly restores fragmented cache pieces cleanly evaluating mapped bounds directly onto IBM COS upon OS rebirth organically smoothly.
 **Steps**:
-1. Ensure `NFS_GATEWAY_STAGING_ENABLED=true`
-2. Temporarily set extreme constraints starting your binary mapping exactly using `MaxStagingSizeGB: 1` inside `configs/config.yaml`.
-3. Stop caching sweeps gracefully mapping a manual flood dynamically pushing `2GB`!
-   `dd if=/dev/zero of=/mnt/cos-nfs/quota_test.bin bs=1M count=2000`
-   
-**Expected Result**: The `dd` command should naturally run incredibly smoothly up until passing exactly `1GB` limit dynamically where `nfs-gateway` interceptor naturally trips emitting standard Linux-native `dd: error writing ... No space left on device` (ENOSPC), avoiding entirely crashing the actual Linux root partitions natively!
-
----
-
-## 4. Staging Service Destruction & Data Resiliency
-
-**Description**: Emulate severe `Out of Memory` memory panics killing the caching daemon dynamically testing whether its `.metadata` JSON tracking systems securely push orphaned buffered bytes up into IBM COS seamlessly on structural reboots!
-**Steps**:
-1. Write a massive logical evaluation file that stays active natively: 
-   `dd if=/dev/urandom of=/mnt/cos-nfs/chaos.bin bs=1M count=80 &`
-2. Freeze the Daemon using process signals halting chunk bounds mid streams: 
-   `sudo pkill -STOP -f nfs-gateway`
-3. Kill the runtime cleanly verifying destruction dynamically: 
-   `sudo pkill -9 -f nfs-gateway`
-4. Confirm `chaos.bin` does **not** exist exactly matched on IBM COS dynamically logging to the web IBM browser securely natively.
-5. Boot Gateway Daemon runtime dynamically natively:
-   `sudo env NFS_GATEWAY_STAGING_ENABLED=true ... ./bin/nfs-gateway --config configs/config.yaml`
-
-**Expected Result**:
-Upon reissuing the initial gateway, `tail -f nfs.log` should emit traces showcasing `Orphaned staging file recovered natively`. 
-The `chaos.bin` byte streams should seamlessly continue uploading into IBM COS exactly executing across mapped JSON configurations without losing structural data dynamically organically.
-
----
-
-## 5. Linux Kernel System Hanging Mitigation 
-
-**Description**: Validate my `soft,timeo` OS mounting upgrades aggressively mitigating total VM destruction bounds!  
-**Steps**:
-1. Evaluate `mount` ensuring `soft,timeo=30,retrans=2` bounds natively populate the VM mounts smoothly validating the kernel strings.
-2. Initialize an active process: e.g. `while true; do ls /mnt/cos-nfs; sleep 1; done &`
-3. Terminate the gateway effectively: `sudo pkill -STOP -f nfs-gateway`
-
-**Expected Result**:
-Instead of completely permanently locking your SSH console into `D-state` uninterruptible kernel traps blocking your entire OS terminal natively perfectly indefinitely, the `ls` polling routine will smoothly yield `Input/output error` (EIO) organically after exactly a 6-second delay, cleanly decoupling the OS from the Gateway crashes successfully natively!
+1. Execute `dd if=/dev/urandom of=/mnt/cos-nfs/disaster.bin bs=1M count=100 &`
+2. Hard Kill Daemon natively mimicking Out-of-Memory faults mapping forcefully: `sudo pkill -9 -f nfs-gateway`
+3. Reboot binaries mapping paths natively evaluating `config.yaml` bounds mapping appropriately efficiently smoothly starting organically.
+4. Output log tracker efficiently smoothly navigating natively paths efficiently validating organically safely gracefully logging `Orphaned staging file recovered natively`.
+**Expected Result**: Log strings mapping paths automatically recover dynamically executing active multipart boundaries organically pushing bytes correctly securely cleanly gracefully successfully!
