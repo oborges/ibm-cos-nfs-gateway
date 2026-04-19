@@ -268,14 +268,9 @@ func (sw *SyncWorker) syncFile(path string) error {
 	// Mark as clean
 	sw.manager.MarkClean(path)
 
-	// Cleanup session if idle
-	if session.GetRefCount() == 0 {
-		if err := sw.manager.CleanupSession(path, true); err != nil {
-			logging.Warn("Failed to cleanup session after sync",
-				zap.String("path", path),
-				zap.Error(err))
-		}
-	}
+	// NOTE: We intentionally DO NOT CleanupSession(path, true) here!
+	// Leaving the session inside memory empowers Gateway `Read-After-Write` paths resolving directly targeting the local Staging layer!
+	// Eventual cache evictions are natively delegated against `MaxStagingSizeGB` LRU triggers or Unlink deletions interceptors dynamically!
 
 	return nil
 }
