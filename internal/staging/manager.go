@@ -3,9 +3,11 @@ package staging
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/oborges/cos-nfs-gateway/internal/config"
@@ -175,7 +177,7 @@ func (sm *StagingManager) RecoverFromDisk() error {
 
 	recovered := 0
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
 			continue
 		}
 
@@ -189,18 +191,43 @@ func (sm *StagingManager) RecoverFromDisk() error {
 			continue
 		}
 
-		// Mark as dirty for re-sync
-		// Note: We don't know the original path from the filename alone
-		// This is a limitation of the MVP - we'll improve this with metadata files
-		logging.Debug("Found staging file during recovery",
+		// Resolve original path metadata gracefully
+		metadataPath := filePath + ".metadata"
+		metadataPayload := make(map[string]string)
+		if metadataBytes, err := os.ReadFile(metadataPath); err == nil {
+			json.Unmarshal(metadataBytes, &metadataPayload)
+		}
+
+		originalPath, ok := metadataPayload["original_path"]
+		if !ok || originalPath == "" {
+			logging.Warn("Failed to extract valid metadata maps for orphaned file. Leaving stranded.",
+				zap.String("file", entry.Name()))
+			continue
+		}
+
+		// Mark as dirty for re-sync safely preserving original maps!
+		session, err := sm.GetOrCreateSession(originalPath)
+		if err != nil {
+			logging.Warn("Failed to reconstruct Write Session for orphaned file", zap.Error(err))
+			continue
+		}
+		
+		// Force size resolution based on orphaned hash stats
+		session.Size = info.Size()
+
+		// Flag the index triggering immediate background upload evaluation!
+		sm.MarkDirty(originalPath, info.Size())
+
+		logging.Debug("Orphaned staging file recovered natively",
 			zap.String("file", entry.Name()),
+			zap.String("original_path", originalPath),
 			zap.Int64("size", info.Size()))
 
 		recovered++
 	}
 
 	if recovered > 0 {
-		logging.Info("Recovered staging files",
+		logging.Info("Recovered staging files automatically after daemon crash",
 			zap.Int("count", recovered))
 	}
 
@@ -232,6 +259,9 @@ func (sm *StagingManager) CleanupSession(path string, deleteStagingFile bool) er
 		if err := os.Remove(session.StagingPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("failed to remove staging file: %w", err)
 		}
+		// Safely clear `.metadata` journals maintaining boundaries safely tracking S3 maps
+		os.Remove(session.StagingPath + ".metadata")
+
 		logging.Debug("Removed staging file",
 			zap.String("path", path),
 			zap.String("staging_path", session.StagingPath))

@@ -75,7 +75,7 @@ sudo ./bin/nfs-gateway -config configs/config.yaml
 
 ```bash
 sudo mkdir -p /mnt/cos-nfs
-sudo mount -t nfs -o vers=3,tcp localhost:/ /mnt/cos-nfs
+sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2 localhost:/ /mnt/cos-nfs
 ```
 
 ## 📖 Documentation

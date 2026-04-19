@@ -1,9 +1,11 @@
 package staging
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -40,6 +42,17 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 	if err != nil {
 		file.Close()
 		return nil, fmt.Errorf("failed to stat staging file: %w", err)
+	}
+
+	// Persist logical path metadata allowing dynamic crash recovery
+	metadataPath := stagingPath + ".metadata"
+	metadataPayload := map[string]string{
+		"original_path": path,
+	}
+	if metadataBytes, err := json.Marshal(metadataPayload); err == nil {
+		if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
+			fmt.Printf("Warning: Failed to persist staging metadata for %s: %v\n", path, err)
+		}
 	}
 
 	now := time.Now()
