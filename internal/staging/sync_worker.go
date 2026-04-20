@@ -497,5 +497,5 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 
 // UploadToCOS uploads data directly to COS (used for immediate sync before delete)
 func (sw *SyncWorker) UploadToCOS(ctx context.Context, path string, data []byte, metadata map[string]string) error {
-	return sw.uploadWithRetry(path, data)
+	return sw.uploadWithRetry(path, data, metadata)
 }
