@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -141,11 +142,11 @@ func (h *COSHandler) FSStat(ctx context.Context, fs billy.Filesystem, stat *nfs.
 // Uses SHA256 hash for deterministic, fixed-size handles (32 bytes)
 func (h *COSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 	pathStr := strings.Join(path, "/")
-	
+
 	// Create deterministic hash (32 bytes, well within NFS 64-byte limit)
 	hash := sha256.Sum256([]byte(pathStr))
 	hashStr := hex.EncodeToString(hash[:])
-	
+
 	// Store mapping in memory
 	h.handleLock.Lock()
 	h.handleMap[hashStr] = &handleEntry{
@@ -153,7 +154,7 @@ func (h *COSHandler) ToHandle(fs billy.Filesystem, path []string) []byte {
 		hash: hashStr,
 	}
 	h.handleLock.Unlock()
-	
+
 	// Return raw hash bytes (not hex string)
 	return hash[:]
 }
@@ -163,19 +164,19 @@ func (h *COSHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
 	if len(fh) == 0 {
 		return nil, []string{}, nil // Root directory
 	}
-	
+
 	// Convert handle bytes to hex string for lookup
 	hashStr := hex.EncodeToString(fh)
-	
+
 	// Look up path in memory
 	h.handleLock.RLock()
 	entry, ok := h.handleMap[hashStr]
 	h.handleLock.RUnlock()
-	
+
 	if !ok {
 		return nil, nil, fmt.Errorf("invalid file handle: %s", hashStr[:16])
 	}
-	
+
 	// Return filesystem instance with decoded path
 	fs := &COSFilesystem{
 		ops:    h.ops,
@@ -260,7 +261,7 @@ func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string)
 func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig, stagingManager *staging.StagingManager, syncWorker *staging.SyncWorker, featureFlags *feature.FeatureFlags) *COSFilesystem {
 	bufferSize := int64(perfConfig.WriteBufferKB) * 1024
 	sessionTimeout := 5 * time.Minute // Keep sessions alive for 5 minutes after last access
-	
+
 	logger.Info("Initializing COS filesystem with configuration",
 		"write_buffer_kb", perfConfig.WriteBufferKB,
 		"write_buffer_bytes", bufferSize,
@@ -270,10 +271,10 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 		"read_ahead_kb", perfConfig.ReadAheadKB,
 		"session_timeout", sessionTimeout,
 		"staging_enabled", featureFlags.IsStagingEnabled())
-	
+
 	// Create session manager for path-scoped write buffering (legacy path)
 	sessionManager := buffer.NewSessionManager(bufferSize, sessionTimeout)
-	
+
 	return &COSFilesystem{
 		ops:            ops,
 		logger:         logger,
@@ -302,7 +303,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 
 	// Generate unique file handle ID for tracking
 	fileID := fmt.Sprintf("%p", &fullPath)
-	
+
 	// Log file open with detailed flags
 	flagStr := ""
 	if flag&os.O_RDONLY != 0 {
@@ -323,9 +324,9 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 	if flag&os.O_APPEND != 0 {
 		flagStr += "APPEND|"
 	}
-	
+
 	useStagingPath := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled()
-	
+
 	fs.logger.Info("FILE OPEN",
 		"file_id", fileID,
 		"path", fullPath,
@@ -368,7 +369,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 				return nil, err
 			}
 			file.stagingSession = session
-			
+
 			// Automatically pre-fetch existing COS objects if modifying without truncating
 			if fileExists && flag&os.O_TRUNC == 0 {
 				err := session.Prefetch(func() error {
@@ -392,7 +393,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 			if exists {
 				file.stagingSession = session
 				session.IncrementRefCount()
-				
+
 				fs.logger.Info("Staging session acquired for read",
 					"file_id", fileID,
 					"path", fullPath,
@@ -419,7 +420,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 				return nil, fmt.Errorf("failed to truncate staging file: %w", err)
 			}
 			fs.stagingManager.MarkDirty(fullPath, 0)
-			
+
 			fs.logger.Info("Truncated staging file",
 				"file_id", fileID,
 				"path", fullPath,
@@ -467,14 +468,22 @@ type stagingFileInfo struct {
 	name    string
 	size    int64
 	modTime time.Time
+	mode    os.FileMode
+	uid     uint32
+	gid     uint32
 }
 
 func (s *stagingFileInfo) Name() string       { return s.name }
 func (s *stagingFileInfo) Size() int64        { return s.size }
-func (s *stagingFileInfo) Mode() os.FileMode  { return 0644 }
+func (s *stagingFileInfo) Mode() os.FileMode  { return s.mode }
 func (s *stagingFileInfo) ModTime() time.Time { return s.modTime }
 func (s *stagingFileInfo) IsDir() bool        { return false }
-func (s *stagingFileInfo) Sys() interface{}   { return nil }
+func (s *stagingFileInfo) Sys() interface{} {
+	return &syscall.Stat_t{
+		Uid: s.uid,
+		Gid: s.gid,
+	}
+}
 
 func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
@@ -497,6 +506,9 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 				name:    filepath.Base(fullPath),
 				size:    session.Size,
 				modTime: session.LastWrite,
+				mode:    session.Mode,
+				uid:     session.UID,
+				gid:     session.GID,
 			}, nil
 		}
 	}
@@ -540,6 +552,7 @@ func (fs *COSFilesystem) Remove(filename string) error {
 
 	return fs.ops.DeleteFile(context.Background(), fullPath)
 }
+
 // cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion
 func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
 	ctx := context.Background()
@@ -636,7 +649,6 @@ func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
 	return nil
 }
 
-
 // Join joins path elements
 func (fs *COSFilesystem) Join(elem ...string) string {
 	return filepath.Join(elem...)
@@ -653,16 +665,16 @@ func (fs *COSFilesystem) TempFile(dir, prefix string) (billy.File, error) {
 // ReadDir reads directory contents
 func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
-	
+
 	fullPath := fs.Join(fs.root, path)
-	
+
 	// Track per-path calls
 	metrics.GetGlobalCounters().RecordPathCall(fullPath)
-	
+
 	listStart := time.Now()
 	entries, err := fs.ops.ListDirectory(context.Background(), fullPath)
 	listDuration := time.Since(listStart)
-	
+
 	if err != nil {
 		// Record trace even on error
 		duration := time.Since(start)
@@ -677,17 +689,43 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	for i, entry := range entries {
 		result[i] = entry
 	}
+
+	// Safely inject StagingManager Memory bounds natively into directories!
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		stagingSessions := fs.stagingManager.GetSessionsInDirectory(fullPath)
+		for _, session := range stagingSessions {
+			// Ensure it doesn't already natively exist in COS results safely
+			exists := false
+			sessionName := filepath.Base(session.Path)
+			for _, entry := range result {
+				if entry.Name() == sessionName {
+					exists = true
+					break
+				}
+			}
+			if !exists && (session.Dirty || session.Size == 0 || session.Prefetched) {
+				result = append(result, &stagingFileInfo{
+					name:    sessionName,
+					size:    session.Size,
+					modTime: session.LastWrite,
+					mode:    session.Mode,
+					uid:     session.UID,
+					gid:     session.GID,
+				})
+			}
+		}
+	}
 	convDuration := time.Since(convStart)
-	
+
 	duration := time.Since(start)
-	
+
 	// Record trace with entry count
 	RecordReaddirCall(fullPath, len(result), duration, nil)
-	
+
 	// Record metrics
 	metrics.RecordReadDir(duration)
 	metrics.RecordConversion(convDuration)
-	
+
 	// Log slow calls or first few calls
 	counters := metrics.GetGlobalCounters()
 	callCount := counters.ReadDirCalls.Load()
@@ -698,7 +736,7 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"call_number", callCount,
 			"entries", len(result))
 	}
-	
+
 	// Log timing breakdown for slow calls
 	if duration > 10*time.Millisecond {
 		fs.logger.Info("ReadDir timing breakdown",
@@ -708,7 +746,7 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"conversion_ms", convDuration.Milliseconds(),
 			"entries", len(entries))
 	}
-	
+
 	return result, nil
 }
 
@@ -762,13 +800,13 @@ func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 	if fs.isStagingDirty(fullPath) {
 		return nil // Staged files bypass COS metadata swaps
 	}
-	
+
 	// Get current file info
 	info, err := fs.ops.Stat(context.Background(), fullPath)
 	if err != nil {
 		return err
 	}
-	
+
 	// Update with new mode
 	attrs := &types.POSIXAttributes{
 		Mode:  mode,
@@ -776,7 +814,7 @@ func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 		GID:   1000,
 		Mtime: time.Now(),
 	}
-	
+
 	// For files, we need to read and rewrite with new attributes
 	if !info.IsDir() {
 		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
@@ -785,7 +823,7 @@ func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 		}
 		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
 	}
-	
+
 	// For directories, just update the marker
 	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
 }
@@ -799,7 +837,7 @@ func (fs *COSFilesystem) Lchown(name string, uid, gid int) error {
 // Chown changes the uid and gid of the named file
 func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 	fullPath := fs.Join(fs.root, name)
-	
+
 	if fs.isStagingDirty(fullPath) {
 		return nil // Staged files bypass COS metadata swaps
 	}
@@ -809,7 +847,7 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Update with new ownership
 	attrs := &types.POSIXAttributes{
 		Mode:  info.Mode(),
@@ -817,7 +855,7 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 		GID:   gid,
 		Mtime: time.Now(),
 	}
-	
+
 	// For files, read and rewrite with new attributes
 	if !info.IsDir() {
 		data, err := fs.ops.ReadFile(context.Background(), fullPath, 0, 0)
@@ -826,7 +864,7 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 		}
 		return fs.ops.WriteFile(context.Background(), fullPath, data, attrs)
 	}
-	
+
 	// For directories, update the marker
 	return fs.ops.CreateDirectory(context.Background(), fullPath, attrs)
 }
@@ -834,7 +872,7 @@ func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 // Chtimes changes the access and modification times
 func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) error {
 	fullPath := fs.Join(fs.root, name)
-	
+
 	if fs.isStagingDirty(fullPath) {
 		return nil // Staged files bypass COS metadata swaps
 	}
@@ -844,7 +882,7 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 	if err != nil {
 		return err
 	}
-	
+
 	// Update with new times
 	attrs := &types.POSIXAttributes{
 		Mode:  info.Mode(),
@@ -853,7 +891,7 @@ func (fs *COSFilesystem) Chtimes(name string, atime time.Time, mtime time.Time) 
 		Mtime: mtime,
 		Atime: atime,
 	}
-	
+
 	// Use efficient metadata update (no need to read/rewrite entire file)
 	return fs.ops.UpdateAttributes(context.Background(), fullPath, attrs)
 }
@@ -869,16 +907,16 @@ type COSFile struct {
 	isNew          bool
 	data           []byte
 	loaded         bool
-	size           int64  // File size (for read-only files without data loaded)
-	writeSession   *buffer.WriteSession  // Shared write session (survives handle close) - LEGACY
-	flushCount     int    // Number of flushes performed
-	totalFlushed   int64  // Total bytes flushed
-	totalWrites    int    // Total number of Write() calls
+	size           int64                     // File size (for read-only files without data loaded)
+	writeSession   *buffer.WriteSession      // Shared write session (survives handle close) - LEGACY
+	flushCount     int                       // Number of flushes performed
+	totalFlushed   int64                     // Total bytes flushed
+	totalWrites    int                       // Total number of Write() calls
 	perfConfig     *config.PerformanceConfig // Performance configuration
-	fileID         string // Unique file handle ID for tracking
-	sessionManager *buffer.SessionManager // Session manager for path-scoped buffering - LEGACY
+	fileID         string                    // Unique file handle ID for tracking
+	sessionManager *buffer.SessionManager    // Session manager for path-scoped buffering - LEGACY
 	// Staging architecture components
-	stagingSession *staging.WriteSession  // Staging write session
+	stagingSession *staging.WriteSession // Staging write session
 	stagingManager *staging.StagingManager
 	syncWorker     *staging.SyncWorker
 	featureFlags   *feature.FeatureFlags
@@ -903,12 +941,12 @@ func (f *COSFile) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		f.offset += int64(n)
-		
+
 		f.logger.Debug("Read from staging session",
 			"path", f.path,
 			"offset", f.offset-int64(n),
 			"bytes", n)
-		
+
 		return n, err
 	}
 
@@ -922,7 +960,7 @@ func (f *COSFile) Read(p []byte) (int, error) {
 		f.writeSession.Mu.Lock()
 		bufferedData := f.writeSession.Buffer.Read(f.offset, int64(len(p)))
 		f.writeSession.Mu.Unlock()
-		
+
 		if len(bufferedData) > 0 {
 			n := copy(p, bufferedData)
 			f.offset += int64(n)
@@ -967,7 +1005,7 @@ func (f *COSFile) Read(p []byte) (int, error) {
 
 	n := copy(p, data)
 	f.offset += int64(n)
-	
+
 	// IMPORTANT: Per io.Reader contract, don't return EOF with data
 	// Return data with nil error, EOF will be returned on next call
 	return n, nil
@@ -991,7 +1029,7 @@ func (f *COSFile) Write(p []byte) (int, error) {
 		}
 
 		f.offset += int64(n)
-		
+
 		// Mark file as dirty and update size
 		f.stagingManager.MarkDirty(f.path, f.stagingSession.Size)
 
@@ -1011,7 +1049,7 @@ func (f *COSFile) Write(p []byte) (int, error) {
 	// 1. Write buffer handles append-only writes efficiently
 	// 2. We only need to download the file during flush (read-modify-write)
 	// 3. Downloading on every write causes catastrophic performance issues
-	
+
 	// Get or create write session for this path
 	if f.writeSession == nil {
 		f.writeSession = f.sessionManager.GetOrCreateSession(f.path)
@@ -1062,7 +1100,7 @@ func (f *COSFile) Write(p []byte) (int, error) {
 			"buffer_size_mb", float64(bufferSize)/(1024*1024),
 			"threshold_bytes", thresholdBytes,
 			"threshold_mb", float64(thresholdBytes)/(1024*1024))
-		
+
 		if err := f.flushSessionBuffer(); err != nil {
 			f.logger.Error("FLUSH ERROR",
 				"file_id", f.fileID,
@@ -1090,7 +1128,7 @@ func (f *COSFile) flushSessionBuffer() error {
 	}
 
 	start := time.Now()
-	
+
 	// Get data to flush
 	data, startOffset, err := f.writeSession.Buffer.GetFlushData()
 	if err != nil {
@@ -1104,7 +1142,7 @@ func (f *COSFile) flushSessionBuffer() error {
 	}
 	flushSize := int64(len(data))
 	f.writeSession.Mu.Unlock()
-	
+
 	f.logger.Info("FLUSH START",
 		"file_id", f.fileID,
 		"session_id", f.writeSession.SessionID,
@@ -1138,7 +1176,7 @@ func (f *COSFile) flushSessionBuffer() error {
 			GID:   1000,
 			Mtime: time.Now(),
 		}
-		
+
 		err := f.ops.WriteFile(context.Background(), f.path, data, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write file during flush",
@@ -1158,7 +1196,7 @@ func (f *COSFile) flushSessionBuffer() error {
 			"current_size", currentSize,
 			"start_offset", startOffset,
 			"append_bytes", flushSize)
-		
+
 		// Read existing file once
 		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 		if err != nil {
@@ -1168,19 +1206,19 @@ func (f *COSFile) flushSessionBuffer() error {
 				"error", err)
 			return err
 		}
-		
+
 		// Append new data
 		finalData := make([]byte, len(existingData)+len(data))
 		copy(finalData, existingData)
 		copy(finalData[len(existingData):], data)
-		
+
 		attrs := &types.POSIXAttributes{
 			Mode:  f.perm,
 			UID:   1000,
 			GID:   1000,
 			Mtime: time.Now(),
 		}
-		
+
 		err = f.ops.WriteFile(context.Background(), f.path, finalData, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write file during sequential append",
@@ -1200,7 +1238,7 @@ func (f *COSFile) flushSessionBuffer() error {
 			"current_size", currentSize,
 			"start_offset", startOffset,
 			"write_bytes", flushSize)
-		
+
 		existingData, err := f.ops.ReadFile(context.Background(), f.path, 0, 0)
 		if err != nil && !strings.Contains(err.Error(), "not found") {
 			f.logger.Error("Failed to read existing file for merge",
@@ -1226,7 +1264,7 @@ func (f *COSFile) flushSessionBuffer() error {
 			GID:   1000,
 			Mtime: time.Now(),
 		}
-		
+
 		err = f.ops.WriteFile(context.Background(), f.path, existingData, attrs)
 		if err != nil {
 			f.logger.Error("Failed to write merged file during flush",
@@ -1268,10 +1306,10 @@ func (f *COSFile) Close() error {
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
 		sessionSize := f.stagingSession.Size
 		isDirty := f.stagingSession.Dirty
-		
+
 		f.stagingSession.DecrementRefCount()
 		refCount := f.stagingSession.GetRefCount()
-		
+
 		f.logger.Info("FILE CLOSE - Releasing staging session",
 			"file_id", f.fileID,
 			"path", f.path,
@@ -1286,7 +1324,7 @@ func (f *COSFile) Close() error {
 			f.logger.Info("Immediately syncing zero-byte truncated file",
 				"file_id", f.fileID,
 				"path", f.path)
-			
+
 			// Sync to staging file
 			if err := f.stagingSession.Sync(); err != nil {
 				f.logger.Error("Failed to sync zero-byte file to staging",
@@ -1318,7 +1356,7 @@ func (f *COSFile) Close() error {
 
 		// Release session reference (session persists for other handles)
 		f.stagingManager.ReleaseSession(f.path)
-		
+
 		// Log final statistics for this handle
 		if f.totalWrites > 0 {
 			f.logger.Info("File handle closed with write statistics",
@@ -1327,7 +1365,7 @@ func (f *COSFile) Close() error {
 				"total_writes", f.totalWrites,
 				"session_size", f.stagingSession.Size)
 		}
-		
+
 		return nil
 	}
 
@@ -1378,7 +1416,7 @@ func (f *COSFile) Close() error {
 			return err
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1473,14 +1511,14 @@ func (f *COSFile) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	n := copy(p, data)
-	
+
 	// Per io.ReaderAt contract: return EOF only if no bytes were read
 	// If we read some bytes but less than requested, that's still success
 	// The caller will detect EOF on the next call when off >= size
 	if n < len(p) && off+int64(n) >= f.size {
 		return n, io.EOF
 	}
-	
+
 	return n, nil
 }
 

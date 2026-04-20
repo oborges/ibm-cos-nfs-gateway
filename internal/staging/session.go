@@ -25,6 +25,9 @@ type WriteSession struct {
 	LastAccess  time.Time
 	CreatedAt   time.Time
 	Multipart   *S3MultipartState
+	Mode        os.FileMode
+	UID         uint32
+	GID         uint32
 	mu          sync.Mutex
 }
 
@@ -45,8 +48,11 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 
 	// Persist logical path metadata allowing dynamic crash recovery
 	metadataPath := stagingPath + ".metadata"
-	metadataPayload := map[string]string{
+	metadataPayload := map[string]interface{}{
 		"original_path": path,
+		"mode":          uint32(0644),
+		"uid":           uint32(1000),
+		"gid":           uint32(1000),
 	}
 	if metadataBytes, err := json.Marshal(metadataPayload); err == nil {
 		if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
@@ -68,7 +74,22 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 		LastAccess:  now,
 		CreatedAt:   now,
 		Multipart:   NewS3MultipartState(20), // Default 20MB part chunks
+		Mode:        0644,
+		UID:         1000,
+		GID:         1000,
 	}, nil
+}
+
+// UpdateAttributes seamlessly mutates POSIX tracking bounds natively
+func (ws *WriteSession) UpdateAttributes(mode os.FileMode, uid uint32, gid uint32) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	if mode != 0 {
+		ws.Mode = mode
+	}
+	// Avoid wiping 0 explicitly unless bounded but standard NFS propagates variables accurately
+	ws.UID = uid
+	ws.GID = gid
 }
 
 // Write writes data to the staging file at the specified offset

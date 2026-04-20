@@ -102,6 +102,29 @@ func (sm *StagingManager) ReleaseSession(path string) {
 	// Cleanup happens after sync + idle timeout
 }
 
+// GetSessionsInDirectory organically returns all actively buffering files existing precisely inside specific logical directories!
+func (sm *StagingManager) GetSessionsInDirectory(dirPath string) []*WriteSession {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var sessions []*WriteSession
+	prefix := dirPath
+	if prefix != "/" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	for path, session := range sm.sessions {
+		if strings.HasPrefix(path, prefix) && len(path) > len(prefix) {
+			// Extracting only precisely adjacent file instances, ignoring deep nested arrays seamlessly!
+			remainder := strings.TrimPrefix(path, prefix)
+			if !strings.Contains(remainder, "/") {
+				sessions = append(sessions, session)
+			}
+		}
+	}
+	return sessions
+}
+
 // MarkDirty marks a file as dirty (needs sync)
 func (sm *StagingManager) MarkDirty(path string, size int64) {
 	sm.dirtyIndex.MarkDirty(path, size)
@@ -193,13 +216,14 @@ func (sm *StagingManager) RecoverFromDisk() error {
 
 		// Resolve original path metadata gracefully
 		metadataPath := filePath + ".metadata"
-		metadataPayload := make(map[string]string)
+		metadataPayload := make(map[string]interface{})
 		if metadataBytes, err := os.ReadFile(metadataPath); err == nil {
 			json.Unmarshal(metadataBytes, &metadataPayload)
 		}
 
-		originalPath, ok := metadataPayload["original_path"]
-		if !ok || originalPath == "" {
+		rawPath, ok := metadataPayload["original_path"]
+		originalPath, isString := rawPath.(string)
+		if !ok || !isString || originalPath == "" {
 			logging.Warn("Failed to extract valid metadata maps for orphaned file. Leaving stranded.",
 				zap.String("file", entry.Name()))
 			continue
