@@ -797,8 +797,11 @@ func (fs *COSFilesystem) Chmod(name string, mode os.FileMode) error {
 	// COS doesn't support chmod directly, but we can update metadata
 	fullPath := fs.Join(fs.root, name)
 
-	if fs.isStagingDirty(fullPath) {
-		return nil // Staged files bypass COS metadata swaps
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
+			session.UpdateAttributes(mode, session.UID, session.GID)
+			return nil // Staged files bypass COS metadata swaps safely bound natively!
+		}
 	}
 
 	// Get current file info
@@ -838,8 +841,11 @@ func (fs *COSFilesystem) Lchown(name string, uid, gid int) error {
 func (fs *COSFilesystem) Chown(name string, uid, gid int) error {
 	fullPath := fs.Join(fs.root, name)
 
-	if fs.isStagingDirty(fullPath) {
-		return nil // Staged files bypass COS metadata swaps
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
+			session.UpdateAttributes(session.Mode, uint32(uid), uint32(gid))
+			return nil // Staged files bypass COS metadata swaps safely bounded
+		}
 	}
 
 	// Get current file info
