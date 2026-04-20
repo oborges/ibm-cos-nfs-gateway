@@ -12,6 +12,8 @@ import (
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
+	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"go.uber.org/zap"
 )
 
@@ -259,8 +261,15 @@ func (sw *SyncWorker) syncFile(path string) error {
 			monolithicReader = mmapReader
 		}
 
+		posixAttrs := &types.POSIXAttributes{
+			Mode: session.Mode,
+			UID:  int(session.UID),
+			GID:  int(session.GID),
+		}
+		cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
+
 		// Upload to COS with retry (monolithic loop)
-		if err := sw.uploadWithRetryStream(path, monolithicReader); err != nil {
+		if err := sw.uploadWithRetryStream(path, monolithicReader, cosMetadata); err != nil {
 			return fmt.Errorf("failed to upload to COS: %w", err)
 		}
 	}
@@ -276,7 +285,7 @@ func (sw *SyncWorker) syncFile(path string) error {
 }
 
 // uploadWithRetry uploads a file to COS with exponential backoff retry
-func (sw *SyncWorker) uploadWithRetry(path string, data []byte) error {
+func (sw *SyncWorker) uploadWithRetry(path string, data []byte, metadata map[string]string) error {
 	var lastErr error
 
 	retryBackoff, _ := sw.config.GetRetryBackoffInitial()
@@ -303,7 +312,7 @@ func (sw *SyncWorker) uploadWithRetry(path string, data []byte) error {
 		}
 
 		// Attempt upload
-		err := sw.cosClient.PutObject(sw.ctx, path, data, nil)
+		err := sw.cosClient.PutObject(sw.ctx, path, data, metadata)
 		if err == nil {
 			if attempt > 0 {
 				logging.Info("Upload succeeded after retry",
@@ -324,7 +333,7 @@ func (sw *SyncWorker) uploadWithRetry(path string, data []byte) error {
 }
 
 // uploadWithRetryStream uploads a file object stream to COS with exponential backoff retry
-func (sw *SyncWorker) uploadWithRetryStream(path string, body io.ReadSeeker) error {
+func (sw *SyncWorker) uploadWithRetryStream(path string, body io.ReadSeeker, metadata map[string]string) error {
 	var lastErr error
 
 	retryBackoff, _ := sw.config.GetRetryBackoffInitial()
@@ -354,7 +363,7 @@ func (sw *SyncWorker) uploadWithRetryStream(path string, body io.ReadSeeker) err
 			return fmt.Errorf("failed to seek upload body: %w", err)
 		}
 
-		err := sw.cosClient.PutObjectStream(sw.ctx, path, body, nil)
+		err := sw.cosClient.PutObjectStream(sw.ctx, path, body, metadata)
 		if err == nil {
 			if attempt > 0 {
 				logging.Info("Upload stream succeeded after retry",
@@ -433,7 +442,14 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 			// Limit uploads sequentially against full boundary
 			if session.Size >= end && session.Multipart.IsSequential() {
 				if session.Multipart.UploadID == "" {
-					uploadID, err := sw.cosClient.CreateMultipartUpload(sw.ctx, metadata.Path, nil)
+					posixAttrs := &types.POSIXAttributes{
+						Mode: session.Mode,
+						UID:  int(session.UID),
+						GID:  int(session.GID),
+					}
+					cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
+
+					uploadID, err := sw.cosClient.CreateMultipartUpload(sw.ctx, metadata.Path, cosMetadata)
 					if err != nil {
 						logging.Error("Failed to initiate multipart", zap.Error(err))
 						break
