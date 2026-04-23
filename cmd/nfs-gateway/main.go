@@ -145,8 +145,17 @@ func main() {
 	if cfg.Server.DebugEnabled {
 		debugAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Server.DebugPort)
 		logging.Info("Starting debug pprof server", zap.String("addr", debugAddr))
+		srv := &http.Server{
+			Addr:              debugAddr,
+			Handler:           nil, // Uses DefaultServeMux internally cleanly mapping explicitly
+			ReadTimeout:       5 * time.Second,
+			ReadHeaderTimeout: 3 * time.Second,
+			WriteTimeout:      10 * time.Second,
+			IdleTimeout:       15 * time.Second,
+		}
+
 		go func() {
-			if err := http.ListenAndServe(debugAddr, nil); err != nil {
+			if err := srv.ListenAndServe(); err != nil {
 				logging.Error("Debug server failed", zap.Error(err))
 			}
 		}()

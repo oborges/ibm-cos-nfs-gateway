@@ -142,8 +142,17 @@ func StartMetricsServer(port int) error {
 	
 	logging.Info("Starting metrics server", zap.String("addr", addr))
 	
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       15 * time.Second,
+	}
+
 	go func() {
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			logging.Error("Metrics server failed", zap.Error(err))
 		}
 	}()

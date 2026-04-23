@@ -149,8 +149,17 @@ func StartHealthServer(port int, checker *Checker) error {
 
 	logging.Info("Starting health check server", zap.String("addr", addr))
 
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 3 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       15 * time.Second,
+	}
+
 	go func() {
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			logging.Error("Health check server failed", zap.Error(err))
 		}
 	}()
