@@ -26,7 +26,7 @@ func NewHandleStore(storePath string) (*HandleStore, error) {
 	}
 	
 	// Create store directory if it doesn't exist
-	if err := os.MkdirAll(filepath.Dir(storePath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(storePath), 0700); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %w", err)
 	}
 	
@@ -89,7 +89,7 @@ func (s *HandleStore) save() error {
 		return err
 	}
 	
-	return os.WriteFile(s.storePath, data, 0644)
+	return os.WriteFile(s.storePath, data, 0600)
 }
 
 // Made with Bob
