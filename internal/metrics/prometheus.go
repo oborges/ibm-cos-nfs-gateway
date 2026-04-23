@@ -135,7 +135,7 @@ func Initialize() {
 
 // StartMetricsServer starts the Prometheus metrics HTTP server
 func StartMetricsServer(port int) error {
-	addr := fmt.Sprintf(":%d", port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	
 	http.Handle("/metrics", promhttp.Handler())
 	

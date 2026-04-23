@@ -20,8 +20,12 @@ type Config struct {
 // ServerConfig represents NFS server configuration
 type ServerConfig struct {
 	NFSPort        int    `mapstructure:"nfs_port"`
+	MetricsEnabled bool   `mapstructure:"metrics_enabled"`
 	MetricsPort    int    `mapstructure:"metrics_port"`
+	HealthEnabled  bool   `mapstructure:"health_enabled"`
 	HealthPort     int    `mapstructure:"health_port"`
+	DebugEnabled   bool   `mapstructure:"debug_enabled"`
+	DebugPort      int    `mapstructure:"debug_port"`
 	MaxConnections int    `mapstructure:"max_connections"`
 	ReadTimeout    string `mapstructure:"read_timeout"`
 	WriteTimeout   string `mapstructure:"write_timeout"`
@@ -149,8 +153,12 @@ func Load(configPath string) (*Config, error) {
 func setDefaults(v *viper.Viper) {
 	// Server defaults
 	v.SetDefault("server.nfs_port", 2049)
+	v.SetDefault("server.metrics_enabled", false)
 	v.SetDefault("server.metrics_port", 8080)
+	v.SetDefault("server.health_enabled", false)
 	v.SetDefault("server.health_port", 8081)
+	v.SetDefault("server.debug_enabled", false)
+	v.SetDefault("server.debug_port", 8082)
 	v.SetDefault("server.max_connections", 1000)
 	v.SetDefault("server.read_timeout", "30s")
 	v.SetDefault("server.write_timeout", "30s")

@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"net/http"
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -113,8 +114,12 @@ func main() {
 
 	// Initialize metrics
 	metrics.Initialize()
-	if err := metrics.StartMetricsServer(cfg.Server.MetricsPort); err != nil {
-		logging.Error("Failed to start metrics server", zap.Error(err))
+	if cfg.Server.MetricsEnabled {
+		if err := metrics.StartMetricsServer(cfg.Server.MetricsPort); err != nil {
+			logging.Error("Failed to start metrics server", zap.Error(err))
+		}
+	} else {
+		logging.Info("Metrics server disabled by configuration")
 	}
 
 	// Initialize health checks
@@ -128,8 +133,25 @@ func main() {
 		func() interface{} { return metadataCache.Stats() },
 	))
 
-	if err := health.StartHealthServer(cfg.Server.HealthPort, healthChecker); err != nil {
-		logging.Error("Failed to start health server", zap.Error(err))
+	if cfg.Server.HealthEnabled {
+		if err := health.StartHealthServer(cfg.Server.HealthPort, healthChecker); err != nil {
+			logging.Error("Failed to start health server", zap.Error(err))
+		}
+	} else {
+		logging.Info("Health server disabled by configuration")
+	}
+
+	// Initialize debug server
+	if cfg.Server.DebugEnabled {
+		debugAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Server.DebugPort)
+		logging.Info("Starting debug pprof server", zap.String("addr", debugAddr))
+		go func() {
+			if err := http.ListenAndServe(debugAddr, nil); err != nil {
+				logging.Error("Debug server failed", zap.Error(err))
+			}
+		}()
+	} else {
+		logging.Info("Debug server disabled by configuration")
 	}
 
 	// Initialize feature flags

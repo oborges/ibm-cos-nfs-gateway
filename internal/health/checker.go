@@ -85,9 +85,9 @@ func (c *Checker) Check(ctx context.Context) CheckResult {
 	return result
 }
 
-// StartHealthServer starts the health check HTTP server
+// StartHealthServer starts an HTTP server for health checks
 func StartHealthServer(port int, checker *Checker) error {
-	addr := fmt.Sprintf(":%d", port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	mux := http.NewServeMux()
 
