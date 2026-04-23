@@ -137,12 +137,13 @@ func Initialize() {
 func StartMetricsServer(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	
-	http.Handle("/metrics", promhttp.Handler())
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
 	
 	logging.Info("Starting metrics server", zap.String("addr", addr))
 	
 	go func() {
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := http.ListenAndServe(addr, mux); err != nil {
 			logging.Error("Metrics server failed", zap.Error(err))
 		}
 	}()

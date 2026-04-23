@@ -14,6 +14,7 @@ type ReaddirTrace struct {
 	traces          map[string]*PathTrace
 	enabled         atomic.Bool
 	maxTraceEntries int
+	maxTracedPaths  int
 }
 
 // PathTrace tracks READDIR calls for a specific path
@@ -39,6 +40,7 @@ type ReaddirRequest struct {
 var globalTrace = &ReaddirTrace{
 	traces:          make(map[string]*PathTrace),
 	maxTraceEntries: 200, // Only keep first 200 requests per path
+	maxTracedPaths:  1000, // Max distinct paths to prevent memory-amplification OOM
 }
 
 // EnableTracing enables READDIR tracing
@@ -67,6 +69,14 @@ func RecordReaddirCall(path string, entriesReturned int, duration time.Duration,
 
 	trace, exists := globalTrace.traces[path]
 	if !exists {
+		// Evict random trace if at capacity to prevent memory-amplification OOM
+		if len(globalTrace.traces) >= globalTrace.maxTracedPaths {
+			for k := range globalTrace.traces {
+				delete(globalTrace.traces, k)
+				break
+			}
+		}
+
 		trace = &PathTrace{
 			Path:           path,
 			FirstCall:      time.Now(),
