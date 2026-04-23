@@ -44,7 +44,7 @@ func NewDataCache(cfg *config.DataCacheConfig) (*DataCache, error) {
 	}
 
 	// Ensure cache directory exists
-	if err := os.MkdirAll(cfg.Path, 0755); err != nil {
+	if err := os.MkdirAll(cfg.Path, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
@@ -163,12 +163,12 @@ func (c *DataCache) Write(key string, data []byte) error {
 
 	// Generate cache file path
 	filePath := c.getCacheFilePath(key)
-	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filePath), 0700); err != nil {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	// Write to file
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := os.WriteFile(filePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
 	}
 
@@ -239,7 +239,7 @@ func (c *DataCache) Clear() error {
 	}
 
 	// Recreate directory
-	if err := os.MkdirAll(c.basePath, 0755); err != nil {
+	if err := os.MkdirAll(c.basePath, 0700); err != nil {
 		return fmt.Errorf("failed to recreate cache directory: %w", err)
 	}
 

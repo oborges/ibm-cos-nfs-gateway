@@ -28,7 +28,7 @@ type StagingManager struct {
 func NewStagingManager(cfg *config.StagingConfig) (*StagingManager, error) {
 	// Create staging directory structure
 	activeDir := filepath.Join(cfg.RootDir, "active")
-	if err := os.MkdirAll(activeDir, 0755); err != nil {
+	if err := os.MkdirAll(activeDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create staging directory: %w", err)
 	}
 

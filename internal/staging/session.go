@@ -34,7 +34,7 @@ type WriteSession struct {
 // NewWriteSession creates a new write session
 func NewWriteSession(manager *StagingManager, path string, stagingPath string) (*WriteSession, error) {
 	// Open or create staging file
-	file, err := os.OpenFile(stagingPath, os.O_RDWR|os.O_CREATE, 0644)
+	file, err := os.OpenFile(stagingPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open staging file: %w", err)
 	}
@@ -50,12 +50,12 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 	metadataPath := stagingPath + ".metadata"
 	metadataPayload := map[string]interface{}{
 		"original_path": path,
-		"mode":          uint32(0644),
+		"mode":          uint32(0600),
 		"uid":           uint32(1000),
 		"gid":           uint32(1000),
 	}
 	if metadataBytes, err := json.Marshal(metadataPayload); err == nil {
-		if err := os.WriteFile(metadataPath, metadataBytes, 0644); err != nil {
+		if err := os.WriteFile(metadataPath, metadataBytes, 0600); err != nil {
 			fmt.Printf("Warning: Failed to persist staging metadata for %s: %v\n", path, err)
 		}
 	}
@@ -74,7 +74,7 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 		LastAccess:  now,
 		CreatedAt:   now,
 		Multipart:   NewS3MultipartState(20), // Default 20MB part chunks
-		Mode:        0644,
+		Mode:        0600,
 		UID:         1000,
 		GID:         1000,
 	}, nil
