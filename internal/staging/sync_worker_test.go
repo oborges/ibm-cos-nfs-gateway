@@ -13,9 +13,9 @@ import (
 
 // MockCOSClient for testing
 type MockCOSClient struct {
-	uploads      map[string][]byte
-	errors       map[string]error
-	putObjectFn  func(ctx context.Context, path string, data []byte, metadata map[string]string) error
+	uploads     map[string][]byte
+	errors      map[string]error
+	putObjectFn func(ctx context.Context, path string, data []byte, metadata map[string]string) error
 }
 
 func NewMockCOSClient() *MockCOSClient {
@@ -472,6 +472,78 @@ func TestSyncWorker_CleanupAfterSync(t *testing.T) {
 	_, exists := manager.GetSession(path)
 	if exists {
 		t.Error("Idle session should be cleaned up after sync")
+	}
+}
+
+func TestSyncWorker_OrphanDirtyWithoutStagingIsForgotten(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, _ := NewStagingManager(cfg)
+	defer manager.Shutdown()
+
+	cosClient := NewMockCOSClient()
+	worker := NewSyncWorker(manager, cosClient, cfg)
+
+	path := "/test/deleted-before-sync.txt"
+	manager.MarkDirty(path, 1024)
+
+	if err := worker.syncFile(path); err != nil {
+		t.Fatalf("Orphaned deleted dirty entry should be forgotten, got error: %v", err)
+	}
+
+	if manager.IsDirty(path) {
+		t.Fatal("Orphaned dirty entry without staging file should be removed")
+	}
+
+	depth, bytes, _ := manager.SyncQueueStats()
+	if depth != 0 || bytes != 0 {
+		t.Fatalf("Expected empty sync queue, got depth=%d bytes=%d", depth, bytes)
+	}
+
+	if _, exists := cosClient.GetUpload(path); exists {
+		t.Fatal("Deleted orphan should not be uploaded")
+	}
+}
+
+func TestSyncWorker_OrphanDirtyWithStagingIsRecoveredAndSynced(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, _ := NewStagingManager(cfg)
+	defer manager.Shutdown()
+
+	cosClient := NewMockCOSClient()
+	worker := NewSyncWorker(manager, cosClient, cfg)
+
+	path := "/test/recoverable-orphan.txt"
+	data := []byte("recover me from staging")
+
+	session, _ := manager.GetOrCreateSession(path)
+	if _, err := session.Write(data, 0); err != nil {
+		t.Fatalf("Failed to write staging data: %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Failed to sync staging data: %v", err)
+	}
+	manager.MarkDirty(path, int64(len(data)))
+
+	if err := manager.CleanupSession(path, false); err != nil {
+		t.Fatalf("Failed to drop session while keeping staging file: %v", err)
+	}
+	if _, exists := manager.GetSession(path); exists {
+		t.Fatal("Session should be absent before recovery")
+	}
+
+	if err := worker.syncFile(path); err != nil {
+		t.Fatalf("Recoverable orphan should sync successfully: %v", err)
+	}
+
+	uploaded, exists := cosClient.GetUpload(path)
+	if !exists {
+		t.Fatal("Recovered staging file was not uploaded")
+	}
+	if string(uploaded) != string(data) {
+		t.Fatalf("Expected uploaded data %q, got %q", data, uploaded)
+	}
+	if manager.IsDirty(path) {
+		t.Fatal("Recovered file should be marked clean after sync")
 	}
 }
 

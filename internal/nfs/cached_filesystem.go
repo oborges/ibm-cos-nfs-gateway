@@ -1,20 +1,22 @@
 package nfs
 
 import (
+	"context"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	gonfs "github.com/willscott/go-nfs"
 )
 
 // CachedFilesystem wraps a billy.Filesystem with directory listing cache
 // This works around the go-nfs library's failure to use CachingHandler
 type CachedFilesystem struct {
 	billy.Filesystem
-	cache      sync.Map // map[string]*cachedDir
-	logger     *Logger
-	cacheTTL   time.Duration
+	cache    sync.Map // map[string]*cachedDir
+	logger   *Logger
+	cacheTTL time.Duration
 }
 
 type cachedDir struct {
@@ -42,12 +44,12 @@ func (cfs *CachedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		if age < cfs.cacheTTL {
 			entries := dir.entries
 			dir.mu.RUnlock()
-			
+
 			cfs.logger.Info("CACHE HIT: ReadDir from cache",
 				"path", path,
 				"entries", len(entries),
 				"age_ms", age.Milliseconds())
-			
+
 			return entries, nil
 		}
 		dir.mu.RUnlock()
@@ -56,7 +58,7 @@ func (cfs *CachedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	// Cache miss - read from underlying filesystem
 	cfs.logger.Info("CACHE MISS: Reading from filesystem",
 		"path", path)
-	
+
 	entries, err := cfs.Filesystem.ReadDir(path)
 	if err != nil {
 		return nil, err
@@ -87,6 +89,16 @@ func (cfs *CachedFilesystem) InvalidateCache(path string) {
 func (cfs *CachedFilesystem) ClearCache() {
 	cfs.cache = sync.Map{}
 	cfs.logger.Info("CACHE CLEAR: Cleared all cache entries")
+}
+
+// FSStat forwards dynamic filesystem capacity data through the cache wrapper.
+func (cfs *CachedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSStat) error {
+	if provider, ok := cfs.Filesystem.(interface {
+		FSStat(context.Context, *gonfs.FSStat) error
+	}); ok {
+		return provider.FSStat(ctx, stat)
+	}
+	return nil
 }
 
 // Chmod changes the mode of the named file (implements billy.Change)

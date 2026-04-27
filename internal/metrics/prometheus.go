@@ -111,6 +111,102 @@ var (
 			Help: "Number of active file locks",
 		},
 	)
+
+	// Staging sync metrics
+	stagingSyncQueueDepth = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_sync_queue_depth",
+			Help: "Current number of dirty files waiting for staging sync",
+		},
+	)
+
+	stagingSyncQueueBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_sync_queue_bytes",
+			Help: "Current total bytes waiting for staging sync",
+		},
+	)
+
+	syncQueueBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sync_queue_bytes",
+			Help: "Current total bytes waiting for staging sync",
+		},
+	)
+
+	stagingSyncOldestDirtyAge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_sync_oldest_dirty_age_seconds",
+			Help: "Age in seconds of the oldest dirty file waiting for staging sync",
+		},
+	)
+
+	stagingCOSVisibilityLatency = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "staging_cos_visibility_latency_seconds",
+			Help:    "Seconds from first dirty mark until the synced file is visible in COS after upload completion",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600},
+		},
+	)
+
+	stagingUploadDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "staging_upload_duration_seconds",
+			Help:    "Wall-clock seconds spent uploading staged file bytes to COS",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+		},
+	)
+
+	stagingUploadThroughputMiB = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "staging_upload_throughput_mib_per_second",
+			Help:    "Observed staged upload throughput in MiB/s for successful COS uploads",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500},
+		},
+	)
+
+	stagingUsedBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_used_bytes",
+			Help: "Current bytes held by staging sessions",
+		},
+	)
+
+	stagingAvailableBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_available_bytes",
+			Help: "Current bytes safely available for staging writes",
+		},
+	)
+
+	stagingPressureLevel = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_pressure_level",
+			Help: "Current staging pressure level: 0=normal, 1=high, 2=critical",
+		},
+	)
+
+	writesBlockedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "writes_blocked_total",
+			Help: "Total staging writes that entered backpressure blocking",
+		},
+	)
+
+	writesRejectedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "writes_rejected_total",
+			Help: "Total staging writes rejected by backpressure",
+		},
+	)
+
+	backpressureWaitSeconds = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "backpressure_wait_seconds",
+			Help:    "Seconds spent waiting for staging backpressure to clear",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		},
+	)
 )
 
 // Initialize registers all metrics with Prometheus
@@ -128,6 +224,19 @@ func Initialize() {
 		bytesWrittenTotal,
 		activeConnections,
 		activeLocksTotal,
+		stagingSyncQueueDepth,
+		stagingSyncQueueBytes,
+		syncQueueBytes,
+		stagingSyncOldestDirtyAge,
+		stagingCOSVisibilityLatency,
+		stagingUploadDuration,
+		stagingUploadThroughputMiB,
+		stagingUsedBytes,
+		stagingAvailableBytes,
+		stagingPressureLevel,
+		writesBlockedTotal,
+		writesRejectedTotal,
+		backpressureWaitSeconds,
 	)
 
 	logging.Info("Metrics initialized")
@@ -136,12 +245,12 @@ func Initialize() {
 // StartMetricsServer starts the Prometheus metrics HTTP server
 func StartMetricsServer(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	
+
 	logging.Info("Starting metrics server", zap.String("addr", addr))
-	
+
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -156,7 +265,7 @@ func StartMetricsServer(port int) error {
 			logging.Error("Metrics server failed", zap.Error(err))
 		}
 	}()
-	
+
 	return nil
 }
 
@@ -210,6 +319,65 @@ func SetActiveConnections(count int) {
 // SetActiveLocks sets the number of active locks
 func SetActiveLocks(count int) {
 	activeLocksTotal.Set(float64(count))
+}
+
+// SetStagingSyncQueue records the current staging sync queue state.
+func SetStagingSyncQueue(depth int, bytes int64, oldestAge time.Duration) {
+	stagingSyncQueueDepth.Set(float64(depth))
+	stagingSyncQueueBytes.Set(float64(bytes))
+	syncQueueBytes.Set(float64(bytes))
+	if depth == 0 {
+		stagingSyncOldestDirtyAge.Set(0)
+		return
+	}
+	stagingSyncOldestDirtyAge.Set(oldestAge.Seconds())
+}
+
+// RecordStagingUpload records successful staged upload timing and throughput.
+func RecordStagingUpload(sizeBytes int64, uploadDuration, visibilityLatency time.Duration) {
+	if uploadDuration > 0 {
+		stagingUploadDuration.Observe(uploadDuration.Seconds())
+		mib := float64(sizeBytes) / (1024 * 1024)
+		stagingUploadThroughputMiB.Observe(mib / uploadDuration.Seconds())
+	}
+	if visibilityLatency > 0 {
+		stagingCOSVisibilityLatency.Observe(visibilityLatency.Seconds())
+	}
+}
+
+// SetStagingPressure records current staging pressure gauges.
+func SetStagingPressure(usedBytes, availableBytes int64, pressureLevel string) {
+	stagingUsedBytes.Set(float64(usedBytes))
+	stagingAvailableBytes.Set(float64(availableBytes))
+	stagingPressureLevel.Set(float64(pressureLevelValue(pressureLevel)))
+}
+
+// RecordBackpressureBlocked records that a write entered backpressure wait.
+func RecordBackpressureBlocked() {
+	writesBlockedTotal.Inc()
+}
+
+// RecordBackpressureRejected records that a write was rejected by backpressure.
+func RecordBackpressureRejected() {
+	writesRejectedTotal.Inc()
+}
+
+// RecordBackpressureWait records time spent waiting for staging pressure relief.
+func RecordBackpressureWait(wait time.Duration) {
+	if wait > 0 {
+		backpressureWaitSeconds.Observe(wait.Seconds())
+	}
+}
+
+func pressureLevelValue(level string) int {
+	switch level {
+	case "critical":
+		return 2
+	case "high":
+		return 1
+	default:
+		return 0
+	}
 }
 
 // Made with Bob

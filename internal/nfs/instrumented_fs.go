@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -8,27 +9,28 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
+	gonfs "github.com/willscott/go-nfs"
 )
 
 // InstrumentedFilesystem wraps a billy.Filesystem to track NFS-level operations
 type InstrumentedFilesystem struct {
 	billy.Filesystem
 	logger *Logger
-	
+
 	// Per-path tracking for detecting loops
 	pathCalls sync.Map // map[string]*PathCallTracker
 }
 
 // PathCallTracker tracks calls to a specific path
 type PathCallTracker struct {
-	callCount    atomic.Int64
-	firstCall    time.Time
-	lastCall     time.Time
-	lastReturn   time.Time  // When the last call returned
-	mu           sync.Mutex
-	callTimes    []time.Time // Track timing of each call
-	returnTimes  []time.Time // Track when calls returned
-	gapTimes     []time.Duration // Track gaps between return and next call
+	callCount   atomic.Int64
+	firstCall   time.Time
+	lastCall    time.Time
+	lastReturn  time.Time // When the last call returned
+	mu          sync.Mutex
+	callTimes   []time.Time     // Track timing of each call
+	returnTimes []time.Time     // Track when calls returned
+	gapTimes    []time.Duration // Track gaps between return and next call
 }
 
 // NewInstrumentedFilesystem wraps a filesystem with instrumentation
@@ -42,7 +44,7 @@ func NewInstrumentedFilesystem(fs billy.Filesystem, logger *Logger) *Instrumente
 // ReadDir wraps the ReadDir call with detailed instrumentation
 func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	start := time.Now()
-	
+
 	// Get or create tracker for this path
 	trackerVal, _ := ifs.pathCalls.LoadOrStore(path, &PathCallTracker{
 		firstCall:   start,
@@ -51,7 +53,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		gapTimes:    make([]time.Duration, 0, 100),
 	})
 	tracker := trackerVal.(*PathCallTracker)
-	
+
 	// Calculate gap since last return (this is the REAL gap)
 	tracker.mu.Lock()
 	var gapSinceLastReturn time.Duration
@@ -62,7 +64,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		}
 	}
 	tracker.mu.Unlock()
-	
+
 	// Record this call
 	callNum := tracker.callCount.Add(1)
 	tracker.mu.Lock()
@@ -71,7 +73,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		tracker.callTimes = append(tracker.callTimes, start)
 	}
 	tracker.mu.Unlock()
-	
+
 	// Log first few calls and detect rapid loops
 	if callNum <= 10 {
 		ifs.logger.Info("ReadDir call",
@@ -79,7 +81,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"call_number", callNum,
 			"time_since_first_ms", start.Sub(tracker.firstCall).Milliseconds())
 	}
-	
+
 	// Detect rapid repeated calls (potential infinite loop)
 	if callNum > 100 && callNum%100 == 0 {
 		tracker.mu.Lock()
@@ -90,23 +92,23 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			avgGap = totalGap / time.Duration(recentCalls-1)
 		}
 		tracker.mu.Unlock()
-		
+
 		ifs.logger.Info("ReadDir loop detected",
 			"path", path,
 			"total_calls", callNum,
 			"avg_gap_ms", avgGap.Milliseconds(),
 			"duration_s", start.Sub(tracker.firstCall).Seconds())
 	}
-	
+
 	// Call the underlying filesystem
 	fsStart := time.Now()
 	entries, err := ifs.Filesystem.ReadDir(path)
 	fsDuration := time.Since(fsStart)
-	
+
 	totalDuration := time.Since(start)
 	overheadDuration := totalDuration - fsDuration
 	returnTime := time.Now()
-	
+
 	// Record return time
 	tracker.mu.Lock()
 	tracker.lastReturn = returnTime
@@ -114,7 +116,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		tracker.returnTimes = append(tracker.returnTimes, returnTime)
 	}
 	tracker.mu.Unlock()
-	
+
 	// Log timing breakdown for slow calls or first few
 	if totalDuration > 10*time.Millisecond || callNum <= 5 {
 		ifs.logger.Info("ReadDir timing",
@@ -127,7 +129,7 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"entries", len(entries),
 			"error", err != nil)
 	}
-	
+
 	// Log if gap is suspiciously long
 	if gapSinceLastReturn > 50*time.Millisecond {
 		ifs.logger.Info("Long gap detected",
@@ -135,10 +137,10 @@ func (ifs *InstrumentedFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 			"call_number", callNum,
 			"gap_ms", gapSinceLastReturn.Milliseconds())
 	}
-	
+
 	// Record metrics
 	metrics.GetGlobalCounters().RecordPathCall(path)
-	
+
 	return entries, err
 }
 
@@ -150,20 +152,20 @@ func (ifs *InstrumentedFilesystem) GetPathStats(path string) map[string]interfac
 			"calls": 0,
 		}
 	}
-	
+
 	tracker := trackerVal.(*PathCallTracker)
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	
+
 	callCount := tracker.callCount.Load()
 	duration := tracker.lastCall.Sub(tracker.firstCall)
-	
+
 	var avgCallGap time.Duration
 	if len(tracker.callTimes) > 1 {
 		totalGap := tracker.callTimes[len(tracker.callTimes)-1].Sub(tracker.callTimes[0])
 		avgCallGap = totalGap / time.Duration(len(tracker.callTimes)-1)
 	}
-	
+
 	var avgReturnGap time.Duration
 	var maxReturnGap time.Duration
 	if len(tracker.gapTimes) > 0 {
@@ -176,29 +178,39 @@ func (ifs *InstrumentedFilesystem) GetPathStats(path string) map[string]interfac
 		}
 		avgReturnGap = total / time.Duration(len(tracker.gapTimes))
 	}
-	
+
 	return map[string]interface{}{
-		"total_calls":           callCount,
-		"duration_seconds":      duration.Seconds(),
-		"avg_call_gap_us":       avgCallGap.Microseconds(),
-		"avg_return_gap_us":     avgReturnGap.Microseconds(),
-		"max_return_gap_us":     maxReturnGap.Microseconds(),
-		"calls_per_second":      float64(callCount) / duration.Seconds(),
-		"gaps_measured":         len(tracker.gapTimes),
+		"total_calls":       callCount,
+		"duration_seconds":  duration.Seconds(),
+		"avg_call_gap_us":   avgCallGap.Microseconds(),
+		"avg_return_gap_us": avgReturnGap.Microseconds(),
+		"max_return_gap_us": maxReturnGap.Microseconds(),
+		"calls_per_second":  float64(callCount) / duration.Seconds(),
+		"gaps_measured":     len(tracker.gapTimes),
 	}
 }
 
 // GetAllPathStats returns statistics for all paths
 func (ifs *InstrumentedFilesystem) GetAllPathStats() map[string]interface{} {
 	stats := make(map[string]interface{})
-	
+
 	ifs.pathCalls.Range(func(key, value interface{}) bool {
 		path := key.(string)
 		stats[path] = ifs.GetPathStats(path)
 		return true
 	})
-	
+
 	return stats
+}
+
+// FSStat forwards dynamic filesystem capacity data through instrumentation.
+func (ifs *InstrumentedFilesystem) FSStat(ctx context.Context, stat *gonfs.FSStat) error {
+	if provider, ok := ifs.Filesystem.(interface {
+		FSStat(context.Context, *gonfs.FSStat) error
+	}); ok {
+		return provider.FSStat(ctx, stat)
+	}
+	return nil
 }
 
 // Chmod changes the mode of the named file (implements billy.Change)

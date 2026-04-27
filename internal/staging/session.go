@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -68,7 +67,7 @@ func NewWriteSession(manager *StagingManager, path string, stagingPath string) (
 		File:        file,
 		Size:        stat.Size(),
 		Dirty:       false,
-		Prefetched  : false,
+		Prefetched:  false,
 		RefCount:    1,
 		LastWrite:   now,
 		LastAccess:  now,
@@ -94,13 +93,17 @@ func (ws *WriteSession) UpdateAttributes(mode os.FileMode, uid uint32, gid uint3
 
 // Write writes data to the staging file at the specified offset
 func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
-	// Check Disk Quota limit enforcing Linux native errors
-	if ws.Manager != nil && ws.Manager.config != nil && ws.Manager.config.MaxStagingSizeGB > 0 {
-		maxSize := ws.Manager.config.MaxStagingSizeGB * 1024 * 1024 * 1024
-		if ws.Manager.GetTotalStagingSize()+int64(len(data)) >= maxSize {
-			return 0, syscall.ENOSPC
+	currentSize := ws.GetSize()
+	growthBytes := offset + int64(len(data)) - currentSize
+	releaseReservation := func() {}
+	if ws.Manager != nil {
+		var err error
+		releaseReservation, err = ws.Manager.ReserveWrite(ws.Path, int64(len(data)), growthBytes)
+		if err != nil {
+			return 0, err
 		}
 	}
+	defer releaseReservation()
 
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
@@ -176,6 +179,18 @@ func (ws *WriteSession) Sync() error {
 	return nil
 }
 
+// Snapshot returns stable session metadata for a sync attempt.
+func (ws *WriteSession) Snapshot() (stagingPath string, size int64, mode os.FileMode, uid uint32, gid uint32, refCount int32, lastWrite time.Time, multipartPartSize int64) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	partSize := int64(0)
+	if ws.Multipart != nil {
+		partSize = ws.Multipart.PartSize
+	}
+	return ws.StagingPath, ws.Size, ws.Mode, ws.UID, ws.GID, ws.RefCount, ws.LastWrite, partSize
+}
+
 // Close closes the staging file
 func (ws *WriteSession) Close() error {
 	ws.mu.Lock()
@@ -229,6 +244,17 @@ func (ws *WriteSession) GetRefCount() int32 {
 
 // Truncate truncates the staging file to the specified size
 func (ws *WriteSession) Truncate(size int64) error {
+	currentSize := ws.GetSize()
+	releaseReservation := func() {}
+	if ws.Manager != nil && size > currentSize {
+		var err error
+		releaseReservation, err = ws.Manager.ReserveWrite(ws.Path, size-currentSize, size-currentSize)
+		if err != nil {
+			return err
+		}
+	}
+	defer releaseReservation()
+
 	ws.mu.Lock()
 	defer ws.mu.Unlock()
 
@@ -262,7 +288,7 @@ func (ws *WriteSession) Prefetch(fetcher func() error) error {
 	if stat, err := ws.File.Stat(); err == nil {
 		ws.Size = stat.Size()
 	}
-	
+
 	ws.Prefetched = true
 	return nil
 }

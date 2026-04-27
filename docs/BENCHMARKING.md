@@ -1,17 +1,17 @@
-# Enterprise Gateway Benchmarking
+# COS NFS Gateway Benchmarking
 
-The IBM COS NFS Gateway includes a highly unified validation dashboard scripting suite (`scripts/run_stress_tests.sh`) that natively tracks Hardware CPU variables and Local Memory usage dynamically scaling across execution profiles.
+The formal benchmark framework is documented in [BENCHMARK_SUITE.md](BENCHMARK_SUITE.md). It produces timestamped result directories with human-readable summaries, JSON, CSV, raw fio output, monitor samples, environment capture, and a compact baseline format for future comparisons.
 
-## Running the Validations
-Execute the primary benchmark sequence locally across your RedHat machine checking out limits natively:
+Run a standard benchmark against an already-running and mounted gateway:
+
 ```bash
-sudo ./scripts/run_stress_tests.sh
+./scripts/run_benchmark_suite.sh
 ```
 
-## Tracked Metrics
-The Dashboard analyzes cache capabilities comprehensively bypassing typical FIO string abstractions:
-- **Sequential OS Cache Scaling**: `cache_throughput`
-- **Multi-Gigabyte Progressive S3 Streaming**: `massive_s3_chunk_burst`
-- **Native Memory Mapped Concurrent Profiling**: `mmap_concurrent_randrw`
+Run a short smoke benchmark:
 
-At execution bounds finish, it will drop natively directly tracking a compiled `DASHBOARD_STRESS.md` detailing Hardware Constraints (Max RAM/Active CPU limits) evaluating Gateway capacities accurately.
+```bash
+PROFILE=quick ./scripts/run_benchmark_suite.sh
+```
+
+The older `scripts/run_stress_tests.sh` script is still available for ad-hoc stress exploration, but benchmark comparisons should use `scripts/benchmark_suite.py` or the wrapper above so outputs remain repeatable and machine-comparable.

@@ -1,8 +1,8 @@
 package main
 
 import (
-	"encoding/json"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -75,6 +75,9 @@ func main() {
 		zap.Int("multipart_threshold_mb", cfg.Performance.MultipartThresholdMB),
 		zap.Int("multipart_chunk_mb", cfg.Performance.MultipartChunkMB),
 		zap.Int("read_ahead_kb", cfg.Performance.ReadAheadKB),
+		zap.Int("max_full_object_read_mb", cfg.Performance.MaxFullObjectReadMB),
+		zap.Int("max_buffered_write_mb", cfg.Performance.MaxBufferedWriteMB),
+		zap.Int("max_directory_entries", cfg.Performance.MaxDirectoryEntries),
 		zap.Bool("data_cache_enabled", cfg.Cache.Data.Enabled),
 		zap.Bool("metadata_cache_enabled", cfg.Cache.Metadata.Enabled),
 		zap.Int("data_cache_size_gb", cfg.Cache.Data.SizeGB),
@@ -106,7 +109,7 @@ func main() {
 	logging.Info("Caches initialized successfully")
 
 	// Initialize POSIX operations handler
-	operations := posix.NewOperationsHandler(cosClient, metadataCache, dataCache)
+	operations := posix.NewOperationsHandler(cosClient, metadataCache, dataCache, &cfg.Performance)
 
 	// Initialize lock manager
 	lockManager := lock.NewManager(5 * time.Minute)
@@ -171,59 +174,59 @@ func main() {
 	// Initialize staging components if enabled
 	var stagingManager *staging.StagingManager
 	var syncWorker *staging.SyncWorker
-	
+
 	if featureFlags.IsStagingEnabled() {
 		logging.Info("Initializing staging architecture",
 			zap.String("root_dir", cfg.Staging.RootDir),
 			zap.Int64("sync_threshold_mb", cfg.Staging.SyncThresholdMB),
 			zap.Int("sync_worker_count", cfg.Staging.SyncWorkerCount))
-		
+
 		// Create staging manager
 		stagingManager, err = staging.NewStagingManager(&cfg.Staging)
 		if err != nil {
 			logging.Fatal("Failed to initialize staging manager", zap.Error(err))
 		}
 		defer stagingManager.Shutdown()
-		
+
 		// Create COS client adapter for sync worker
 		cosClientAdapter := &staging.COSClientAdapter{Client: cosClient}
-		
+
 		// Create sync worker
 		syncWorker = staging.NewSyncWorker(stagingManager, cosClientAdapter, &cfg.Staging)
-		
+
 		// Start sync worker
 		syncWorker.Start()
 		defer syncWorker.Stop()
-		
+
 		logging.Info("Staging architecture initialized successfully")
 	}
 
 	// Initialize NFS filesystem and server
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
-	
+
 	// Create billy.Filesystem implementation with config
 	cosFilesystem := nfs.NewCOSFilesystemWithConfig(operations, nfsLogger, "/", &cfg.Performance, stagingManager, syncWorker, featureFlags)
-	
+
 	// Wrap with directory caching to work around go-nfs library limitation
 	// The go-nfs library doesn't use CachingHandler for READDIR, so we cache at filesystem level
 	// Use 30-second TTL - long enough to handle pagination, short enough to see updates
 	cachedFS := nfs.NewCachedFilesystem(cosFilesystem, nfsLogger, 30*time.Second)
-	
+
 	// Wrap with instrumentation to track NFS-level behavior
 	instrumentedFS := nfs.NewInstrumentedFilesystem(cachedFS, nfsLogger)
-	
+
 	// Wrap with null auth handler, then caching handler
 	// Use large cache to prevent verifier eviction during directory pagination
 	// Handle cache: 10000 (file handles)
 	// Verifier cache: 10000 (directory listings)
 	authHandler := nfshelper.NewNullAuthHandler(instrumentedFS)
 	cachedHandler := nfshelper.NewCachingHandlerWithVerifierLimit(authHandler, 10000, 10000)
-	
+
 	// Wrap with stable verifier handler to prevent BadCookie errors
 	// This ensures the same verifier is returned for a directory across all pagination requests
 	stableHandler := nfs.NewStableVerifierHandler(cachedHandler, nfsLogger)
-	
+
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
 	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger)
 	if err != nil {
@@ -245,19 +248,34 @@ func main() {
 	http.HandleFunc("/debug/perf", func(w http.ResponseWriter, r *http.Request) {
 		counters := metrics.GetGlobalCounters()
 		report := counters.GetReport()
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(report)
 	})
-	
+
 	// Add path-specific stats endpoint
 	http.HandleFunc("/debug/perf/paths", func(w http.ResponseWriter, r *http.Request) {
 		stats := instrumentedFS.GetAllPathStats()
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(stats)
 	})
-	
+
+	// Add staging sync metrics endpoint
+	http.HandleFunc("/debug/staging/sync", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if syncWorker == nil {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"enabled": false,
+			})
+			return
+		}
+
+		stats := syncWorker.Stats()
+		stats["enabled"] = true
+		json.NewEncoder(w).Encode(stats)
+	})
+
 	// Add reset endpoint
 	http.HandleFunc("/debug/perf/reset", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -268,7 +286,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Counters reset\n"))
 	})
-	
+
 	// Add READDIR trace endpoints
 	http.HandleFunc("/debug/readdir/enable", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -279,7 +297,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing enabled\n"))
 	})
-	
+
 	http.HandleFunc("/debug/readdir/disable", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -289,38 +307,38 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR tracing disabled\n"))
 	})
-	
+
 	http.HandleFunc("/debug/readdir/traces", func(w http.ResponseWriter, r *http.Request) {
 		traces := nfs.GetAllTraces()
-		
+
 		// Analyze each trace
 		result := make(map[string]interface{})
 		for path, trace := range traces {
 			result[path] = trace.Analyze()
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
 	})
-	
+
 	http.HandleFunc("/debug/readdir/trace", func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Query().Get("path")
 		if path == "" {
 			http.Error(w, "Missing 'path' query parameter", http.StatusBadRequest)
 			return
 		}
-		
+
 		trace := nfs.GetTrace(path)
 		if trace == nil {
 			http.Error(w, "No trace found for path", http.StatusNotFound)
 			return
 		}
-		
+
 		// Return detailed trace
 		w.Header().Set("Content-Type", "text/plain")
 		trace.PrintTrace(w)
 	})
-	
+
 	http.HandleFunc("/debug/readdir/clear", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -330,10 +348,11 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("READDIR traces cleared\n"))
 	})
-	
+
 	logging.Info("Performance metrics available at:")
-	logging.Info("  http://localhost:8080/debug/perf - Overall metrics")
-	logging.Info("  http://localhost:8080/debug/perf/paths - Per-path statistics")
+	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/perf - Overall metrics", cfg.Server.DebugPort))
+	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/perf/paths - Per-path statistics", cfg.Server.DebugPort))
+	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/staging/sync - Staging sync queue and upload metrics", cfg.Server.DebugPort))
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

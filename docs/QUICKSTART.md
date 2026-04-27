@@ -28,7 +28,6 @@ cos:
   bucket: "my-nfs-bucket"
   region: "us-south"
   auth_type: "iam"
-  api_key: "${IBM_CLOUD_API_KEY}"
 
 cache:
   metadata:
@@ -57,10 +56,10 @@ docker run -d \
   -p 2049:2049 \
   -p 8080:8080 \
   -p 8081:8081 \
-  -e IBM_CLOUD_API_KEY="${IBM_CLOUD_API_KEY}" \
+  -e NFS_GATEWAY_COS_API_KEY="${IBM_CLOUD_API_KEY}" \
   -v $(pwd)/config.yaml:/etc/nfs-gateway/config.yaml \
   -v nfs-cache:/var/cache/nfs-gateway \
-  oborges/cos-nfs-gateway:latest
+  oborges/cos-nfs-gateway:1.0.0
 ```
 
 ### 3. Mount the NFS Share
@@ -100,16 +99,16 @@ version: '3.8'
 
 services:
   nfs-gateway:
-    image: oborges/cos-nfs-gateway:latest
+    image: oborges/cos-nfs-gateway:1.0.0
     ports:
       - "2049:2049"
       - "8080:8080"
       - "8081:8081"
     environment:
-      - COS_ENDPOINT=s3.us-south.cloud-object-storage.appdomain.cloud
-      - COS_BUCKET=my-nfs-bucket
-      - COS_REGION=us-south
-      - IBM_CLOUD_API_KEY=${IBM_CLOUD_API_KEY}
+      - NFS_GATEWAY_COS_ENDPOINT=s3.us-south.cloud-object-storage.appdomain.cloud
+      - NFS_GATEWAY_COS_BUCKET=my-nfs-bucket
+      - NFS_GATEWAY_COS_REGION=us-south
+      - NFS_GATEWAY_COS_API_KEY=${IBM_CLOUD_API_KEY}
     volumes:
       - ./config.yaml:/etc/nfs-gateway/config.yaml
       - nfs-cache:/var/cache/nfs-gateway
@@ -244,6 +243,9 @@ performance:
   worker_pool_size: 200
   max_concurrent_reads: 100
   max_concurrent_writes: 50
+  max_full_object_read_mb: 512
+  max_buffered_write_mb: 512
+  max_directory_entries: 100000
 
 cache:
   data:

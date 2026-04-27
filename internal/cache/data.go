@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,9 +114,26 @@ func (c *DataCache) Read(key string, offset, length int64) ([]byte, error) {
 	}
 	defer file.Close()
 
+	if offset < 0 {
+		return nil, fmt.Errorf("invalid cache offset: %d", offset)
+	}
+
 	// Seek to offset
 	if _, err := file.Seek(offset, 0); err != nil {
 		return nil, fmt.Errorf("failed to seek: %w", err)
+	}
+
+	if length <= 0 {
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read cache file: %w", err)
+		}
+		logging.Debug("Data cache hit",
+			zap.String("key", key),
+			zap.Int64("offset", offset),
+			zap.Int("length", len(data)),
+		)
+		return data, nil
 	}
 
 	// Read data
@@ -154,6 +172,13 @@ func (c *DataCache) Write(key string, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if value, ok := c.index.Get(key); ok {
+		if entry, ok := value.(*CacheEntry); ok {
+			c.deleteFile(entry.FilePath)
+			c.index.Delete(key)
+		}
+	}
+
 	// Evict entries if necessary
 	for c.currentSize+size > c.maxSize {
 		if !c.evictOldest() {
@@ -191,6 +216,40 @@ func (c *DataCache) Write(key string, data []byte) error {
 	)
 
 	return nil
+}
+
+// ReadChunk reads an object chunk from cache.
+func (c *DataCache) ReadChunk(objectKey string, chunkStart, chunkSize int64) ([]byte, error) {
+	return c.Read(c.chunkKey(objectKey, chunkStart, chunkSize), 0, 0)
+}
+
+// WriteChunk stores an object chunk in cache.
+func (c *DataCache) WriteChunk(objectKey string, chunkStart, chunkSize int64, data []byte) error {
+	return c.Write(c.chunkKey(objectKey, chunkStart, chunkSize), data)
+}
+
+// DeleteObject removes full-object and chunk cache entries for a logical object.
+func (c *DataCache) DeleteObject(objectKey string) error {
+	if !c.enabled {
+		return nil
+	}
+
+	if err := c.Delete(objectKey); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.index.DeletePrefix(c.chunkPrefix(objectKey))
+	return nil
+}
+
+// ChunkSize returns the configured cache chunk size.
+func (c *DataCache) ChunkSize() int64 {
+	if c == nil || !c.enabled || c.chunkSize <= 0 {
+		return 0
+	}
+	return c.chunkSize
 }
 
 // Delete removes an entry from cache
@@ -262,9 +321,9 @@ func (c *DataCache) Stats() DataCacheStats {
 	indexStats := c.index.Stats()
 
 	return DataCacheStats{
-		CacheStats:  indexStats,
-		CurrentSize: c.currentSize,
-		MaxSize:     c.maxSize,
+		CacheStats:   indexStats,
+		CurrentSize:  c.currentSize,
+		MaxSize:      c.maxSize,
 		UsagePercent: float64(c.currentSize) / float64(c.maxSize) * 100,
 	}
 }
@@ -282,9 +341,11 @@ func (c *DataCache) evictOldest() bool {
 		return false
 	}
 
-	// The LRU cache will handle eviction through its callback
-	c.index.CleanExpired()
-	return true
+	if expired := c.index.CleanExpired(); expired > 0 {
+		return true
+	}
+
+	return c.index.EvictOldest()
 }
 
 // deleteFile deletes a cache file
@@ -315,6 +376,14 @@ func (c *DataCache) getCacheFilePath(key string) string {
 	return filepath.Join(c.basePath, subdir, filename)
 }
 
+func (c *DataCache) chunkPrefix(objectKey string) string {
+	return "chunk:" + objectKey + ":"
+}
+
+func (c *DataCache) chunkKey(objectKey string, chunkStart, chunkSize int64) string {
+	return fmt.Sprintf("%s%d:%d", c.chunkPrefix(objectKey), chunkStart, chunkSize)
+}
+
 // calculateSize calculates the current cache size
 func (c *DataCache) calculateSize() error {
 	var totalSize int64
@@ -335,6 +404,11 @@ func (c *DataCache) calculateSize() error {
 
 	c.currentSize = totalSize
 	return nil
+}
+
+// IsChunkKey reports whether a cache key belongs to a chunk entry.
+func IsChunkKey(key string) bool {
+	return strings.HasPrefix(key, "chunk:")
 }
 
 // DataCacheStats represents data cache statistics

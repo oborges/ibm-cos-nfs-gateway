@@ -10,7 +10,7 @@ import (
 
 func createTestConfig(t *testing.T) *config.StagingConfig {
 	tmpDir := t.TempDir()
-	
+
 	return &config.StagingConfig{
 		Enabled:          true,
 		RootDir:          tmpDir,
@@ -239,6 +239,43 @@ func TestStagingManager_CleanupSession(t *testing.T) {
 	// Staging file should be deleted
 	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
 		t.Error("Staging file should be deleted")
+	}
+}
+
+func TestStagingManager_CleanupSessionDeleteClearsDirtyEntry(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/test/deleted-file.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("Failed to create session: %v", err)
+	}
+
+	data := []byte("delete me before sync")
+	if _, err := session.Write(data, 0); err != nil {
+		t.Fatalf("Failed to write staging data: %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Failed to sync staging data: %v", err)
+	}
+	manager.MarkDirty(path, int64(len(data)))
+
+	if err := manager.CleanupSession(path, true); err != nil {
+		t.Fatalf("Failed to cleanup session: %v", err)
+	}
+
+	if manager.IsDirty(path) {
+		t.Fatal("Deleted staging file should not remain in dirty index")
+	}
+
+	depth, bytes, _ := manager.SyncQueueStats()
+	if depth != 0 || bytes != 0 {
+		t.Fatalf("Expected empty sync queue, got depth=%d bytes=%d", depth, bytes)
 	}
 }
 

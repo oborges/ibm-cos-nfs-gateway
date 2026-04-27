@@ -2,6 +2,7 @@ package staging
 
 import (
 	"sync"
+
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 )
 
@@ -51,13 +52,13 @@ func (s *S3MultipartState) IsSequential() bool {
 func (s *S3MultipartState) AddCompletedPart(partNumber int64, etag string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	part := &s3.CompletedPart{
 		ETag:       &etag,
 		PartNumber: &partNumber,
 	}
 	s.CompletedParts = append(s.CompletedParts, part)
-	
+
 	// Advance offset (assuming sequential part uploads)
 	s.NextOffset += s.PartSize
 	s.MinModifiedOffset = s.NextOffset // Reset minimum
@@ -68,6 +69,18 @@ func (s *S3MultipartState) GetNextUploadRange() (int64, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.NextOffset, s.NextOffset + s.PartSize
+}
+
+// Reset clears all upload session state after a complete, abort, or restart.
+func (s *S3MultipartState) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.UploadID = ""
+	s.NextOffset = 0
+	s.MinModifiedOffset = 0
+	s.CompletedParts = make([]*s3.CompletedPart, 0)
+	s.Active = false
 }
 
 // Made with Bob

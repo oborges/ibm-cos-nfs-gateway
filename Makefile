@@ -1,9 +1,9 @@
-.PHONY: all build test clean install run docker-build docker-push k8s-deploy help
+.PHONY: all build test clean install run docker-build docker-push k8s-deploy benchmark-suite help
 
 # Variables
 BINARY_NAME=nfs-gateway
 DOCKER_IMAGE=oborges/cos-nfs-gateway
-VERSION?=latest
+VERSION?=1.0.0
 GO=go
 GOFLAGS=-v
 LDFLAGS=-ldflags "-X main.Version=${VERSION}"
@@ -58,6 +58,11 @@ bench:
 	@echo "Running benchmarks..."
 	${GO} test -bench=. -benchmem ./...
 
+# Run the formal mounted-gateway benchmark suite
+benchmark-suite:
+	@echo "Running COS NFS Gateway benchmark suite..."
+	./scripts/run_benchmark_suite.sh
+
 # Clean build artifacts
 clean:
 	@echo "Cleaning..."
@@ -101,13 +106,11 @@ vet:
 docker-build:
 	@echo "Building Docker image..."
 	docker build -t ${DOCKER_IMAGE}:${VERSION} -f deployments/docker/Dockerfile .
-	docker tag ${DOCKER_IMAGE}:${VERSION} ${DOCKER_IMAGE}:latest
 
 # Push Docker image
 docker-push:
 	@echo "Pushing Docker image..."
 	docker push ${DOCKER_IMAGE}:${VERSION}
-	docker push ${DOCKER_IMAGE}:latest
 
 # Run Docker container
 docker-run:
@@ -154,6 +157,7 @@ help:
 	@echo "  make test-e2e        - Run e2e tests"
 	@echo "  make coverage        - Generate coverage report"
 	@echo "  make bench           - Run benchmarks"
+	@echo "  make benchmark-suite - Run mounted gateway benchmark suite"
 	@echo "  make clean           - Clean build artifacts"
 	@echo "  make install         - Install dependencies"
 	@echo "  make run             - Run the application"

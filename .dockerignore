@@ -1,0 +1,25 @@
+# Local configuration may contain COS credentials.
+configs/config.yaml
+
+# Environment files often contain secrets.
+.env
+.env.local
+.env.*.local
+
+# Build and test artifacts are not needed in Docker contexts.
+bin/
+dist/
+coverage.out
+coverage.html
+*.test
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# Local/editor files.
+.git/
+.DS_Store
+.idea/
+.vscode/

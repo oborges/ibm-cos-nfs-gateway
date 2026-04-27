@@ -19,11 +19,10 @@ data:
       write_timeout: "30s"
 
     cos:
-      endpoint: "${COS_ENDPOINT}"
-      bucket: "${COS_BUCKET}"
-      region: "${COS_REGION}"
+      endpoint: "s3.us-south.cloud-object-storage.appdomain.cloud"
+      bucket: "my-nfs-bucket"
+      region: "us-south"
       auth_type: "iam"
-      api_key: "${IBM_CLOUD_API_KEY}"
       max_retries: 3
       timeout: "30s"
 
@@ -40,13 +39,16 @@ data:
         chunk_size_kb: 1024
 
     performance:
-      read_ahead_kb: 1024
+      read_ahead_kb: 8192
       write_buffer_kb: 4096
       multipart_threshold_mb: 100
       multipart_chunk_mb: 10
       worker_pool_size: 100
       max_concurrent_reads: 50
       max_concurrent_writes: 25
+      max_full_object_read_mb: 512
+      max_buffered_write_mb: 512
+      max_directory_entries: 100000
 
     logging:
       level: "info"

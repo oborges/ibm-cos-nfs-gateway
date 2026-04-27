@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -247,7 +246,8 @@ func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string)
 		WriteBufferKB:        4096,
 		MultipartThresholdMB: 100,
 		MultipartChunkMB:     10,
-		ReadAheadKB:          1024,
+		ReadAheadKB:          config.DefaultReadAheadKB,
+		MaxBufferedWriteMB:   config.DefaultMaxBufferedWriteMB,
 	}
 	return &COSFilesystem{
 		ops:        ops,
@@ -259,8 +259,19 @@ func NewCOSFilesystem(ops *posix.OperationsHandler, logger *Logger, root string)
 
 // NewCOSFilesystemWithConfig creates a new COS filesystem with configuration
 func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, root string, perfConfig *config.PerformanceConfig, stagingManager *staging.StagingManager, syncWorker *staging.SyncWorker, featureFlags *feature.FeatureFlags) *COSFilesystem {
+	if perfConfig == nil {
+		perfConfig = &config.PerformanceConfig{
+			WriteBufferKB:        4096,
+			MultipartThresholdMB: 100,
+			MultipartChunkMB:     10,
+			ReadAheadKB:          config.DefaultReadAheadKB,
+			MaxBufferedWriteMB:   config.DefaultMaxBufferedWriteMB,
+		}
+	}
+
 	bufferSize := int64(perfConfig.WriteBufferKB) * 1024
 	sessionTimeout := 5 * time.Minute // Keep sessions alive for 5 minutes after last access
+	stagingEnabled := featureFlags != nil && featureFlags.IsStagingEnabled()
 
 	logger.Info("Initializing COS filesystem with configuration",
 		"write_buffer_kb", perfConfig.WriteBufferKB,
@@ -269,8 +280,9 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 		"multipart_threshold_mb", perfConfig.MultipartThresholdMB,
 		"multipart_chunk_mb", perfConfig.MultipartChunkMB,
 		"read_ahead_kb", perfConfig.ReadAheadKB,
+		"max_buffered_write_mb", perfConfig.MaxBufferedWriteMB,
 		"session_timeout", sessionTimeout,
-		"staging_enabled", featureFlags.IsStagingEnabled())
+		"staging_enabled", stagingEnabled)
 
 	// Create session manager for path-scoped write buffering (legacy path)
 	sessionManager := buffer.NewSessionManager(bufferSize, sessionTimeout)
@@ -290,6 +302,51 @@ func NewCOSFilesystemWithConfig(ops *posix.OperationsHandler, logger *Logger, ro
 // Create creates a new file
 func (fs *COSFilesystem) Create(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+}
+
+// FSStat reports staging-aware capacity so NFS clients see pressure before writeback fails.
+func (fs *COSFilesystem) FSStat(ctx context.Context, stat *nfs.FSStat) error {
+	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		pressure := fs.stagingManager.CurrentPressure()
+		totalBytes := pressure.QuotaBytes
+		availableBytes := pressure.AvailableBytes
+		if pressure.HighWatermarkBytes > 0 {
+			safeAvailable := pressure.HighWatermarkBytes - pressure.UsedBytes
+			if safeAvailable < 0 {
+				safeAvailable = 0
+			}
+			if safeAvailable < availableBytes {
+				availableBytes = safeAvailable
+			}
+		}
+		total := uint64(totalBytes)
+		available := uint64(0)
+		if availableBytes > 0 {
+			available = uint64(availableBytes)
+		}
+		if totalBytes == 0 {
+			total = 1 << 50
+			available = total
+		}
+
+		stat.TotalSize = total
+		stat.FreeSize = available
+		stat.AvailableSize = available
+		stat.TotalFiles = 1 << 32
+		stat.FreeFiles = 1 << 32
+		stat.AvailableFiles = 1 << 32
+		stat.CacheHint = time.Second
+		return nil
+	}
+
+	stat.TotalSize = 1 << 50
+	stat.FreeSize = 1 << 50
+	stat.AvailableSize = 1 << 50
+	stat.TotalFiles = 1 << 32
+	stat.FreeFiles = 1 << 32
+	stat.AvailableFiles = 1 << 32
+	stat.CacheHint = time.Second
+	return nil
 }
 
 // Open opens a file for reading
@@ -479,10 +536,7 @@ func (s *stagingFileInfo) Mode() os.FileMode  { return s.mode }
 func (s *stagingFileInfo) ModTime() time.Time { return s.modTime }
 func (s *stagingFileInfo) IsDir() bool        { return false }
 func (s *stagingFileInfo) Sys() interface{} {
-	return &syscall.Stat_t{
-		Uid: s.uid,
-		Gid: s.gid,
-	}
+	return nil
 }
 
 func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
@@ -781,9 +835,14 @@ func (fs *COSFilesystem) Readlink(link string) (string, error) {
 func (fs *COSFilesystem) Chroot(path string) (billy.Filesystem, error) {
 	newRoot := fs.Join(fs.root, path)
 	return &COSFilesystem{
-		ops:    fs.ops,
-		logger: fs.logger,
-		root:   newRoot,
+		ops:            fs.ops,
+		logger:         fs.logger,
+		root:           newRoot,
+		perfConfig:     fs.perfConfig,
+		sessionManager: fs.sessionManager,
+		stagingManager: fs.stagingManager,
+		syncWorker:     fs.syncWorker,
+		featureFlags:   fs.featureFlags,
 	}, nil
 }
 
@@ -931,6 +990,14 @@ type COSFile struct {
 // Name returns the file name
 func (f *COSFile) Name() string {
 	return filepath.Base(f.path)
+}
+
+func (f *COSFile) maxBufferedWriteBytes() int64 {
+	limitMB := config.DefaultMaxBufferedWriteMB
+	if f.perfConfig != nil && f.perfConfig.MaxBufferedWriteMB > 0 {
+		limitMB = f.perfConfig.MaxBufferedWriteMB
+	}
+	return int64(limitMB) * 1024 * 1024
 }
 
 // Read reads data from the file
@@ -1196,6 +1263,12 @@ func (f *COSFile) flushSessionBuffer() error {
 	} else if startOffset == currentSize && currentSize > 0 {
 		// SEQUENTIAL APPEND: startOffset equals current file size
 		// We can optimize this by reading once and appending
+		mergedSize := currentSize + flushSize
+		if mergedSize > f.maxBufferedWriteBytes() {
+			return fmt.Errorf("buffered append merge for %s would allocate %d bytes, exceeding max_buffered_write_mb=%d; enable staging or raise the limit",
+				f.path, mergedSize, f.maxBufferedWriteBytes()/(1024*1024))
+		}
+
 		f.logger.Info("SEQUENTIAL APPEND detected",
 			"file_id", f.fileID,
 			"path", f.path,
@@ -1238,6 +1311,12 @@ func (f *COSFile) flushSessionBuffer() error {
 	} else {
 		// For random writes/updates, we need to read existing data and merge
 		// This is a limitation of COS - we can't do partial updates
+		needed := startOffset + int64(len(data))
+		if needed > f.maxBufferedWriteBytes() {
+			return fmt.Errorf("buffered random-write merge for %s would allocate %d bytes, exceeding max_buffered_write_mb=%d; enable staging or raise the limit",
+				f.path, needed, f.maxBufferedWriteBytes()/(1024*1024))
+		}
+
 		f.logger.Info("RANDOM WRITE detected - requires full file download",
 			"file_id", f.fileID,
 			"path", f.path,
@@ -1256,7 +1335,6 @@ func (f *COSFile) flushSessionBuffer() error {
 		}
 
 		// Merge the data
-		needed := startOffset + int64(len(data))
 		if needed > int64(len(existingData)) {
 			newData := make([]byte, needed)
 			copy(newData, existingData)
@@ -1312,8 +1390,6 @@ func (f *COSFile) Close() error {
 	if f.featureFlags != nil && f.featureFlags.IsStagingEnabled() && f.stagingSession != nil {
 		sessionSize := f.stagingSession.Size
 		isDirty := f.stagingSession.Dirty
-
-		f.stagingSession.DecrementRefCount()
 		refCount := f.stagingSession.GetRefCount()
 
 		f.logger.Info("FILE CLOSE - Releasing staging session",
@@ -1325,7 +1401,6 @@ func (f *COSFile) Close() error {
 
 		// If this is a zero-byte file that was truncated and this is the last handle,
 		// immediately sync it to COS to ensure it exists for NFS attribute operations
-		// Note: refCount == 1 means this was the last handle (session starts at 1, we increment to 2 in Open)
 		if sessionSize == 0 && isDirty && refCount == 1 && f.totalWrites == 0 {
 			f.logger.Info("Immediately syncing zero-byte truncated file",
 				"file_id", f.fileID,

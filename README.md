@@ -1,349 +1,404 @@
 # IBM Cloud COS NFS Gateway
 
-> ⚠️ **DISCLAIMER**: This is an **unofficial, community-driven hobby project** and is **NOT affiliated with, endorsed by, or supported by IBM Corporation**. This software is provided "as-is" without any warranty. Use at your own risk.
+IBM Cloud COS NFS Gateway exposes an IBM Cloud Object Storage bucket through an
+NFSv3 mount. It is intended for Linux workloads that need a filesystem-shaped
+interface while storing file data in COS.
 
-A high-performance NFS v3 gateway that provides POSIX filesystem access to IBM Cloud Object Storage (COS). This solution enables legacy applications and workflows to seamlessly use cloud object storage through standard NFS mounts.
+This is an unofficial community project. It is not an IBM product, is not
+endorsed by IBM, and is provided as-is without warranty or official support.
+Test carefully with your own workload before relying on it.
 
-## ⚠️ Important Notices
+## What This Gateway Does
 
-- **NOT AN IBM PRODUCT**: This is a personal hobby project, not an official IBM solution
-- **NO WARRANTY**: Provided "as-is" without warranties of any kind
-- **NO SUPPORT**: No official support is provided - use at your own risk
-- **EXPERIMENTAL**: This is experimental software - thoroughly test before any production use
-- **YOUR RESPONSIBILITY**: You are solely responsible for any data loss, costs, or issues
-- **NOT FOR PRODUCTION**: Not recommended for production workloads without extensive testing
+- Serves an NFSv3 export backed by one IBM Cloud COS bucket.
+- Accepts POSIX-style file operations from Linux NFS clients.
+- Uses a local staging layer for writes.
+- Syncs staged dirty files to COS asynchronously in background workers.
+- Uses multipart upload for large staged objects.
+- Provides staging backpressure to prevent the local staging filesystem from
+  filling unexpectedly.
+- Provides metadata and chunk/range data caching for reads.
+- Uses read-ahead, parallel range fetches, and singleflight deduplication to
+  reduce repeated COS reads.
+- Exposes Prometheus metrics, health endpoints, and debug endpoints when
+  enabled.
+- Includes a repeatable benchmark suite for write, sync, read, backpressure,
+  small-file, crash-safety, and mixed workload validation.
 
-## 🌟 Features
+## The Most Important Write Semantics
 
-- **NFSv3 Protocol Support**: Full NFSv3 implementation using go-nfs library
-- **IBM Cloud COS Backend**: Transparent object storage integration
-- **High Performance Caching**: Multi-tier staging layer avoiding Out Of Memory logic dynamically pushing max chunk boundaries preserving limits natively!
-- **Zero-Copy MMap Optimization**: Eliminates networking overhead by Memory-Mapping Linux Page Caches direct out to HTTP bindings.
-- **Progressive S3 Multipart**: Massive isolated gigabyte streaming chunk pipelines uploaded organically concurrently intercepting POSIX sequences!
-- **Strict Hardware OS Quotas**: Transparent disk metrics mapping Native `ENOSPC` bounds halting scaling connections preventing underlying memory faults securely!
-- **POSIX Semantics**: Preserves active local caching sequences maintaining mapping validations synchronously.
+The gateway uses write-back asynchronous sync.
 
-## 📋 Prerequisites
+When an NFS write is accepted by the gateway, the data has been accepted into
+local staging. That does not mean the object is already durable in COS.
 
-- Go 1.21 or higher
-- IBM Cloud account with Cloud Object Storage service
-- Linux system with NFS utilities
-- (Optional) Docker for containerized deployment
-- (Optional) Kubernetes cluster for production deployment
+Durability in COS happens later, when the background sync worker uploads the
+staged file and the object becomes visible in the target bucket. Until that
+sync completes, the gateway must preserve the staged dirty data locally. If you
+need to know whether data is durable in COS, monitor the sync queue, dirty
+bytes, upload metrics, logs, or the debug staging endpoint.
 
-## 🚀 Quick Start
+In short:
 
-### 1. Clone the Repository
+- "Write accepted" means local staging accepted the write.
+- "Sync complete" means the staged file was uploaded to COS.
+- "Durable in COS" means the uploaded object is visible in COS with the
+  expected size/checksum for your validation process.
+
+## Prerequisites
+
+Before running the gateway, the operator must create and provide:
+
+- An IBM Cloud Object Storage service.
+- A COS bucket.
+- An API key or HMAC credentials with the required permissions for that bucket.
+- A Linux host with NFS client utilities.
+- Local disk capacity for staging and read cache.
+- Go 1.25 or newer if building from source.
+
+The NFS export itself does not implement user authentication. Deploy it only on
+trusted hosts or trusted networks, and control access with operating-system,
+firewall, VPC, security group, or Kubernetes network policy boundaries.
+
+## Quick Start
+
+Clone and build:
 
 ```bash
 git clone https://github.com/oborges/ibm-cos-nfs-gateway.git
 cd ibm-cos-nfs-gateway
+make build
 ```
 
-### 2. Configure
-
-Create your configuration file:
+Create a configuration file:
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
 ```
 
-Edit `configs/config.yaml` with your IBM Cloud COS credentials:
+Edit `configs/config.yaml` with your COS settings:
 
 ```yaml
 cos:
   endpoint: "s3.us-south.cloud-object-storage.appdomain.cloud"
+  bucket: "my-nfs-bucket"
   region: "us-south"
-  bucket: "your-bucket-name"
-  api_key: "your-api-key"
-  service_instance_id: "your-service-instance-id"
+  auth_type: "iam"
+  api_key: "your-ibm-cloud-api-key"
+  service_id: "ServiceId-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
-### 3. Build
+Run the gateway:
 
 ```bash
-make build
+sudo ./bin/nfs-gateway --config configs/config.yaml
 ```
 
-### 4. Run
-
-```bash
-sudo ./bin/nfs-gateway -config configs/config.yaml
-```
-
-### 5. Mount
+Mount it from the same Linux host:
 
 ```bash
 sudo mkdir -p /mnt/cos-nfs
-sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
-## 📖 Documentation
+Unmount when finished:
 
-- [Quick Start Guide](docs/QUICKSTART.md) - Detailed setup instructions
-- [Architecture](ARCHITECTURE.md) - System design and components
-- [Gateway Staging Structuring](docs/STAGING_ARCHITECTURE.md) - Deep dive resolving active File constraints scaling S3 mapping limits organically!
-- [Enterprise Dashboard Benchmarks](docs/BENCHMARKING.md) - FIO Stress FIO implementations parsing Hardware validation tracking.
-
-## 🏗️ Architecture
-
-```
-┌─────────────┐
-│ NFS Clients │
-└──────┬──────┘
-       │ NFSv3
-       ▼
-┌─────────────────────────────────────┐
-│     NFS Gateway (Go)                │
-│  ┌──────────┐  ┌─────────────────┐ │
-│  │   NFS    │  │  POSIX Ops      │ │
-│  │  Server  │──│  Handler        │ │
-│  └──────────┘  └─────────────────┘ │
-│  ┌──────────┐  ┌─────────────────┐ │
-│  │  Cache   │  │  Lock Manager   │ │
-│  │  Layer   │  │                 │ │
-│  └──────────┘  └─────────────────┘ │
-└───────────────┬─────────────────────┘
-                │ S3 API
-                ▼
-        ┌───────────────┐
-        │  IBM Cloud    │
-        │     COS       │
-        └───────────────┘
+```bash
+sudo umount /mnt/cos-nfs -f
 ```
 
-## 🔧 Configuration
+## Configuration Areas
 
-Key configuration options:
+The full example lives in `configs/config.example.yaml`. All nested settings can
+also be overridden with environment variables using the `NFS_GATEWAY_` prefix.
+For example, `cos.api_key` becomes `NFS_GATEWAY_COS_API_KEY`.
+
+### Server
 
 ```yaml
 server:
-  nfs_port: 2049          # NFS server port
-  metrics_port: 9090      # Prometheus metrics
-  health_port: 8080       # Health checks
+  nfs_port: 2049
+  metrics_enabled: true
+  metrics_port: 8080
+  health_enabled: true
+  health_port: 8081
+  debug_enabled: true
+  debug_port: 8082
+```
 
+Metrics, health, and debug HTTP servers bind to localhost. Enable only the
+endpoints you need.
+
+### Staging And Async Sync
+
+```yaml
+staging:
+  enabled: true
+  root_dir: "/var/staging/nfs-gateway"
+  sync_interval: "30s"
+  sync_threshold_mb: 10
+  max_dirty_age: "5m"
+  sync_on_close: false
+  max_staging_size_gb: 10
+  max_dirty_files: 1000
+  sync_worker_count: 4
+  sync_queue_size: 100
+  max_sync_retries: 3
+  retry_backoff_initial: "1s"
+  retry_backoff_max: "60s"
+  clean_after_sync: true
+```
+
+Dirty files are kept under `root_dir` until they are synced. On restart, the
+gateway scans staging metadata and resumes syncing dirty data. For production
+use, put staging on reliable local storage with enough free capacity for your
+largest expected dirty working set.
+
+### Backpressure
+
+```yaml
+staging:
+  backpressure_enabled: true
+  backpressure_mode: "block"
+  backpressure_high_watermark_percent: 80
+  backpressure_critical_watermark_percent: 95
+  backpressure_wait_timeout: "30s"
+  backpressure_check_interval: "250ms"
+```
+
+Backpressure protects staging before it is full.
+
+- `block` waits for sync workers to drain dirty data until the timeout.
+- `fail_fast` rejects writes immediately at or above the critical watermark.
+- Above the critical watermark, writes receive deterministic errors instead of
+  being allowed to run until the filesystem is full.
+- Sync workers continue uploading and cleaning dirty files while pressure is
+  active.
+
+Every backpressure decision is logged with the path, requested bytes, available
+bytes, pressure level, and decision.
+
+### Read Cache And Read-Ahead
+
+```yaml
 cache:
   metadata:
     enabled: true
-    max_size: 10000       # Max cached entries
-    ttl: 300s             # Cache TTL
+    size_mb: 256
+    ttl_seconds: 60
+    max_entries: 10000
   data:
     enabled: true
-    max_size_mb: 1024     # Max cache size
-    directory: "/tmp/nfs-cache"
+    size_gb: 10
+    path: "/var/cache/nfs-gateway"
+    chunk_size_kb: 1024
 
 performance:
-  multipart_threshold_mb: 100
-  multipart_chunk_size_mb: 10
-  max_concurrent_uploads: 4
+  read_ahead_kb: 8192
+  max_concurrent_reads: 50
 ```
 
-## 🐳 Docker Deployment
+Reads can be served from local chunk cache when available. Cold reads fetch
+object ranges from COS, warm reads can hit local cache, and read-ahead can fetch
+nearby chunks in parallel for sequential access patterns.
+
+### Multipart Upload
+
+```yaml
+performance:
+  multipart_threshold_mb: 100
+  multipart_chunk_mb: 10
+  max_concurrent_writes: 25
+```
+
+Files larger than the threshold use multipart upload during background sync.
+Multipart upload lifecycle is protected by per-object synchronization so
+workers do not race the same object.
+
+## Observability
+
+Prometheus metrics are available when `server.metrics_enabled` is true:
 
 ```bash
-# Build image
-docker build -t cos-nfs-gateway -f deployments/docker/Dockerfile .
-
-# Run container
-docker run -d \
-  --name nfs-gateway \
-  --cap-add SYS_ADMIN \
-  --device /dev/fuse \
-  -p 2049:2049 \
-  -p 9090:9090 \
-  -p 8080:8080 \
-  -v $(pwd)/configs:/app/configs \
-  cos-nfs-gateway
+curl http://127.0.0.1:8080/metrics
 ```
 
-Or use Docker Compose:
+Important metrics include:
+
+- `staging_used_bytes`
+- `staging_available_bytes`
+- `staging_pressure_level`
+- `writes_blocked_total`
+- `writes_rejected_total`
+- `backpressure_wait_seconds`
+- `sync_queue_bytes`
+- `staging_sync_queue_depth`
+- `staging_sync_queue_bytes`
+- `staging_cos_visibility_latency_seconds`
+- `staging_upload_duration_seconds`
+- `staging_upload_throughput_mib_per_second`
+- `cache_hits_total`
+- `cache_misses_total`
+- `nfs_requests_total`
+- `cos_api_calls_total`
+
+Health endpoints are available when `server.health_enabled` is true:
+
+```bash
+curl http://127.0.0.1:8081/health/live
+curl http://127.0.0.1:8081/health/ready
+curl http://127.0.0.1:8081/health
+```
+
+Debug endpoints are available when `server.debug_enabled` is true:
+
+```bash
+curl http://127.0.0.1:8082/debug/staging/sync
+curl http://127.0.0.1:8082/debug/perf
+```
+
+Use `/debug/staging/sync` to check dirty files, sync queue depth, queue bytes,
+staging pressure, last sync timing, and upload throughput.
+
+## Benchmarking
+
+The benchmark suite is in `scripts/benchmark_suite.py` and
+`scripts/run_benchmark_suite.sh`. It writes timestamped results under
+`benchmark-results/`.
+
+Run a standard profile against a running and mounted gateway:
+
+```bash
+PROFILE=standard ./scripts/run_benchmark_suite.sh
+```
+
+Run selected categories:
+
+```bash
+./scripts/run_benchmark_suite.sh --categories frontend-write sync read
+```
+
+Backpressure and crash-safety tests are opt-in because they intentionally stress
+staging capacity or kill the gateway:
+
+```bash
+./scripts/run_benchmark_suite.sh \
+  --categories backpressure \
+  --allow-backpressure
+```
+
+```bash
+./scripts/run_benchmark_suite.sh \
+  --categories crash-safety \
+  --allow-crash \
+  --gateway-command 'cd ~/ibm-cos-nfs-gateway && sudo nohup ./bin/nfs-gateway --config configs/config.yaml >/tmp/nfs-gateway-benchmark.log 2>&1 &' \
+  --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs'
+```
+
+Each benchmark run produces:
+
+- `SUMMARY.md`
+- `results.json`
+- `results.csv`
+- `baseline.json`
+- `environment.json`
+- `monitor_samples.csv`
+- raw fio output when fio-backed tests are used
+
+See `docs/BENCHMARK_SUITE.md` for the benchmark categories and output format.
+
+## Docker And Kubernetes
+
+Docker and Kubernetes manifests are provided under `deployments/`.
+
+Build the image:
+
+```bash
+docker build -t cos-nfs-gateway -f deployments/docker/Dockerfile .
+```
+
+Run with Docker Compose:
 
 ```bash
 cd deployments/docker
-docker-compose up -d
+COS_ENDPOINT=... COS_BUCKET=... IBM_CLOUD_API_KEY=... docker compose up -d
 ```
 
-## ☸️ Kubernetes Deployment
+The optional monitoring profile starts Prometheus and Grafana. Grafana requires
+`GRAFANA_PASSWORD` to be set before enabling that profile.
+
+Kubernetes manifests are examples and should be reviewed for your cluster,
+secret management, storage, network policy, and operational requirements before
+use.
+
+## Operational Notes
+
+- Keep staging and cache paths outside ephemeral directories for real workloads.
+- Size staging for the largest expected unsynced dirty working set.
+- Monitor `sync_queue_bytes`, `staging_used_bytes`, and upload latency.
+- Treat a growing sync queue as a durability delay, not just a performance
+  issue.
+- Use private COS endpoints or private networking where possible.
+- Keep COS credentials out of source control.
+- Restrict access to the NFS port at the host or network layer.
+- Prefer benchmark validation on the same VM shape, disk type, COS region, and
+  mount options used in deployment.
+
+## Troubleshooting
+
+Gateway fails to start:
 
 ```bash
-# Create namespace
-kubectl create namespace nfs-gateway
-
-# Apply manifests
-kubectl apply -f deployments/kubernetes/
-
-# Check status
-kubectl get pods -n nfs-gateway
-kubectl logs -f deployment/nfs-gateway -n nfs-gateway
-```
-
-## 📊 Monitoring
-
-### Health Checks
-
-```bash
-# Liveness probe
-curl http://localhost:8080/health
-
-# Readiness probe
-curl http://localhost:8080/ready
-```
-
-### Metrics
-
-Prometheus metrics available at `http://localhost:9090/metrics`:
-
-- `nfs_requests_total` - Total NFS requests
-- `nfs_request_duration_seconds` - Request latency
-- `cos_api_calls_total` - COS API calls
-- `cache_hits_total` - Cache hit count
-- `cache_misses_total` - Cache miss count
-- `bytes_read_total` - Total bytes read
-- `bytes_written_total` - Total bytes written
-
-## 🧪 Testing
-
-### Unit Tests
-
-```bash
-# Run unit tests
-make test
-
-# Run with coverage
-make test-coverage
-
-# Run specific test
-go test -v ./internal/posix -run TestPathTranslation
-```
-
-### Performance/Stress Testing
-
-```bash
-# Quick performance check (5 minutes)
-./scripts/quick_test.sh
-
-# Comprehensive stress test suite (15-20 minutes)
-./scripts/run_stress_tests.sh
-
-# Manual fio tests
-fio --name=test --directory=/mnt/cos-nfs --rw=write --bs=1M --size=100M
-```
-
-See [Stress Testing Guide](docs/STRESS_TESTING_GUIDE.md) for detailed testing procedures and performance targets.
-
-## 🔒 Security Considerations
-
-- Store API keys securely (use Kubernetes secrets in production)
-- Use private endpoints when possible
-- Enable SSL/TLS for COS connections
-- Implement network policies in Kubernetes
-- Regular security updates and patches
-
-## 🚦 Performance Tuning
-
-For optimal performance:
-
-1. **Increase cache sizes** for frequently accessed data
-2. **Adjust multipart settings** based on file sizes
-3. **Use private endpoints** to reduce latency
-4. **Enable chunk cache** for read-heavy workloads
-5. **Tune TTL values** based on data freshness requirements
-6. **Optimize NFS mount options**: Use `rsize=1048576,wsize=1048576` for better throughput
-7. **Run stress tests** to validate performance meets your requirements
-
-### Performance Targets
-
-| Metric | Target | Acceptable |
-|--------|--------|------------|
-| Sequential Read | >100 MB/s | >50 MB/s |
-| Sequential Write | >50 MB/s | >20 MB/s |
-| Random Read IOPS | >200 | >100 |
-| Random Write IOPS | >100 | >50 |
-
-Run `./scripts/quick_test.sh` to validate your deployment meets these targets.
-
-## 🐛 Troubleshooting
-
-### Gateway won't start
-```bash
-# Check logs
-journalctl -u nfs-gateway -n 50
-
-# Verify port availability
 sudo ss -tlnp | grep 2049
-
-# Test COS connectivity
-curl -I https://s3.us-south.cloud-object-storage.appdomain.cloud
+sudo ./bin/nfs-gateway --config configs/config.yaml
 ```
 
-### Mount fails
+Mount fails:
+
 ```bash
-# Check NFS server status
-systemctl status nfs-gateway
-
-# Try verbose mount
-sudo mount -t nfs -o vers=3,tcp,v localhost:/ /mnt/cos-nfs
-
-# Check firewall
-sudo firewall-cmd --list-ports
+sudo umount /mnt/cos-nfs -f
+sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
-### Files not appearing in COS
+Writes succeed but objects are not visible in COS yet:
+
 ```bash
-# Check gateway logs
-journalctl -u nfs-gateway | grep -i error
-
-# Verify COS credentials
-# Check metrics for failed operations
-curl http://localhost:9090/metrics | grep cos_api_calls_total
+curl http://127.0.0.1:8082/debug/staging/sync
+curl http://127.0.0.1:8080/metrics | grep -E 'sync_queue|staging_|writes_'
 ```
 
-## 🤝 Contributing
+Remember that accepted writes are staged locally first. Check whether dirty
+files or queue bytes are still present before concluding that COS has the final
+object.
 
-Contributions are welcome! Please:
+Backpressure rejects or blocks writes:
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests
-5. Submit a pull request
+```bash
+df -h /var/staging/nfs-gateway
+curl http://127.0.0.1:8082/debug/staging/sync
+curl http://127.0.0.1:8080/metrics | grep -E 'staging_pressure|writes_blocked|writes_rejected|backpressure'
+```
 
-## 📝 License
+## Development
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+```bash
+make build
+make test
+make benchmark-suite
+```
 
-**DISCLAIMER**: This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND, express or implied. In no event shall the authors or copyright holders be liable for any claim, damages or other liability arising from the use of this software.
+Useful local documentation:
 
-## 👥 Authors
+- `docs/BENCHMARK_SUITE.md`
+- `docs/BENCHMARKING.md`
+- `ARCHITECTURE.md`
+- `docs/STAGING_ARCHITECTURE.md`
 
-- **Olavo Borges** - Personal hobby project - [@oborges](https://github.com/oborges)
+## License
 
-## 🙏 Acknowledgments
+This project is licensed under the MIT License. See `LICENSE` for details.
 
-- [go-nfs](https://github.com/willscott/go-nfs) - NFS server implementation
-- [go-billy](https://github.com/go-git/go-billy) - Filesystem abstraction
-- IBM Cloud Object Storage (this project is NOT affiliated with IBM)
+## Support
 
-## 📞 Support
-
-**NO OFFICIAL SUPPORT PROVIDED** - This is a hobby project.
-
-For community help:
-- Open an issue on GitHub (best effort, no guarantees)
-- Check existing documentation
-- Review troubleshooting guide
-
-**Note**: The author provides no warranty, support, or liability for this software.
-
-## 🗺️ Roadmap
-
-- [ ] NFSv4 support
-- [ ] Enhanced caching strategies
-- [ ] Multi-bucket support
-- [ ] Advanced monitoring dashboard
-- [ ] Performance benchmarks
-- [ ] Integration tests
-
----
-
-**Made with ❤️ for IBM Cloud**
+There is no official support channel. Issues and pull requests are handled on a
+best-effort basis.

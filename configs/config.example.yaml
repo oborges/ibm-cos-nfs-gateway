@@ -52,17 +52,43 @@ cache:
     chunk_size_kb: 1024   # Size of cache chunks
 
 performance:
-  read_ahead_kb: 1024           # Read-ahead buffer size
+  read_ahead_kb: 8192           # Read-ahead window for cached parallel range fetches
   write_buffer_kb: 4096         # Write buffer size
   multipart_threshold_mb: 100   # Files larger than this use multipart upload
   multipart_chunk_mb: 10        # Size of each multipart chunk
   worker_pool_size: 100         # Number of worker goroutines
   max_concurrent_reads: 50      # Maximum concurrent read operations
   max_concurrent_writes: 25     # Maximum concurrent write operations
+  max_full_object_read_mb: 512   # Max size for whole-object reads into memory
+  max_buffered_write_mb: 512     # Max size for legacy append/random-write merges
+  max_directory_entries: 100000  # Max objects returned for a single directory listing
 
 logging:
   level: "info"     # debug, info, warn, error
   format: "json"    # json or text
   output: "stdout"  # stdout, stderr, or file path
+
+staging:
+  enabled: true
+  root_dir: "/var/staging/nfs-gateway"
+  sync_interval: "30s"
+  sync_threshold_mb: 10
+  max_dirty_age: "5m"
+  sync_on_close: false
+  max_staging_size_gb: 10
+  max_dirty_files: 1000
+  sync_worker_count: 4
+  sync_queue_size: 100
+  max_sync_retries: 3
+  retry_backoff_initial: "1s"
+  retry_backoff_max: "60s"
+  clean_after_sync: true
+  stale_file_age: "24h"
+  backpressure_enabled: true
+  backpressure_mode: "block"                  # "block" or "fail_fast"
+  backpressure_high_watermark_percent: 80     # start slowing/blocking before staging fills
+  backpressure_critical_watermark_percent: 95 # reject writes immediately at/above this level
+  backpressure_wait_timeout: "30s"
+  backpressure_check_interval: "250ms"
 
 # Made with Bob

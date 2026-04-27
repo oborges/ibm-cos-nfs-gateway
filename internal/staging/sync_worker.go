@@ -2,20 +2,27 @@ package staging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
-	"github.com/oborges/cos-nfs-gateway/pkg/types"
+	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
+	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	"go.uber.org/zap"
 )
+
+var errMultipartSnapshotChanged = errors.New("multipart snapshot changed during upload")
+
+const syncStabilityDelay = 5 * time.Second
 
 // COSClient interface for uploading objects
 type COSClient interface {
@@ -37,6 +44,28 @@ type SyncWorker struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	syncTicker *time.Ticker
+
+	uploadMu           sync.Mutex
+	uploadByPath       map[string]uploadAccumulator
+	objectLocksMu      sync.Mutex
+	objectLocks        map[string]*sync.Mutex
+	totalSyncedFiles   int64
+	totalUploadedBytes int64
+	lastSync           syncObservation
+}
+
+type uploadAccumulator struct {
+	bytes    int64
+	duration time.Duration
+}
+
+type syncObservation struct {
+	Path              string
+	SizeBytes         int64
+	UploadDuration    time.Duration
+	VisibilityLatency time.Duration
+	ThroughputMiBps   float64
+	CompletedAt       time.Time
 }
 
 // NewSyncWorker creates a new sync worker
@@ -44,11 +73,13 @@ func NewSyncWorker(manager *StagingManager, cosClient COSClient, cfg *config.Sta
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &SyncWorker{
-		manager:   manager,
-		cosClient: cosClient,
-		config:    cfg,
-		ctx:       ctx,
-		cancel:    cancel,
+		manager:      manager,
+		cosClient:    cosClient,
+		config:       cfg,
+		ctx:          ctx,
+		cancel:       cancel,
+		uploadByPath: make(map[string]uploadAccumulator),
+		objectLocks:  make(map[string]*sync.Mutex),
 	}
 }
 
@@ -97,8 +128,9 @@ func (sw *SyncWorker) workerLoop(workerID int) {
 			return
 
 		case <-sw.syncTicker.C:
-			sw.processMultipartFiles(workerID)
+			sw.manager.updateSyncQueueMetrics()
 			sw.processDirtyFiles(workerID)
+			sw.manager.updateSyncQueueMetrics()
 		}
 	}
 }
@@ -132,7 +164,7 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 		}
 
 		// Sync the file
-		if err := sw.syncFile(metadata.Path); err != nil {
+		if err := sw.syncFileWithWorker(metadata.Path, workerID); err != nil {
 			logging.Error("Failed to sync file",
 				zap.Int("worker_id", workerID),
 				zap.String("path", metadata.Path),
@@ -153,6 +185,31 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 // shouldSync determines if a file should be synced based on triggers
 func (sw *SyncWorker) shouldSync(metadata *DirtyFileMetadata) bool {
 	now := time.Now()
+	if !metadata.LastModified.IsZero() {
+		idleSinceModified := now.Sub(metadata.LastModified)
+		if idleSinceModified < syncStabilityDelay {
+			logging.Debug("Deferring sync until dirty file is stable",
+				zap.String("path", metadata.Path),
+				zap.Duration("idle_since_modified", idleSinceModified),
+				zap.Duration("required_idle", syncStabilityDelay))
+			return false
+		}
+	}
+
+	session, sessionExists := sw.manager.GetSession(metadata.Path)
+	if sessionExists {
+		_, _, _, _, _, refCount, lastWrite, _ := session.Snapshot()
+		if refCount > 0 {
+			idleTime := now.Sub(lastWrite)
+			if idleTime < syncStabilityDelay {
+				logging.Debug("Deferring sync while file is actively being written",
+					zap.String("path", metadata.Path),
+					zap.Int32("ref_count", refCount),
+					zap.Duration("idle_time", idleTime))
+				return false
+			}
+		}
+	}
 
 	// Quick-Flush 80% Buffer Disk Quotas
 	totalSize := sw.manager.GetTotalStagingSize()
@@ -184,11 +241,11 @@ func (sw *SyncWorker) shouldSync(metadata *DirtyFileMetadata) bool {
 	}
 
 	// Check if session is idle (no active handles)
-	session, exists := sw.manager.GetSession(metadata.Path)
-	if exists && session.GetRefCount() == 0 {
+	if sessionExists && session.GetRefCount() == 0 {
 		// Session is idle, check idle time
-		idleTime := now.Sub(session.LastWrite)
-		if idleTime >= 5*time.Second { // Configurable idle threshold
+		_, _, _, _, _, _, lastWrite, _ := session.Snapshot()
+		idleTime := now.Sub(lastWrite)
+		if idleTime >= syncStabilityDelay {
 			logging.Debug("File session is idle",
 				zap.String("path", metadata.Path),
 				zap.Duration("idle_time", idleTime))
@@ -201,70 +258,99 @@ func (sw *SyncWorker) shouldSync(metadata *DirtyFileMetadata) bool {
 
 // syncFile synchronizes a single file to COS
 func (sw *SyncWorker) syncFile(path string) error {
+	return sw.syncFileWithWorker(path, -1)
+}
+
+func (sw *SyncWorker) syncFileWithWorker(path string, workerID int) error {
+	unlockObject := sw.lockObject(path)
+	defer unlockObject()
+
+	return sw.syncFileLocked(path, workerID)
+}
+
+func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	// Get the session
 	session, exists := sw.manager.GetSession(path)
 	if !exists {
-		return fmt.Errorf("session not found for path: %s", path)
+		recovered, err := sw.manager.RecoverSessionFromStaging(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				sw.manager.ForgetDirty(path, "missing_session_and_staging_file")
+				logging.Info("Dropped orphaned dirty staging entry",
+					zap.Int("worker_id", workerID),
+					zap.String("path", path),
+					zap.String("reason", "missing_session_and_staging_file"))
+				return nil
+			}
+			return fmt.Errorf("session not found for path: %s: %w", path, err)
+		}
+		session = recovered
+	}
+	dirtySince := time.Now()
+	var snapshotLastModified time.Time
+	if metadata := sw.manager.dirtyIndex.GetMetadata(path); metadata != nil && !metadata.DirtySince.IsZero() {
+		dirtySince = metadata.DirtySince
+		snapshotLastModified = metadata.LastModified
 	}
 
 	// Sync the session (flushes to staging file)
 	if err := session.Sync(); err != nil {
 		return fmt.Errorf("failed to sync session: %w", err)
 	}
+	stagingPath, size, mode, uid, gid, _, lastWrite, multipartPartSize := session.Snapshot()
+	if multipartPartSize <= 0 {
+		multipartPartSize = 20 * 1024 * 1024
+	}
 
 	// Read staging file using file stream to prevent OOM on large files
-	file, err := os.Open(session.StagingPath)
+	file, err := os.Open(stagingPath)
 	if err != nil {
 		return fmt.Errorf("failed to open staging file: %w", err)
 	}
 	defer file.Close()
 
-	if session.Multipart != nil && session.Multipart.Active && session.Multipart.IsSequential() {
-		// Upload the final remaining bytes as the last part
-		start, _ := session.Multipart.GetNextUploadRange()
-		finalSize := session.Size - start
-		
-		if finalSize > 0 {
-			var uploadReader io.ReadSeeker
-			mmapReader, err := NewMMapReader(file, start, finalSize)
-			if err == nil {
-				defer mmapReader.Close()
-				uploadReader = mmapReader
-			} else {
-				uploadReader = io.NewSectionReader(file, start, finalSize)
-			}
-
-			partNumber := int64(len(session.Multipart.CompletedParts)) + 1
-			etag, err := sw.cosClient.UploadPart(sw.ctx, path, session.Multipart.UploadID, partNumber, uploadReader)
-			if err != nil {
-				return fmt.Errorf("failed to upload final part: %w", err)
-			}
-			session.Multipart.AddCompletedPart(partNumber, etag)
+	if size >= multipartPartSize {
+		posixAttrs := &types.POSIXAttributes{
+			Mode: mode,
+			UID:  int(uid),
+			GID:  int(gid),
 		}
-		
-		// Ensure strictly ascending chunk part sequences for IBM COS API limitations
-		sort.Slice(session.Multipart.CompletedParts, func(i, j int) bool {
-			return *session.Multipart.CompletedParts[i].PartNumber < *session.Multipart.CompletedParts[j].PartNumber
-		})
-
-		// Complete the multipart upload
-		err := sw.cosClient.CompleteMultipartUpload(sw.ctx, path, session.Multipart.UploadID, session.Multipart.CompletedParts)
-		if err != nil {
-			return fmt.Errorf("failed to complete multipart upload: %w", err)
+		cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
+		if session.Multipart != nil {
+			session.Multipart.Reset()
 		}
-		logging.Info("Successfully completed S3 multipart payload", zap.String("path", path))
+		isSnapshotCurrent := func() bool {
+			_, currentSize, _, _, _, _, currentLastWrite, _ := session.Snapshot()
+			if currentSize != size || !currentLastWrite.Equal(lastWrite) {
+				return false
+			}
+			if currentMetadata := sw.manager.dirtyIndex.GetMetadata(path); currentMetadata != nil && currentMetadata.LastModified.After(snapshotLastModified) {
+				return false
+			}
+			return true
+		}
+		if err := sw.uploadMultipartWithRetry(path, file, size, multipartPartSize, cosMetadata, workerID, isSnapshotCurrent); err != nil {
+			if session.Multipart != nil {
+				session.Multipart.Reset()
+			}
+			return fmt.Errorf("failed to multipart upload to COS: %w", err)
+		}
+		if session.Multipart != nil {
+			session.Multipart.Reset()
+		}
 	} else {
+		uploadStart := time.Now()
 		var monolithicReader io.ReadSeeker = file
-		mmapReader, err := NewMMapReader(file, 0, session.Size)
-		if err == nil && session.Size > 0 {
+		mmapReader, err := NewMMapReader(file, 0, size)
+		if err == nil && size > 0 {
 			defer mmapReader.Close()
 			monolithicReader = mmapReader
 		}
 
 		posixAttrs := &types.POSIXAttributes{
-			Mode: session.Mode,
-			UID:  int(session.UID),
-			GID:  int(session.GID),
+			Mode: mode,
+			UID:  int(uid),
+			GID:  int(gid),
 		}
 		cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
 
@@ -272,16 +358,238 @@ func (sw *SyncWorker) syncFile(path string) error {
 		if err := sw.uploadWithRetryStream(path, monolithicReader, cosMetadata); err != nil {
 			return fmt.Errorf("failed to upload to COS: %w", err)
 		}
+		sw.addUploadSample(path, size, time.Since(uploadStart))
 	}
+
+	if currentMetadata := sw.manager.dirtyIndex.GetMetadata(path); currentMetadata != nil && currentMetadata.LastModified.After(snapshotLastModified) {
+		return fmt.Errorf("snapshot changed during upload; leaving file dirty for retry")
+	}
+
+	uploadedBytes, uploadDuration := sw.consumeUploadSamples(path)
+	if uploadedBytes == 0 && size > 0 {
+		uploadedBytes = size
+	}
+	sw.recordSuccessfulSync(path, uploadedBytes, dirtySince, uploadDuration)
 
 	// Mark as clean
 	sw.manager.MarkClean(path)
 
-	// NOTE: We intentionally DO NOT CleanupSession(path, true) here!
-	// Leaving the session inside memory empowers Gateway `Read-After-Write` paths resolving directly targeting the local Staging layer!
-	// Eventual cache evictions are natively delegated against `MaxStagingSizeGB` LRU triggers or Unlink deletions interceptors dynamically!
+	if sw.config.CleanAfterSync && session.GetRefCount() == 0 {
+		if err := sw.manager.CleanupSession(path, true); err != nil {
+			return fmt.Errorf("failed to cleanup synced staging session: %w", err)
+		}
+		logging.Info("Cleaned synced staging session",
+			zap.String("path", path))
+	}
 
 	return nil
+}
+
+func (sw *SyncWorker) lockObject(path string) func() {
+	sw.objectLocksMu.Lock()
+	lock := sw.objectLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		sw.objectLocks[path] = lock
+	}
+	sw.objectLocksMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (sw *SyncWorker) uploadMultipartWithRetry(path string, file *os.File, size, partSize int64, metadata map[string]string, workerID int, isSnapshotCurrent func() bool) error {
+	var lastErr error
+
+	retryBackoff, _ := sw.config.GetRetryBackoffInitial()
+	maxRetryBackoff, _ := sw.config.GetRetryBackoffMax()
+
+	for attempt := 0; attempt < sw.config.MaxSyncRetries; attempt++ {
+		if attempt > 0 {
+			backoff := retryBackoff * time.Duration(1<<uint(attempt-1))
+			if backoff > maxRetryBackoff {
+				backoff = maxRetryBackoff
+			}
+			sw.logMultipartEvent("retry", path, "", "retrying", workerID, 0, 0, "", fmt.Sprintf("attempt=%d backoff=%s previous_error=%v", attempt+1, backoff, lastErr), nil)
+			select {
+			case <-time.After(backoff):
+			case <-sw.ctx.Done():
+				return sw.ctx.Err()
+			}
+		}
+
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind staging file: %w", err)
+		}
+		if err := sw.uploadMultipartOnce(path, file, size, partSize, metadata, workerID, isSnapshotCurrent); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if errors.Is(err, errMultipartSnapshotChanged) {
+				return err
+			}
+			if isNoSuchUpload(err) {
+				sw.logMultipartEvent("error", path, "", "invalid_upload_id", workerID, 0, 0, "", "NoSuchUpload; restarting multipart from clean upload session", err)
+			}
+		}
+	}
+
+	return fmt.Errorf("multipart upload failed after %d attempts: %w", sw.config.MaxSyncRetries, lastErr)
+}
+
+func (sw *SyncWorker) uploadMultipartOnce(path string, file *os.File, size, partSize int64, metadata map[string]string, workerID int, isSnapshotCurrent func() bool) error {
+	uploadID, err := sw.cosClient.CreateMultipartUpload(sw.ctx, path, metadata)
+	if err != nil {
+		sw.logMultipartEvent("error", path, "", "create_failed", workerID, 0, 0, "", "create_multipart_failed", err)
+		return err
+	}
+	sw.logMultipartEvent("create", path, uploadID, "active", workerID, 0, 0, "", "new_multipart_upload", nil)
+
+	completed := false
+	abortReason := "error"
+	defer func() {
+		if completed {
+			return
+		}
+		if abortErr := sw.cosClient.AbortMultipartUpload(sw.ctx, path, uploadID); abortErr != nil {
+			sw.logMultipartEvent("error", path, uploadID, "abort_failed", workerID, 0, 0, "", abortReason, abortErr)
+			return
+		}
+		sw.logMultipartEvent("abort", path, uploadID, "aborted", workerID, 0, 0, "", abortReason, nil)
+	}()
+
+	completedParts := make([]*s3.CompletedPart, 0, (size+partSize-1)/partSize)
+	for offset, partNumber := int64(0), int64(1); offset < size; offset, partNumber = offset+partSize, partNumber+1 {
+		currentPartSize := partSize
+		if remaining := size - offset; remaining < currentPartSize {
+			currentPartSize = remaining
+		}
+
+		uploadReader, closeReader := sw.multipartPartReader(file, offset, currentPartSize)
+		partStart := time.Now()
+		etag, err := sw.cosClient.UploadPart(sw.ctx, path, uploadID, partNumber, uploadReader)
+		closeReader()
+		if err != nil {
+			abortReason = fmt.Sprintf("upload_part_failed part=%d", partNumber)
+			sw.logMultipartEvent("error", path, uploadID, "active", workerID, partNumber, currentPartSize, "", abortReason, err)
+			return err
+		}
+
+		sw.addUploadSample(path, currentPartSize, time.Since(partStart))
+		completedParts = append(completedParts, &s3.CompletedPart{
+			ETag:       &etag,
+			PartNumber: &partNumber,
+		})
+		sw.logMultipartEvent("upload_part", path, uploadID, "active", workerID, partNumber, currentPartSize, etag, "part_uploaded", nil)
+	}
+
+	sort.Slice(completedParts, func(i, j int) bool {
+		return *completedParts[i].PartNumber < *completedParts[j].PartNumber
+	})
+
+	if !isSnapshotCurrent() {
+		abortReason = "snapshot_changed_before_complete"
+		sw.logMultipartEvent("abort", path, uploadID, "snapshot_changed", workerID, 0, size, "", abortReason, nil)
+		return errMultipartSnapshotChanged
+	}
+
+	if err := sw.cosClient.CompleteMultipartUpload(sw.ctx, path, uploadID, completedParts); err != nil {
+		abortReason = "complete_failed"
+		sw.logMultipartEvent("error", path, uploadID, "complete_failed", workerID, 0, 0, "", abortReason, err)
+		return err
+	}
+	completed = true
+	sw.logMultipartEvent("complete", path, uploadID, "completed", workerID, 0, size, "", fmt.Sprintf("parts=%d", len(completedParts)), nil)
+	return nil
+}
+
+func (sw *SyncWorker) multipartPartReader(file *os.File, offset, size int64) (io.ReadSeeker, func()) {
+	mmapReader, err := NewMMapReader(file, offset, size)
+	if err == nil {
+		return mmapReader, func() { _ = mmapReader.Close() }
+	}
+	return io.NewSectionReader(file, offset, size), func() {}
+}
+
+func (sw *SyncWorker) logMultipartEvent(event, path, uploadID, state string, workerID int, partNumber, partSize int64, etag, reason string, err error) {
+	fields := []zap.Field{
+		zap.String("path", path),
+		zap.String("upload_id", uploadID),
+		zap.String("multipart_state", state),
+		zap.Int("worker_id", workerID),
+		zap.Int64("part_number", partNumber),
+		zap.Int64("part_size", partSize),
+		zap.String("etag", etag),
+		zap.String("event", event),
+		zap.String("reason", reason),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+		logging.Error("Multipart upload lifecycle event", fields...)
+		return
+	}
+	logging.Info("Multipart upload lifecycle event", fields...)
+}
+
+func isNoSuchUpload(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "NoSuchUpload") || strings.Contains(message, "Invalid uploadId")
+}
+
+func (sw *SyncWorker) addUploadSample(path string, bytes int64, duration time.Duration) {
+	if bytes <= 0 {
+		return
+	}
+
+	sw.uploadMu.Lock()
+	defer sw.uploadMu.Unlock()
+
+	acc := sw.uploadByPath[path]
+	acc.bytes += bytes
+	acc.duration += duration
+	sw.uploadByPath[path] = acc
+}
+
+func (sw *SyncWorker) consumeUploadSamples(path string) (int64, time.Duration) {
+	sw.uploadMu.Lock()
+	defer sw.uploadMu.Unlock()
+
+	acc := sw.uploadByPath[path]
+	delete(sw.uploadByPath, path)
+	return acc.bytes, acc.duration
+}
+
+func (sw *SyncWorker) recordSuccessfulSync(path string, uploadedBytes int64, dirtySince time.Time, uploadDuration time.Duration) {
+	visibilityLatency := time.Since(dirtySince)
+	throughputMiBps := float64(0)
+	if uploadDuration > 0 {
+		throughputMiBps = (float64(uploadedBytes) / (1024 * 1024)) / uploadDuration.Seconds()
+	}
+
+	metrics.RecordStagingUpload(uploadedBytes, uploadDuration, visibilityLatency)
+
+	sw.uploadMu.Lock()
+	sw.totalSyncedFiles++
+	sw.totalUploadedBytes += uploadedBytes
+	sw.lastSync = syncObservation{
+		Path:              path,
+		SizeBytes:         uploadedBytes,
+		UploadDuration:    uploadDuration,
+		VisibilityLatency: visibilityLatency,
+		ThroughputMiBps:   throughputMiBps,
+		CompletedAt:       time.Now(),
+	}
+	sw.uploadMu.Unlock()
+
+	logging.Info("Staging file visible in COS",
+		zap.String("path", path),
+		zap.Int64("bytes", uploadedBytes),
+		zap.Duration("upload_duration", uploadDuration),
+		zap.Float64("upload_mib_per_second", throughputMiBps),
+		zap.Duration("cos_visibility_latency", visibilityLatency))
 }
 
 // uploadWithRetry uploads a file to COS with exponential backoff retry
@@ -385,6 +693,9 @@ func (sw *SyncWorker) uploadWithRetryStream(path string, body io.ReadSeeker, met
 
 // TriggerSync manually triggers a sync for a specific file
 func (sw *SyncWorker) TriggerSync(path string) error {
+	unlockObject := sw.lockObject(path)
+	defer unlockObject()
+
 	if !sw.manager.IsDirty(path) {
 		return nil // Nothing to sync
 	}
@@ -392,11 +703,12 @@ func (sw *SyncWorker) TriggerSync(path string) error {
 	logging.Info("Manual sync triggered",
 		zap.String("path", path))
 
-	return sw.syncFile(path)
+	return sw.syncFileLocked(path, -1)
 }
 
 // Stats returns statistics about the sync worker
 func (sw *SyncWorker) Stats() map[string]interface{} {
+	sw.manager.updateSyncQueueMetrics()
 	dirtyFiles := sw.manager.GetDirtyFiles()
 
 	totalSize := int64(0)
@@ -409,88 +721,52 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 		}
 	}
 
+	depth, queueBytes, oldestAge := sw.manager.SyncQueueStats()
+	pressure := sw.manager.CurrentPressure()
+	sw.uploadMu.Lock()
+	lastSync := sw.lastSync
+	totalSyncedFiles := sw.totalSyncedFiles
+	totalUploadedBytes := sw.totalUploadedBytes
+	sw.uploadMu.Unlock()
+
 	stats := map[string]interface{}{
-		"dirty_files":  len(dirtyFiles),
-		"total_size":   totalSize,
-		"worker_count": sw.config.SyncWorkerCount,
+		"dirty_files":             len(dirtyFiles),
+		"total_size":              totalSize,
+		"worker_count":            sw.config.SyncWorkerCount,
+		"sync_queue_depth":        depth,
+		"sync_queue_bytes":        queueBytes,
+		"syncing_files":           sw.manager.dirtyIndex.SyncingCount(),
+		"total_synced_files":      totalSyncedFiles,
+		"total_uploaded_bytes":    totalUploadedBytes,
+		"staging_used_bytes":      pressure.UsedBytes,
+		"staging_available_bytes": pressure.AvailableBytes,
+		"staging_pressure_level":  pressure.Level,
 	}
 
 	if !oldestDirty.IsZero() {
 		stats["oldest_dirty_age"] = time.Since(oldestDirty).String()
 	}
+	if oldestAge > 0 {
+		stats["oldest_dirty_age_seconds"] = oldestAge.Seconds()
+	}
+	if !lastSync.CompletedAt.IsZero() {
+		stats["last_sync"] = map[string]interface{}{
+			"path":                           lastSync.Path,
+			"bytes":                          lastSync.SizeBytes,
+			"upload_duration_seconds":        lastSync.UploadDuration.Seconds(),
+			"cos_visibility_latency_seconds": lastSync.VisibilityLatency.Seconds(),
+			"upload_mib_per_second":          lastSync.ThroughputMiBps,
+			"completed_at":                   lastSync.CompletedAt.Format(time.RFC3339Nano),
+		}
+	}
 
 	return stats
 }
 
-// processMultipartFiles processes progressive multi-part chunk streaming 
+// processMultipartFiles processes progressive multi-part chunk streaming
 func (sw *SyncWorker) processMultipartFiles(workerID int) {
-	for _, metadata := range sw.manager.GetDirtyFiles() {
-		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
-			continue
-		}
-
-		session, exists := sw.manager.GetSession(metadata.Path)
-		if !exists || session.Multipart == nil {
-			sw.manager.dirtyIndex.UnlockFile(metadata.Path)
-			continue
-		}
-
-		// Attempt progressive chunk boundaries
-		for {
-			start, end := session.Multipart.GetNextUploadRange()
-			
-			// Limit uploads sequentially against full boundary
-			if session.Size >= end && session.Multipart.IsSequential() {
-				if session.Multipart.UploadID == "" {
-					posixAttrs := &types.POSIXAttributes{
-						Mode: session.Mode,
-						UID:  int(session.UID),
-						GID:  int(session.GID),
-					}
-					cosMetadata := posix.EncodePOSIXAttributes(posixAttrs)
-
-					uploadID, err := sw.cosClient.CreateMultipartUpload(sw.ctx, metadata.Path, cosMetadata)
-					if err != nil {
-						logging.Error("Failed to initiate multipart", zap.Error(err))
-						break
-					}
-					session.Multipart.UploadID = uploadID
-					session.Multipart.Active = true
-				}
-				
-				session.Sync() 
-				file, err := os.Open(session.StagingPath)
-				if err != nil {
-					break
-				}
-				
-				var uploadReader io.ReadSeeker
-				mmapReader, err := NewMMapReader(file, start, end-start)
-				if err == nil {
-					defer mmapReader.Close()
-					uploadReader = mmapReader
-				} else {
-					uploadReader = io.NewSectionReader(file, start, end-start)
-				}
-
-				partNumber := int64(len(session.Multipart.CompletedParts)) + 1
-				
-				etag, err := sw.cosClient.UploadPart(sw.ctx, metadata.Path, session.Multipart.UploadID, partNumber, uploadReader)
-				file.Close()
-				
-				if err == nil {
-					session.Multipart.AddCompletedPart(partNumber, etag)
-					logging.Info("Uploaded progressive part chunk", zap.Int64("part", partNumber), zap.String("path", metadata.Path))
-				} else {
-					logging.Error("Failed to upload progressive multipart", zap.Error(err))
-					break
-				}
-			} else {
-				break
-			}
-		}
-		sw.manager.dirtyIndex.UnlockFile(metadata.Path)
-	}
+	logging.Debug("Progressive multipart pre-upload disabled; multipart lifecycle is owned by final sync",
+		zap.Int("worker_id", workerID))
 }
 
 // Made with Bob

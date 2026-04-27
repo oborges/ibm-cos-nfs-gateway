@@ -56,13 +56,14 @@ func (dfi *DirtyFileIndex) MarkClean(path string) {
 	defer dfi.mu.Unlock()
 
 	delete(dfi.dirty, path)
+	delete(dfi.syncing, path)
 }
 
 // LockFile securely claims the file for syncing by a background worker natively isolating multiple loops
 func (dfi *DirtyFileIndex) LockFile(path string) bool {
 	dfi.mu.Lock()
 	defer dfi.mu.Unlock()
-	
+
 	if dfi.syncing[path] {
 		return false // Activity bound globally to another worker
 	}
@@ -74,8 +75,16 @@ func (dfi *DirtyFileIndex) LockFile(path string) bool {
 func (dfi *DirtyFileIndex) UnlockFile(path string) {
 	dfi.mu.Lock()
 	defer dfi.mu.Unlock()
-	
+
 	delete(dfi.syncing, path)
+}
+
+// IsSyncing returns true if a file is currently claimed by a sync worker.
+func (dfi *DirtyFileIndex) IsSyncing(path string) bool {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	return dfi.syncing[path]
 }
 
 // IsDirty returns true if the file is dirty
@@ -132,6 +141,14 @@ func (dfi *DirtyFileIndex) Count() int {
 	defer dfi.mu.RUnlock()
 
 	return len(dfi.dirty)
+}
+
+// SyncingCount returns the number of files currently claimed by sync workers.
+func (dfi *DirtyFileIndex) SyncingCount() int {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	return len(dfi.syncing)
 }
 
 // Made with Bob

@@ -6,14 +6,17 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
+	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/cos"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 // OperationsHandler handles POSIX filesystem operations
@@ -22,6 +25,8 @@ type OperationsHandler struct {
 	metadataCache *cache.MetadataCache
 	dataCache     *cache.DataCache
 	translator    *PathTranslator
+	perfConfig    *config.PerformanceConfig
+	readGroup     singleflight.Group
 }
 
 // NewOperationsHandler creates a new operations handler
@@ -29,13 +34,70 @@ func NewOperationsHandler(
 	cosClient *cos.Client,
 	metadataCache *cache.MetadataCache,
 	dataCache *cache.DataCache,
+	perfConfig *config.PerformanceConfig,
 ) *OperationsHandler {
+	if perfConfig == nil {
+		perfConfig = &config.PerformanceConfig{
+			MaxFullObjectReadMB: config.DefaultMaxFullObjectReadMB,
+			MaxDirectoryEntries: config.DefaultMaxDirectoryEntries,
+		}
+	}
+
 	return &OperationsHandler{
 		cosClient:     cosClient,
 		metadataCache: metadataCache,
 		dataCache:     dataCache,
 		translator:    NewPathTranslator(""),
+		perfConfig:    perfConfig,
 	}
+}
+
+func (h *OperationsHandler) maxFullObjectReadBytes() int64 {
+	limitMB := config.DefaultMaxFullObjectReadMB
+	if h.perfConfig != nil && h.perfConfig.MaxFullObjectReadMB > 0 {
+		limitMB = h.perfConfig.MaxFullObjectReadMB
+	}
+	return int64(limitMB) * 1024 * 1024
+}
+
+func (h *OperationsHandler) maxDirectoryEntries() int {
+	if h.perfConfig != nil && h.perfConfig.MaxDirectoryEntries > 0 {
+		return h.perfConfig.MaxDirectoryEntries
+	}
+	return config.DefaultMaxDirectoryEntries
+}
+
+func (h *OperationsHandler) maxConcurrentReadFetches() int {
+	if h.perfConfig != nil && h.perfConfig.MaxConcurrentReads > 0 {
+		return h.perfConfig.MaxConcurrentReads
+	}
+	return 8
+}
+
+func (h *OperationsHandler) readAheadBytes() int64 {
+	if h.perfConfig != nil && h.perfConfig.ReadAheadKB > 0 {
+		return int64(h.perfConfig.ReadAheadKB) * 1024
+	}
+	return int64(config.DefaultReadAheadKB) * 1024
+}
+
+func (h *OperationsHandler) dataCacheEnabled() bool {
+	return h.dataCache != nil && h.dataCache.IsEnabled()
+}
+
+func (h *OperationsHandler) ensureFullObjectReadAllowed(ctx context.Context, path string) error {
+	info, err := h.Stat(ctx, path)
+	if err != nil {
+		return err
+	}
+
+	limitBytes := h.maxFullObjectReadBytes()
+	if info.Size() > limitBytes {
+		return fmt.Errorf("full-object read for %s would allocate %d bytes, exceeding max_full_object_read_mb=%d; use ranged reads or raise the limit",
+			path, info.Size(), limitBytes/(1024*1024))
+	}
+
+	return nil
 }
 
 // Stat retrieves file/directory metadata
@@ -52,12 +114,12 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		if !entry.IsImplicit {
 			metrics.RecordCacheHit("metadata")
 			log.Debug("Metadata cache hit")
-			
+
 			// If we have FileInfo, use it directly
 			if entry.FileInfo != nil {
 				return entry.FileInfo.(*FileInfo), nil
 			}
-			
+
 			// Fallback: construct from attributes
 			mode := os.FileMode(0644)
 			modTime := DefaultAttributes(entry.IsDir).Mtime
@@ -69,7 +131,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			if entry.IsDir {
 				mode = mode | os.ModeDir
 			}
-			
+
 			return &FileInfo{
 				name:    GetBaseName(path),
 				size:    size,
@@ -136,16 +198,16 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	if prefix != "" && !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-	
+
 	metrics.RecordCOSListObjects()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1)
 	if err == nil && len(objects) > 0 {
 		// It's an implicit directory - has children
 		log.Debug("Implicit directory detected", zap.String("prefix", prefix))
-		
+
 		// Use default directory attributes
 		attrs := DefaultAttributes(true)
-		
+
 		info := &FileInfo{
 			name:    GetBaseName(path),
 			size:    0,
@@ -210,7 +272,15 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 
 	// Try cache first - but only for full file reads
 	// The cache is designed for complete files, not partial ranges
-	if h.dataCache.IsEnabled() && offset == 0 && length == 0 {
+	fullObjectRead := length <= 0
+	if fullObjectRead {
+		if err := h.ensureFullObjectReadAllowed(ctx, path); err != nil {
+			log.Error("Full-object read rejected", zap.Error(err))
+			return nil, err
+		}
+	}
+
+	if h.dataCacheEnabled() && offset == 0 && length == 0 {
 		if data, err := h.dataCache.Read(path, offset, length); err == nil {
 			metrics.RecordCacheHit("data")
 			metrics.RecordBytesRead(int64(len(data)))
@@ -222,13 +292,16 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 
 	// Read from COS
 	objectKey := h.translator.ToObjectKey(path)
-	
+
 	var data []byte
 	var err error
-	
+
 	if length > 0 {
-		// Range read - don't cache partial reads
-		data, err = h.cosClient.GetObjectRange(ctx, objectKey, offset, length)
+		if h.dataCacheEnabled() {
+			data, err = h.readRangeWithCache(ctx, path, objectKey, offset, length)
+		} else {
+			data, err = h.cosClient.GetObjectRange(ctx, objectKey, offset, length)
+		}
 	} else {
 		// Full read - can be cached
 		data, err = h.cosClient.GetObject(ctx, objectKey)
@@ -240,7 +313,7 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 	}
 
 	// Cache the data - but only for full file reads
-	if h.dataCache.IsEnabled() && len(data) > 0 && offset == 0 && length == 0 {
+	if h.dataCacheEnabled() && len(data) > 0 && offset == 0 && length == 0 {
 		if err := h.dataCache.Write(path, data); err != nil {
 			log.Warn("Failed to cache data", zap.Error(err))
 		}
@@ -248,6 +321,171 @@ func (h *OperationsHandler) ReadFile(ctx context.Context, path string, offset, l
 
 	metrics.RecordBytesRead(int64(len(data)))
 	log.Debug("File read successful", zap.Int("bytes", len(data)))
+	return data, nil
+}
+
+func (h *OperationsHandler) readRangeWithCache(ctx context.Context, path, objectKey string, offset, length int64) ([]byte, error) {
+	if offset < 0 || length < 0 {
+		return nil, fmt.Errorf("invalid read range offset=%d length=%d", offset, length)
+	}
+
+	requestEnd := offset + length
+
+	fetchLength := h.readAheadBytes()
+	if fetchLength < length {
+		fetchLength = length
+	}
+	fetchEnd := offset + fetchLength
+
+	chunkSize := h.dataCache.ChunkSize()
+	if chunkSize <= 0 {
+		chunkSize = 1024 * 1024
+	}
+
+	firstChunk := (offset / chunkSize) * chunkSize
+	lastChunk := ((fetchEnd - 1) / chunkSize) * chunkSize
+	lastRequiredChunk := ((requestEnd - 1) / chunkSize) * chunkSize
+	chunks := make(map[int64][]byte)
+	var missing []int64
+
+	for chunkStart := firstChunk; chunkStart <= lastChunk; chunkStart += chunkSize {
+		if cached, err := h.dataCache.ReadChunk(path, chunkStart, chunkSize); err == nil {
+			metrics.RecordCacheHit("data")
+			chunks[chunkStart] = cached
+			continue
+		}
+		metrics.RecordCacheMiss("data")
+		missing = append(missing, chunkStart)
+	}
+
+	if len(missing) > 0 {
+		fetched, err := h.fetchMissingChunks(ctx, path, objectKey, missing, chunkSize, lastRequiredChunk)
+		if err != nil {
+			return nil, err
+		}
+		for chunkStart, data := range fetched {
+			chunks[chunkStart] = data
+		}
+	}
+
+	out := make([]byte, 0, requestEnd-offset)
+	for chunkStart := firstChunk; chunkStart <= lastChunk && int64(len(out)) < requestEnd-offset; chunkStart += chunkSize {
+		chunk := chunks[chunkStart]
+		if len(chunk) == 0 {
+			continue
+		}
+
+		startInChunk := int64(0)
+		if offset > chunkStart {
+			startInChunk = offset - chunkStart
+		}
+		endInChunk := int64(len(chunk))
+		if requestEnd < chunkStart+endInChunk {
+			endInChunk = requestEnd - chunkStart
+		}
+		if startInChunk < 0 {
+			startInChunk = 0
+		}
+		if endInChunk > int64(len(chunk)) {
+			endInChunk = int64(len(chunk))
+		}
+		if endInChunk > startInChunk {
+			out = append(out, chunk[startInChunk:endInChunk]...)
+		}
+	}
+
+	return out, nil
+}
+
+func (h *OperationsHandler) fetchMissingChunks(ctx context.Context, path, objectKey string, missing []int64, chunkSize, lastRequiredChunk int64) (map[int64][]byte, error) {
+	type result struct {
+		start int64
+		data  []byte
+		err   error
+	}
+
+	parallelism := h.maxConcurrentReadFetches()
+	if parallelism < 1 {
+		parallelism = 1
+	}
+	if parallelism > len(missing) {
+		parallelism = len(missing)
+	}
+
+	jobs := make(chan int64)
+	results := make(chan result, len(missing))
+	var wg sync.WaitGroup
+
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunkStart := range jobs {
+				data, err := h.fetchChunkSingleflight(ctx, path, objectKey, chunkStart, chunkSize)
+				if err != nil {
+					results <- result{start: chunkStart, err: err}
+					continue
+				}
+				results <- result{start: chunkStart, data: data}
+			}
+		}()
+	}
+
+	for _, chunkStart := range missing {
+		jobs <- chunkStart
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	fetched := make(map[int64][]byte, len(missing))
+	for res := range results {
+		if res.err != nil {
+			if res.start <= lastRequiredChunk {
+				return nil, res.err
+			}
+			logging.Warn("Read-ahead chunk fetch failed",
+				zap.String("path", path),
+				zap.Int64("chunk_start", res.start),
+				zap.Error(res.err))
+			continue
+		}
+		fetched[res.start] = res.data
+	}
+
+	return fetched, nil
+}
+
+func (h *OperationsHandler) fetchChunkSingleflight(ctx context.Context, path, objectKey string, chunkStart, chunkSize int64) ([]byte, error) {
+	groupKey := fmt.Sprintf("%s:%d:%d", path, chunkStart, chunkSize)
+	value, err, _ := h.readGroup.Do(groupKey, func() (interface{}, error) {
+		if cached, cacheErr := h.dataCache.ReadChunk(path, chunkStart, chunkSize); cacheErr == nil {
+			metrics.RecordCacheHit("data")
+			return cached, nil
+		}
+
+		metrics.RecordCOSGetObject()
+		data, fetchErr := h.cosClient.GetObjectRange(ctx, objectKey, chunkStart, chunkSize)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		if len(data) > 0 {
+			if cacheErr := h.dataCache.WriteChunk(path, chunkStart, chunkSize, data); cacheErr != nil {
+				logging.Warn("Failed to cache read chunk",
+					zap.String("path", path),
+					zap.Int64("chunk_start", chunkStart),
+					zap.Error(cacheErr))
+			}
+		}
+		return data, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	data, ok := value.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("invalid read chunk type %T", value)
+	}
 	return data, nil
 }
 
@@ -276,8 +514,8 @@ func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []b
 
 	// Invalidate caches
 	h.metadataCache.InvalidatePath(path)
-	if h.dataCache.IsEnabled() {
-		h.dataCache.Delete(path)
+	if h.dataCacheEnabled() {
+		h.dataCache.DeleteObject(path)
 	}
 
 	metrics.RecordBytesWritten(int64(len(data)))
@@ -304,8 +542,8 @@ func (h *OperationsHandler) DeleteFile(ctx context.Context, path string) error {
 
 	// Invalidate caches
 	h.metadataCache.InvalidatePath(path)
-	if h.dataCache.IsEnabled() {
-		h.dataCache.Delete(path)
+	if h.dataCacheEnabled() {
+		h.dataCache.DeleteObject(path)
 	}
 
 	log.Debug("File deleted successfully")
@@ -381,12 +619,12 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 	log := logging.WithOperation("ListDirectory").With(zap.String("path", path))
 	start := time.Now()
 	cacheHit := false
-	
+
 	defer func() {
 		duration := time.Since(start)
 		metrics.RecordNFSRequest("readdir", "success", duration)
 		metrics.RecordListDirectory(duration, cacheHit)
-		
+
 		// Log first call, cache misses, or slow operations
 		counters := metrics.GetGlobalCounters()
 		callCount := counters.ListDirCalls.Load()
@@ -400,9 +638,13 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 
 	// Check cache first - NEW: Return full FileInfo entries directly (O(1) cache hit)
 	if entry, ok := h.metadataCache.Get(path); ok && entry.ChildEntries != nil {
+		maxEntries := h.maxDirectoryEntries()
+		if len(entry.ChildEntries) > maxEntries {
+			return nil, fmt.Errorf("cached directory listing for %s exceeds max_directory_entries=%d", path, maxEntries)
+		}
 		cacheHit = true
 		metrics.RecordCacheHit("metadata")
-		
+
 		// Convert []os.FileInfo to []*FileInfo (just type assertion, no COS calls)
 		entries := make([]*FileInfo, len(entry.ChildEntries))
 		for i, info := range entry.ChildEntries {
@@ -415,18 +657,18 @@ func (h *OperationsHandler) ListDirectory(ctx context.Context, path string) ([]*
 				goto fetchFromCOS
 			}
 		}
-		
+
 		// O(1) cache hit - no per-file Stat() calls!
 		return entries, nil
 	}
-	
+
 	// DEPRECATED: Old cache format with just names (fallback for compatibility)
 	if entry, ok := h.metadataCache.Get(path); ok && entry.Children != nil {
 		log.Warn("Using deprecated cache format, will upgrade on next fetch")
 		h.metadataCache.InvalidatePath(path)
 		// Fall through to fetch fresh listing
 	}
-	
+
 fetchFromCOS:
 	cacheHit = false
 	metrics.RecordCacheMiss("metadata")
@@ -434,13 +676,17 @@ fetchFromCOS:
 	// List from COS
 	prefix := ListPrefix(path)
 	log.Info("ListDirectory cache miss, fetching from COS", zap.String("prefix", prefix))
-	
+
 	cosStart := time.Now()
 	metrics.RecordCOSListObjects()
-	objects, err := h.cosClient.ListObjects(ctx, prefix, 0)
+	maxEntries := h.maxDirectoryEntries()
+	objects, err := h.cosClient.ListObjects(ctx, prefix, maxEntries+1)
 	if err != nil {
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
+	}
+	if len(objects) > maxEntries {
+		return nil, fmt.Errorf("directory listing for %s exceeds max_directory_entries=%d", path, maxEntries)
 	}
 
 	log.Info("Got objects from COS",
@@ -453,7 +699,7 @@ fetchFromCOS:
 
 	for _, obj := range objects {
 		log.Debug("Processing object", zap.String("key", obj.Key))
-		
+
 		// Remove prefix to get relative path
 		relPath := obj.Key
 		if prefix != "" {
@@ -473,10 +719,10 @@ fetchFromCOS:
 			log.Debug("Skipping - no parts")
 			continue
 		}
-		
+
 		name := parts[0]
 		isDir := len(parts) > 1 || strings.HasSuffix(obj.Key, "/")
-		
+
 		// Skip if already seen
 		if seen[name] {
 			log.Debug("Skipping duplicate", zap.String("name", name))
@@ -550,8 +796,9 @@ func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath str
 	// Invalidate caches
 	h.metadataCache.InvalidatePath(oldPath)
 	h.metadataCache.InvalidatePath(newPath)
-	if h.dataCache.IsEnabled() {
-		h.dataCache.Delete(oldPath)
+	if h.dataCacheEnabled() {
+		h.dataCache.DeleteObject(oldPath)
+		h.dataCache.DeleteObject(newPath)
 	}
 
 	log.Debug("File renamed successfully")

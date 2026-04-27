@@ -23,8 +23,8 @@ spec:
       serviceAccountName: nfs-gateway
       containers:
       - name: nfs-gateway
-        image: oborges/cos-nfs-gateway:latest
-        imagePullPolicy: Always
+        image: oborges/cos-nfs-gateway:1.0.0
+        imagePullPolicy: IfNotPresent
         ports:
         - name: nfs
           containerPort: 2049
@@ -36,22 +36,22 @@ spec:
           containerPort: 8081
           protocol: TCP
         env:
-        - name: COS_ENDPOINT
+        - name: NFS_GATEWAY_COS_ENDPOINT
           valueFrom:
             configMapKeyRef:
               name: nfs-gateway-config
               key: cos.endpoint
-        - name: COS_BUCKET
+        - name: NFS_GATEWAY_COS_BUCKET
           valueFrom:
             configMapKeyRef:
               name: nfs-gateway-config
               key: cos.bucket
-        - name: COS_REGION
+        - name: NFS_GATEWAY_COS_REGION
           valueFrom:
             configMapKeyRef:
               name: nfs-gateway-config
               key: cos.region
-        - name: IBM_CLOUD_API_KEY
+        - name: NFS_GATEWAY_COS_API_KEY
           valueFrom:
             secretKeyRef:
               name: nfs-gateway-secret

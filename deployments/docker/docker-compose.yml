@@ -5,7 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: deployments/docker/Dockerfile
-    image: oborges/cos-nfs-gateway:latest
+    image: oborges/cos-nfs-gateway:${NFS_GATEWAY_IMAGE_TAG:-1.0.0}
     container_name: cos-nfs-gateway
     ports:
       - "2049:2049"   # NFS
@@ -13,10 +13,10 @@ services:
       - "8081:8081"   # Health
     environment:
       # COS Configuration
-      - COS_ENDPOINT=${COS_ENDPOINT}
-      - COS_BUCKET=${COS_BUCKET}
-      - COS_REGION=${COS_REGION:-us-south}
-      - IBM_CLOUD_API_KEY=${IBM_CLOUD_API_KEY}
+      - NFS_GATEWAY_COS_ENDPOINT=${COS_ENDPOINT}
+      - NFS_GATEWAY_COS_BUCKET=${COS_BUCKET}
+      - NFS_GATEWAY_COS_REGION=${COS_REGION:-us-south}
+      - NFS_GATEWAY_COS_API_KEY=${IBM_CLOUD_API_KEY}
       
       # Logging
       - NFS_GATEWAY_LOGGING_LEVEL=${LOG_LEVEL:-info}
@@ -46,7 +46,7 @@ services:
 
   # Optional: Prometheus for metrics collection
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.4
     container_name: prometheus
     ports:
       - "9090:9090"
@@ -63,7 +63,7 @@ services:
 
   # Optional: Grafana for visualization
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.6.0
     container_name: grafana
     ports:
       - "127.0.0.1:3000:3000"

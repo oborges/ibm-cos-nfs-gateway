@@ -8,15 +8,15 @@ import (
 
 // LRUCache implements a thread-safe LRU cache with TTL support
 type LRUCache struct {
-	maxSize    int
-	ttl        time.Duration
-	items      map[string]*list.Element
-	evictList  *list.List
-	mu         sync.RWMutex
-	onEvict    func(key string, value interface{})
-	hits       uint64
-	misses     uint64
-	evictions  uint64
+	maxSize   int
+	ttl       time.Duration
+	items     map[string]*list.Element
+	evictList *list.List
+	mu        sync.RWMutex
+	onEvict   func(key string, value interface{})
+	hits      uint64
+	misses    uint64
+	evictions uint64
 }
 
 // entry represents a cache entry
@@ -199,6 +199,18 @@ func (c *LRUCache) CleanExpired() int {
 	}
 
 	return count
+}
+
+// EvictOldest removes the least recently used entry.
+func (c *LRUCache) EvictOldest() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.evictList.Len() == 0 {
+		return false
+	}
+	c.evictOldest()
+	return true
 }
 
 // removeElement removes an element from the cache (must be called with lock held)

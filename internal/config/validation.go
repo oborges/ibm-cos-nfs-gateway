@@ -184,6 +184,18 @@ func validatePerformance(config *PerformanceConfig) error {
 		return fmt.Errorf("invalid max_concurrent_writes: %d (must be > 0)", config.MaxConcurrentWrites)
 	}
 
+	if config.MaxFullObjectReadMB < 1 {
+		return fmt.Errorf("invalid max_full_object_read_mb: %d (must be > 0)", config.MaxFullObjectReadMB)
+	}
+
+	if config.MaxBufferedWriteMB < 1 {
+		return fmt.Errorf("invalid max_buffered_write_mb: %d (must be > 0)", config.MaxBufferedWriteMB)
+	}
+
+	if config.MaxDirectoryEntries < 1 {
+		return fmt.Errorf("invalid max_directory_entries: %d (must be > 0)", config.MaxDirectoryEntries)
+	}
+
 	return nil
 }
 
@@ -228,6 +240,32 @@ func validateStaging(config *StagingConfig) error {
 		}
 		if config.SyncWorkerCount < 1 {
 			return fmt.Errorf("invalid staging sync_worker_count: %d (must be > 0)", config.SyncWorkerCount)
+		}
+		mode := strings.ToLower(config.BackpressureMode)
+		if mode != "block" && mode != "fail_fast" {
+			return fmt.Errorf("invalid staging backpressure_mode: %s (must be 'block' or 'fail_fast')", config.BackpressureMode)
+		}
+		if config.BackpressureHighWatermarkPct < 1 || config.BackpressureHighWatermarkPct > 99 {
+			return fmt.Errorf("invalid staging backpressure_high_watermark_percent: %d (must be 1-99)", config.BackpressureHighWatermarkPct)
+		}
+		if config.BackpressureCritWatermarkPct < 1 || config.BackpressureCritWatermarkPct > 100 {
+			return fmt.Errorf("invalid staging backpressure_critical_watermark_percent: %d (must be 1-100)", config.BackpressureCritWatermarkPct)
+		}
+		if config.BackpressureHighWatermarkPct >= config.BackpressureCritWatermarkPct {
+			return fmt.Errorf("staging backpressure_high_watermark_percent (%d) must be lower than backpressure_critical_watermark_percent (%d)",
+				config.BackpressureHighWatermarkPct, config.BackpressureCritWatermarkPct)
+		}
+		if timeout, err := config.GetBackpressureWaitTimeout(); err != nil || timeout < 0 {
+			if err != nil {
+				return fmt.Errorf("invalid staging backpressure_wait_timeout: %w", err)
+			}
+			return fmt.Errorf("invalid staging backpressure_wait_timeout: %s (must be >= 0)", timeout)
+		}
+		if interval, err := config.GetBackpressureCheckInterval(); err != nil || interval <= 0 {
+			if err != nil {
+				return fmt.Errorf("invalid staging backpressure_check_interval: %w", err)
+			}
+			return fmt.Errorf("invalid staging backpressure_check_interval: %s (must be > 0)", interval)
 		}
 
 		// Check if staging directory exists or can be created

@@ -32,7 +32,8 @@ go.work
 # Configuration files with secrets
 configs/config.yaml
 !configs/config.example.yaml
-
+configs/local-config.yaml
+/local-config.yaml
 # Cache directories
 /var/cache/
 *.cache
@@ -40,6 +41,9 @@ configs/config.yaml
 # Log files
 *.log
 logs/
+
+# Benchmark output artifacts
+benchmark-results/
 
 # Temporary files
 tmp/

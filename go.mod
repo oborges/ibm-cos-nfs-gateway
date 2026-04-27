@@ -12,6 +12,8 @@ require (
 	golang.org/x/sync v0.20.0
 )
 
+replace github.com/willscott/go-nfs => ./third_party/go-nfs
+
 require (
 	github.com/IBM/go-sdk-core/v5 v5.21.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
