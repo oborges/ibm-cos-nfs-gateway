@@ -1,412 +1,433 @@
-# IBM Cloud COS NFS Gateway - Architecture Design
+# IBM Cloud COS NFS Gateway Architecture
 
 ## Overview
 
-This project implements an NFS gateway service that exposes IBM Cloud Object Storage (COS) as a POSIX-compliant filesystem, similar to AWS S3 Files. The gateway enables IBM Cloud Virtual Server Instances (VSIs) to mount COS buckets as network filesystems.
+IBM Cloud COS NFS Gateway exposes a single IBM Cloud Object Storage bucket as an
+NFSv3 filesystem. Linux clients speak NFS to the gateway; the gateway translates
+filesystem operations into COS object operations and uses local disk for staging,
+write-back sync, and read caching.
 
-## System Architecture
+The current architecture is intentionally centered on local correctness:
+
+- Writes are accepted into local staging first.
+- Background workers sync dirty staged files to COS asynchronously.
+- Read paths prefer dirty/staged data when present, then local cache, then COS.
+- Backpressure protects staging capacity before the local filesystem is full.
+- Multipart uploads are owned by final sync workers and protected from
+  per-object races.
+- Crash recovery scans staging metadata and resumes unsynced dirty files.
+
+## High-Level Architecture
 
 ```mermaid
-graph TB
-    subgraph "IBM Cloud VSI"
-        A[NFS Client] -->|NFS v3 Protocol| B[NFS Gateway Service]
+flowchart TB
+    client["Linux NFS client"] -->|NFSv3 TCP| nfs["NFS server layer"]
+
+    subgraph gateway["COS NFS Gateway"]
+        nfs --> wrappers["NFS wrappers: auth, cache, instrumentation, stable verifier"]
+        wrappers --> fs["COSFilesystem"]
+        fs --> ops["POSIX operations handler"]
+        fs --> staging["Staging manager"]
+        staging --> sync["Async sync workers"]
+        ops --> metadata["Metadata cache"]
+        ops --> data["Chunk data cache"]
+        ops --> cos["COS client"]
+        sync --> cos
+        fs --> metrics["Metrics, health, debug endpoints"]
     end
-    
-    subgraph "NFS Gateway Service"
-        B --> C[NFS Server Layer]
-        C --> D[POSIX Operations Handler]
-        D --> E[Metadata Cache]
-        D --> F[File Cache]
-        D --> G[Lock Manager]
-        E --> H[COS Client Wrapper]
-        F --> H
-        G --> H
-    end
-    
-    subgraph "IBM Cloud"
-        H -->|S3 API| I[IBM Cloud Object Storage]
-        J[IAM Authentication] --> H
-    end
-    
-    subgraph "Monitoring & Logging"
-        B --> K[Prometheus Metrics]
-        B --> L[Structured Logging]
-    end
+
+    cos -->|S3-compatible API| bucket["IBM Cloud Object Storage bucket"]
+
+    staging --> disk1["Local staging disk"]
+    data --> disk2["Local read-cache disk"]
 ```
+
+## Request Flow
+
+### NFS Layer
+
+The gateway serves NFSv3 over TCP, normally on port `2049`. The NFS stack is
+built on a vendored `go-nfs` dependency with local changes needed for gateway
+behavior, including filesystem statistics forwarding and deterministic ENOSPC
+mapping.
+
+The request path is:
+
+1. NFS client sends an NFSv3 operation.
+2. `go-nfs` decodes the request.
+3. wrapper handlers apply caching, instrumentation, and stable directory
+   verifier behavior.
+4. `COSFilesystem` handles filesystem semantics.
+5. operations are routed to staging, cache, or COS depending on file state.
+
+### Write Path
+
+Writes use local staging when `staging.enabled` is true.
+
+```mermaid
+sequenceDiagram
+    participant C as NFS client
+    participant F as COSFilesystem
+    participant B as Backpressure
+    participant S as Staging manager
+    participant W as Sync worker
+    participant O as COS
+
+    C->>F: WRITE(path, offset, bytes)
+    F->>B: reserve requested bytes
+    B-->>F: allow, block, or reject
+    F->>S: write bytes into staging file
+    S-->>F: mark dirty
+    F-->>C: NFS write response
+    S->>W: enqueue or discover dirty file
+    W->>O: upload full staged object
+    O-->>W: object stored
+    W->>S: mark clean and cleanup if configured
+```
+
+An accepted write means the gateway accepted data into local staging. It does
+not mean the object is already durable in COS. COS durability happens after the
+background sync worker uploads the staged file and the object is visible in the
+bucket.
+
+Dirty files are tracked by staging metadata. Sync can be triggered by size,
+dirty age, close behavior, explicit queueing, or periodic scans depending on
+configuration.
+
+### Read Path
+
+Reads follow a consistency-first order:
+
+1. If a file is dirty, syncing, or otherwise has active staged state, read from
+   staging.
+2. If the requested range exists in the local chunk cache, read from cache.
+3. Otherwise fetch from COS using object/range reads.
+4. Populate the chunk cache when configured.
+
+Sequential COS reads can use read-ahead and parallel range fetches. Repeated
+concurrent fetches for the same range are deduplicated with singleflight to
+avoid stampeding COS.
+
+### Directory And Metadata Path
+
+Object keys are translated into filesystem paths. Directory listings are
+constructed from COS prefix listings plus local staged state. Metadata cache
+entries store file attributes and directory listings with TTL-based expiration.
+
+Write, remove, rename, and metadata-changing operations invalidate relevant
+cache entries so clients do not keep reading stale metadata through the gateway.
 
 ## Core Components
 
-### 1. NFS Server Layer
-- **Purpose**: Implements NFSv3 protocol server
-- **Technology**: Go NFS library (go-nfs or willscott/go-nfs)
-- **Responsibilities**:
-  - Handle NFS protocol requests
-  - Manage NFS sessions and connections
-  - Translate NFS operations to internal API calls
+### `cmd/nfs-gateway`
 
-### 2. POSIX Operations Handler
-- **Purpose**: Maps POSIX filesystem operations to COS operations
-- **Key Operations**:
-  - `READ`: Fetch object from COS
-  - `WRITE`: Upload object to COS
-  - `READDIR`: List bucket prefix
-  - `LOOKUP`: Check object existence
-  - `GETATTR`: Retrieve object metadata
-  - `SETATTR`: Update object metadata
-  - `CREATE`: Create new object
-  - `REMOVE`: Delete object
-  - `RENAME`: Copy and delete object
-  - `MKDIR`: Create prefix marker
-  - `RMDIR`: Remove prefix marker
+The executable loads configuration, initializes logging, COS, caches, staging,
+sync workers, health endpoints, metrics, debug endpoints, and the NFS server.
 
-### 3. Metadata Cache
-- **Purpose**: Cache object metadata to reduce COS API calls
-- **Implementation**: In-memory LRU cache with TTL
-- **Cached Data**:
-  - File attributes (size, timestamps, permissions)
-  - Directory listings
-  - Object existence checks
-- **Configuration**:
-  - Configurable cache size
-  - Configurable TTL (default: 60 seconds)
-  - Cache invalidation on write operations
+Configuration can be provided by YAML and overridden with environment variables
+using the `NFS_GATEWAY_` prefix.
 
-### 4. Enterprise Staging Layer (File Cache)
-- **Purpose**: Abstract file streaming via Native caching limits!
-- **Deep Dive**: Refer to [docs/STAGING_ARCHITECTURE.md](docs/STAGING_ARCHITECTURE.md)
-- **Implementation**: Real-time OS limits enforcing Memory-Mapped (`syscall.Mmap`) abstractions alongside Quota bounds.
-- **Features**:
-  - Configurable `MaxStagingSizeGB` Quota eviction triggers natively checking `syscall.ENOSPC`.
-  - Aggressive 80% Idle threshold flushing asynchronous pipelines.
-  - Zero-Copy mapped read boundaries bypassing standard OS string duplication natively!
+### `internal/nfs`
 
-### 5. Lock Manager
-- **Purpose**: Implement distributed file locking
-- **Implementation**: 
-  - Advisory locks using COS object metadata
-  - Lock lease mechanism with timeout
-  - Deadlock detection and prevention
-- **Lock Types**:
-  - Shared (read) locks
-  - Exclusive (write) locks
+This package adapts NFS requests to the internal filesystem implementation.
 
-### 6. COS Client Wrapper
-- **Purpose**: Abstract IBM Cloud COS API interactions
-- **Features**:
-  - Connection pooling
-  - Retry logic with exponential backoff
-  - Request rate limiting
-  - Multi-part upload support
-  - Streaming downloads
+Responsibilities include:
 
-## Technical Specifications
+- NFS server startup.
+- NFS operation handling through `COSFilesystem`.
+- stable verifier handling for directory pagination.
+- instrumentation wrappers.
+- filesystem statistics forwarding so clients can see staging-aware capacity.
+- dirty-file read routing through staged state.
 
-### NFS Protocol Support
-- **Version**: NFSv3 (RFC 1813)
-- **Transport**: TCP
-- **Authentication**: AUTH_SYS (Unix authentication)
-- **Port**: 2049 (configurable)
+### `internal/posix`
 
-### IBM Cloud COS Integration
-- **API**: S3-compatible API
-- **Authentication**: IBM Cloud IAM API Key or HMAC credentials
-- **Endpoints**: Regional endpoints for optimal performance
-- **Features Used**:
-  - Standard object operations
-  - Multipart uploads for large files
-  - Object metadata for POSIX attributes
-  - Bucket lifecycle policies
+This package implements object-backed POSIX-style operations:
 
-### POSIX Compliance
+- `Stat`, `Read`, `Write`, `Delete`, `Mkdir`, `Rmdir`, `Rename`, and `SetAttr`.
+- COS object key/path translation.
+- metadata encoding and decoding.
+- range and whole-object reads.
+- chunk-cache and metadata-cache integration.
+- singleflight deduplication for concurrent COS range fetches.
 
-#### Supported Features
-- File operations: open, read, write, close, truncate
-- Directory operations: mkdir, rmdir, readdir
-- Metadata operations: stat, chmod, chown, utimes
-- File locking: advisory locks (flock, fcntl)
-- Symbolic links: stored as special objects
-- Hard links: not supported (COS limitation)
+When staging is enabled, the primary write path is handled by `internal/nfs` and
+`internal/staging`; the POSIX handler remains responsible for COS-backed reads,
+metadata, legacy paths, and object operations.
 
-#### Limitations
-- No true inode numbers (generated from object keys)
-- Limited support for special files (devices, FIFOs)
-- Atomic operations limited by COS capabilities
-- Rename operations are copy + delete (not atomic)
+### `internal/staging`
 
-### Performance Optimizations
+The staging subsystem is the center of write-back behavior.
 
-#### Caching Strategy
-1. **Metadata Caching**
-   - Cache directory listings for fast navigation
-   - Cache file attributes to reduce HEAD requests
-   - Invalidate on write operations
+Main responsibilities:
 
-2. **Data Caching**
-   - Read-ahead for sequential access patterns
-   - Write buffering to batch small writes
-   - Chunk-based caching for large files
+- create and manage one local staging session per logical path.
+- write incoming NFS data to local staging files.
+- track dirty files and dirty bytes.
+- apply high/critical watermark backpressure.
+- expose pressure and queue state to metrics/debug endpoints.
+- recover dirty files after process restart.
+- coordinate cleanup after successful sync.
+- protect active readers and active multipart uploads from premature cleanup.
 
-3. **Connection Pooling**
-   - Reuse HTTP connections to COS
-   - Configurable pool size per endpoint
-   - Connection health checks
+The staging directory must be treated as durable local state until sync has
+completed. Losing dirty staging files before upload can lose accepted writes.
 
-#### Concurrency
-- Goroutine pool for handling NFS requests
-- Parallel uploads for multipart operations
-- Concurrent directory listing with pagination
+### `internal/staging/sync_worker`
 
-## Deployment Architecture
+Sync workers upload dirty staged files to COS. They process queued and scanned
+dirty files, retry transient failures, and record upload timing.
 
-### Container Configuration
-```
-┌─────────────────────────────────────┐
-│     NFS Gateway Container           │
-│                                     │
-│  ┌──────────────────────────────┐  │
-│  │   NFS Gateway Service        │  │
-│  │   - Port 2049 (NFS)          │  │
-│  │   - Port 8080 (Metrics)      │  │
-│  │   - Port 8081 (Health)       │  │
-│  └──────────────────────────────┘  │
-│                                     │
-│  ┌──────────────────────────────┐  │
-│  │   Configuration              │  │
-│  │   - /etc/nfs-gateway/        │  │
-│  └──────────────────────────────┘  │
-│                                     │
-│  ┌──────────────────────────────┐  │
-│  │   Cache Volume               │  │
-│  │   - /var/cache/nfs-gateway/  │  │
-│  └──────────────────────────────┘  │
-└─────────────────────────────────────┘
-```
+For large files, sync workers use multipart upload. Multipart lifecycle is
+managed as one active upload session per object sync attempt:
 
-### Kubernetes Deployment
-- **Deployment Type**: StatefulSet (for cache persistence)
-- **Replicas**: Configurable (1-N based on load)
-- **Service Type**: LoadBalancer or NodePort
-- **Persistent Volumes**: For cache storage
-- **ConfigMaps**: For configuration
-- **Secrets**: For IBM Cloud credentials
+- create multipart upload.
+- upload parts with ordered part numbers.
+- track ETags.
+- complete exactly once when all parts are uploaded and the staged snapshot is
+  still current.
+- abort failed or stale attempts when safe.
+- restart from a clean multipart upload if COS reports an invalid upload
+  session such as `NoSuchUpload`.
 
-### High Availability
-- Multiple gateway instances behind load balancer
-- Shared cache using Redis (optional)
-- Health checks and automatic failover
-- Graceful shutdown handling
+Per-object synchronization prevents multiple workers from syncing the same path
+at the same time.
 
-## Security Considerations
+### `internal/cache`
 
-### Authentication & Authorization
-1. **IBM Cloud IAM Integration**
-   - Service ID with API key
-   - Fine-grained access policies
-   - Credential rotation support
+The cache subsystem has two layers:
 
-2. **NFS Authentication**
-   - IP-based access control
-   - UID/GID mapping
-   - Export restrictions
+- Metadata cache: in-memory LRU with TTL for attributes and directory entries.
+- Data cache: local disk chunk cache for object ranges.
 
-### Data Security
-- TLS for COS API communication
-- Encryption at rest (COS feature)
-- Encryption in transit (NFS over VPN/private network)
-- Secure credential storage (Kubernetes secrets)
+The data cache is optimized for repeated and sequential reads. It is not the
+durability mechanism for writes; that role belongs to staging.
 
-### Network Security
-- Private network deployment recommended
-- Security groups and firewall rules
-- VPC isolation
-- Optional VPN for remote access
+### `internal/cos`
 
-## Monitoring & Observability
+The COS client wraps IBM Cloud COS S3-compatible operations:
 
-### Metrics (Prometheus)
-- Request rate and latency
-- Cache hit/miss ratios
-- COS API call statistics
-- Error rates by operation type
-- Active connections and sessions
-- Cache size and eviction rate
+- object stat/head.
+- object get and range get.
+- put object.
+- delete object.
+- list objects by prefix.
+- multipart create/upload-part/complete/abort.
 
-### Logging
-- Structured JSON logging
-- Log levels: DEBUG, INFO, WARN, ERROR
-- Request tracing with correlation IDs
-- Audit logging for security events
+Authentication supports IAM API key and HMAC credentials according to
+configuration.
 
-### Health Checks
-- Liveness probe: Service running
-- Readiness probe: COS connectivity
-- Startup probe: Initialization complete
+### `internal/metrics` And `internal/health`
 
-## Configuration Management
+The gateway exposes optional HTTP endpoints for operations:
 
-### Configuration File Structure
+- Prometheus metrics on `127.0.0.1:<metrics_port>/metrics`.
+- health endpoints on `127.0.0.1:<health_port>/health/*`.
+- debug endpoints on `127.0.0.1:<debug_port>/debug/*`.
+
+The debug staging endpoint reports dirty files, sync queue depth, queue bytes,
+staging pressure, last sync timing, COS visibility latency, and upload
+throughput.
+
+## Staging Backpressure
+
+Backpressure is enforced before staging is full. The gateway computes staging
+pressure from configured size limits and current staged bytes.
+
+Pressure levels:
+
+- `normal`: writes are allowed.
+- `high`: block mode can wait for sync drain before allowing more writes.
+- `critical`: writes are rejected early or fail after the configured wait
+  timeout.
+
+Modes:
+
+- `block`: wait for pressure relief until `backpressure_wait_timeout`.
+- `fail_fast`: reject immediately at or above the critical watermark.
+
+Backpressure decisions are logged with:
+
+- path.
+- requested bytes.
+- available bytes.
+- pressure level.
+- decision: `allow`, `block`, or `reject`.
+
+NFS filesystem statistics are staging-aware, so clients can see reduced
+available space before staging is fully exhausted.
+
+## Crash Safety Model
+
+Crash safety is based on preserving local staging state.
+
+Accepted writes remain dirty until sync completes. On restart, the gateway scans
+staging metadata and active staging files, rebuilds the dirty index, and resumes
+sync. If a crash happens during multipart upload, the gateway does not rely on
+the old in-memory upload state; it starts a clean sync attempt from the staged
+file.
+
+This model depends on:
+
+- reliable local storage for `staging.root_dir`.
+- not deleting staging files manually while they are dirty.
+- keeping `clean_after_sync` cleanup limited to files that are already clean and
+  no longer needed by active handles.
+
+## Consistency Model
+
+The gateway provides local read-after-write consistency through staging: a
+client that writes a file can read the dirty version from the gateway before COS
+sync completes.
+
+COS is still an object store, so some filesystem operations are approximations:
+
+- rename is implemented through object operations and is not equivalent to a
+  local filesystem atomic rename across every failure mode.
+- hard links are not supported as native object-store constructs.
+- generated file identity is based on path/object metadata rather than true
+  persistent inode allocation from COS.
+- multi-gateway active/active writes to the same bucket are not a supported
+  consistency model unless external coordination is added.
+
+## Configuration Shape
+
+The main configuration groups are:
+
 ```yaml
 server:
   nfs_port: 2049
+  metrics_enabled: true
   metrics_port: 8080
+  health_enabled: true
   health_port: 8081
-  max_connections: 1000
+  debug_enabled: true
+  debug_port: 8082
 
 cos:
-  endpoint: s3.us-south.cloud-object-storage.appdomain.cloud
-  bucket: my-bucket
-  region: us-south
-  auth_type: iam  # or hmac
-  api_key: ${IBM_CLOUD_API_KEY}
-  
+  endpoint: "s3.us-south.cloud-object-storage.appdomain.cloud"
+  bucket: "my-nfs-bucket"
+  region: "us-south"
+  auth_type: "iam"
+  api_key: "..."
+  service_id: "..."
+
 cache:
   metadata:
     enabled: true
     size_mb: 256
     ttl_seconds: 60
+    max_entries: 10000
   data:
     enabled: true
     size_gb: 10
-    path: /var/cache/nfs-gateway
-    
+    path: "/var/cache/nfs-gateway"
+    chunk_size_kb: 1024
+
 performance:
-  read_ahead_kb: 1024
-  write_buffer_kb: 4096
+  read_ahead_kb: 8192
   multipart_threshold_mb: 100
   multipart_chunk_mb: 10
-  worker_pool_size: 100
+  max_concurrent_reads: 50
+  max_concurrent_writes: 25
+  max_full_object_read_mb: 512
+  max_buffered_write_mb: 512
+  max_directory_entries: 100000
 
-logging:
-  level: info
-  format: json
-  output: stdout
+staging:
+  enabled: true
+  root_dir: "/var/staging/nfs-gateway"
+  sync_interval: "30s"
+  sync_threshold_mb: 10
+  max_dirty_age: "5m"
+  max_staging_size_gb: 10
+  sync_worker_count: 4
+  sync_queue_size: 100
+  clean_after_sync: true
+  backpressure_enabled: true
+  backpressure_mode: "block"
+  backpressure_high_watermark_percent: 80
+  backpressure_critical_watermark_percent: 95
+  backpressure_wait_timeout: "30s"
 ```
 
-### Environment Variables
-- `IBM_CLOUD_API_KEY`: IAM API key
-- `COS_ENDPOINT`: COS endpoint URL
-- `COS_BUCKET`: Target bucket name
-- `CACHE_SIZE_GB`: Data cache size
-- `LOG_LEVEL`: Logging level
+See `configs/config.example.yaml` for the complete current example.
 
-## Implementation Phases
+## Observability
 
-### Phase 1: Foundation (Weeks 1-2)
-- Project setup and structure
-- IBM Cloud COS client implementation
-- Basic NFS server setup
-- Configuration management
+Important Prometheus metrics include:
 
-### Phase 2: Core Functionality (Weeks 3-5)
-- POSIX operation mapping
-- Read operations
-- Write operations
-- Directory operations
-- Metadata handling
+- `staging_used_bytes`
+- `staging_available_bytes`
+- `staging_pressure_level`
+- `writes_blocked_total`
+- `writes_rejected_total`
+- `backpressure_wait_seconds`
+- `sync_queue_bytes`
+- `staging_sync_queue_depth`
+- `staging_sync_queue_bytes`
+- `staging_cos_visibility_latency_seconds`
+- `staging_upload_duration_seconds`
+- `staging_upload_throughput_mib_per_second`
+- `cache_hits_total`
+- `cache_misses_total`
+- `nfs_requests_total`
+- `cos_api_calls_total`
 
-### Phase 3: Performance & Caching (Weeks 6-7)
-- Metadata cache implementation
-- Data cache implementation
-- Read-ahead and write buffering
-- Connection pooling
+Important debug endpoints include:
 
-### Phase 4: Advanced Features (Weeks 8-9)
-- File locking mechanism
-- Concurrent access handling
-- Error handling and recovery
-- Performance optimization
+- `/debug/staging/sync`: staging, sync queue, pressure, and last upload state.
+- `/debug/perf`: aggregate gateway performance counters.
+- `/debug/perf/paths`: per-path instrumentation data.
 
-### Phase 5: Deployment & Operations (Weeks 10-11)
-- Docker containerization
-- Kubernetes manifests
-- Monitoring and logging
-- Health checks
+## Deployment Model
 
-### Phase 6: Testing & Documentation (Weeks 12-13)
-- Unit tests
-- Integration tests
-- Performance testing
-- Documentation
+The gateway can run directly on a Linux host, in Docker, or in Kubernetes. The
+most important deployment requirement is persistent local storage for staging
+and adequate local storage for cache.
 
-## Success Criteria
+Recommended production shape:
 
-### Functional Requirements
-- ✓ Mount IBM Cloud COS bucket as NFS filesystem
-- ✓ Support basic file operations (read, write, delete)
-- ✓ Support directory operations
-- ✓ POSIX-compliant metadata handling
-- ✓ Concurrent access support
-- ✓ File locking mechanism
+- one gateway instance owns one mounted export.
+- staging path on reliable local or attached disk.
+- cache path on local or attached disk sized for the read working set.
+- NFS port exposed only to trusted clients.
+- COS credentials provided through environment variables, local secret files,
+  or Kubernetes secrets.
+- metrics, health, and debug endpoints kept on localhost or protected networks.
 
-### Performance Requirements
-- Read throughput: >100 MB/s per client
-- Write throughput: >50 MB/s per client
-- Metadata operations: <100ms latency (cached)
-- Cache hit ratio: >80% for typical workloads
-- Support 100+ concurrent clients
+Container and Kubernetes examples live under `deployments/`, but they are
+deployment templates rather than a complete production platform.
 
-### Operational Requirements
-- 99.9% uptime SLA
-- Automated deployment via Kubernetes
-- Comprehensive monitoring and alerting
-- Detailed logging and troubleshooting
-- Configuration hot-reload support
+## Security Boundaries
 
-## Risks & Mitigations
+The gateway assumes the operator controls the Linux host or network where NFS is
+mounted. NFS access is not authenticated by the gateway itself. Access control
+must be provided by host firewall rules, VPC security groups, Kubernetes network
+policy, private networking, or equivalent infrastructure controls.
 
-### Technical Risks
-1. **COS API Rate Limits**
-   - Mitigation: Aggressive caching, request batching
-   
-2. **Network Latency**
-   - Mitigation: Regional endpoints, read-ahead caching
-   
-3. **Consistency Challenges**
-   - Mitigation: Cache invalidation strategy, eventual consistency model
+COS access is authenticated with the configured IBM Cloud credentials. Those
+credentials should be scoped to the target bucket and stored outside source
+control.
 
-4. **Large File Performance**
-   - Mitigation: Multipart uploads, chunk-based caching
+COS API traffic uses HTTPS through the IBM COS SDK. NFS traffic is plain NFSv3
+and should be kept on trusted networks.
 
-### Operational Risks
-1. **Cache Invalidation Complexity**
-   - Mitigation: Conservative TTLs, manual invalidation API
-   
-2. **Credential Management**
-   - Mitigation: Kubernetes secrets, IAM service IDs
-   
-3. **Monitoring Blind Spots**
-   - Mitigation: Comprehensive metrics, distributed tracing
+## Benchmark Architecture
 
-## Future Enhancements
+The formal benchmark suite runs outside the gateway against a mounted export.
+It records human-readable summaries, JSON, CSV, baseline files, environment
+capture, and monitor samples.
 
-### Short-term (3-6 months)
-- NFSv4 support
-- Read-write cache with write-back mode
-- Distributed cache using Redis
-- Advanced access control (Kerberos)
+Benchmark categories cover:
 
-### Long-term (6-12 months)
-- Multi-bucket support
-- Cross-region replication awareness
-- AI-powered cache optimization
-- Integration with IBM Cloud monitoring services
-- Support for IBM Cloud Code Engine deployment
+- frontend write performance.
+- time-to-durable in COS and sync throughput.
+- cold and warm reads.
+- range, random, and large sequential reads.
+- backpressure behavior.
+- small-file workloads.
+- crash safety.
+- mixed dirty-read and concurrent workloads.
 
-## References
-
-### AWS S3 Files
-- AWS S3 Files provides managed NFS access to S3 buckets
-- Key features: POSIX compliance, file locking, metadata handling
-- Performance: Optimized for cloud-native workloads
-
-### IBM Cloud COS
-- S3-compatible object storage
-- Regional and cross-region buckets
-- IAM integration
-- High durability and availability
-
-### Related Projects
-- s3fs-fuse: FUSE-based S3 filesystem
-- goofys: High-performance S3 filesystem in Go
-- go-nfs: NFS server implementation in Go
-- minio: S3-compatible object storage with gateway mode
+See `docs/BENCHMARK_SUITE.md` for benchmark operation details.
