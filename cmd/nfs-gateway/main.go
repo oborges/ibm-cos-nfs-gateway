@@ -15,6 +15,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/cos"
+	"github.com/oborges/cos-nfs-gateway/internal/dashboard"
 	"github.com/oborges/cos-nfs-gateway/internal/feature"
 	"github.com/oborges/cos-nfs-gateway/internal/health"
 	"github.com/oborges/cos-nfs-gateway/internal/lock"
@@ -276,6 +277,32 @@ func main() {
 		json.NewEncoder(w).Encode(stats)
 	})
 
+	// Add consolidated dashboard endpoint
+	http.HandleFunc("/debug/dashboard/data", func(w http.ResponseWriter, r *http.Request) {
+		syncStats := map[string]interface{}{
+			"enabled": false,
+		}
+		if syncWorker != nil {
+			syncStats = syncWorker.Stats()
+			syncStats["enabled"] = true
+		}
+
+		payload := map[string]interface{}{
+			"sync":         syncStats,
+			"performance":  metrics.GetGlobalCounters().GetReport(),
+			"transfers":    metrics.GetTransferReport(),
+			"generated_at": time.Now().Format(time.RFC3339Nano),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(payload)
+	})
+
+	http.Handle("/dashboard/", http.StripPrefix("/dashboard/", dashboard.Handler()))
+	http.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/dashboard/", http.StatusTemporaryRedirect)
+	})
+
 	// Add reset endpoint
 	http.HandleFunc("/debug/perf/reset", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -353,6 +380,7 @@ func main() {
 	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/perf - Overall metrics", cfg.Server.DebugPort))
 	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/perf/paths - Per-path statistics", cfg.Server.DebugPort))
 	logging.Info(fmt.Sprintf("  http://localhost:%d/debug/staging/sync - Staging sync queue and upload metrics", cfg.Server.DebugPort))
+	logging.Info(fmt.Sprintf("  http://localhost:%d/dashboard/ - End-user sync dashboard", cfg.Server.DebugPort))
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

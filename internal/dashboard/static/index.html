@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>COS NFS Gateway Dashboard</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">IBM Cloud COS NFS Gateway</p>
+          <h1>Sync Dashboard</h1>
+        </div>
+        <div class="status-pill" id="connectionStatus">
+          <span></span>
+          Connecting
+        </div>
+      </header>
+
+      <section class="hero-grid">
+        <article class="metric-card primary">
+          <div>
+            <p>Total Uploaded</p>
+            <strong id="totalUploaded">0 B</strong>
+          </div>
+          <small id="uploadedRate">0 MiB/s last upload</small>
+        </article>
+        <article class="metric-card">
+          <div>
+            <p>Total Downloaded</p>
+            <strong id="totalDownloaded">0 B</strong>
+          </div>
+          <small id="readCalls">0 COS reads</small>
+        </article>
+        <article class="metric-card">
+          <div>
+            <p>Sync Backlog</p>
+            <strong id="queueDepth">0 files</strong>
+          </div>
+          <small id="queueBytes">0 B waiting</small>
+        </article>
+        <article class="metric-card">
+          <div>
+            <p>Staging Pressure</p>
+            <strong id="pressureLevel">Normal</strong>
+          </div>
+          <small id="stagingUsage">0 B staged</small>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel wide">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Overall Process</p>
+              <h2>Live Sync Flow</h2>
+            </div>
+            <span id="lastUpdated">Waiting for data</span>
+          </div>
+          <div class="flow">
+            <div class="flow-node">
+              <span id="dirtyCount">0</span>
+              <small>Queued</small>
+            </div>
+            <div class="flow-line"><i id="queuePulse"></i></div>
+            <div class="flow-node accent">
+              <span id="syncingCount">0</span>
+              <small>Syncing</small>
+            </div>
+            <div class="flow-line"><i></i></div>
+            <div class="flow-node done">
+              <span id="syncedCount">0</span>
+              <small>Synced</small>
+            </div>
+          </div>
+          <canvas id="historyChart" height="150" aria-label="Sync backlog history"></canvas>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Capacity</p>
+              <h2>Staging Disk</h2>
+            </div>
+          </div>
+          <div class="donut-wrap">
+            <canvas id="capacityChart" width="220" height="220" aria-label="Staging disk usage"></canvas>
+            <div class="donut-label">
+              <strong id="capacityPercent">0%</strong>
+              <span>used</span>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Transfers</p>
+              <h2>Upload vs Download</h2>
+            </div>
+          </div>
+          <canvas id="transferChart" height="240" aria-label="Upload and download totals"></canvas>
+        </article>
+      </section>
+
+      <section class="tables-grid">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Active Work</p>
+              <h2>Files Still Syncing</h2>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Status</th>
+                  <th>Size</th>
+                  <th>Progress</th>
+                </tr>
+              </thead>
+              <tbody id="pendingFiles"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Completed</p>
+              <h2>Files Synced</h2>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Uploaded</th>
+                  <th>Throughput</th>
+                  <th>Finished</th>
+                </tr>
+              </thead>
+              <tbody id="syncedFiles"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

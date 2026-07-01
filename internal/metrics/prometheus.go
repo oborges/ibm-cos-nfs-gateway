@@ -304,11 +304,13 @@ func RecordCacheEviction(cacheType string) {
 // RecordBytesRead records bytes read
 func RecordBytesRead(bytes int64) {
 	bytesReadTotal.Add(float64(bytes))
+	RecordBytesReadCounter(bytes)
 }
 
 // RecordBytesWritten records bytes written
 func RecordBytesWritten(bytes int64) {
 	bytesWrittenTotal.Add(float64(bytes))
+	RecordBytesWrittenCounter(bytes)
 }
 
 // SetActiveConnections sets the number of active connections

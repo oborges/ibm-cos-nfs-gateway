@@ -52,6 +52,7 @@ type SyncWorker struct {
 	totalSyncedFiles   int64
 	totalUploadedBytes int64
 	lastSync           syncObservation
+	recentSyncs        []syncObservation
 }
 
 type uploadAccumulator struct {
@@ -574,13 +575,18 @@ func (sw *SyncWorker) recordSuccessfulSync(path string, uploadedBytes int64, dir
 	sw.uploadMu.Lock()
 	sw.totalSyncedFiles++
 	sw.totalUploadedBytes += uploadedBytes
-	sw.lastSync = syncObservation{
+	observation := syncObservation{
 		Path:              path,
 		SizeBytes:         uploadedBytes,
 		UploadDuration:    uploadDuration,
 		VisibilityLatency: visibilityLatency,
 		ThroughputMiBps:   throughputMiBps,
 		CompletedAt:       time.Now(),
+	}
+	sw.lastSync = observation
+	sw.recentSyncs = append([]syncObservation{observation}, sw.recentSyncs...)
+	if len(sw.recentSyncs) > 50 {
+		sw.recentSyncs = sw.recentSyncs[:50]
 	}
 	sw.uploadMu.Unlock()
 
@@ -713,18 +719,45 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 
 	totalSize := int64(0)
 	oldestDirty := time.Time{}
+	now := time.Now()
+	pendingFiles := make([]map[string]interface{}, 0, len(dirtyFiles))
+
+	sort.Slice(dirtyFiles, func(i, j int) bool {
+		return dirtyFiles[i].DirtySince.Before(dirtyFiles[j].DirtySince)
+	})
 
 	for _, metadata := range dirtyFiles {
 		totalSize += metadata.Size
 		if oldestDirty.IsZero() || metadata.DirtySince.Before(oldestDirty) {
 			oldestDirty = metadata.DirtySince
 		}
+		syncing := sw.manager.dirtyIndex.IsSyncing(metadata.Path)
+		status := "queued"
+		progress := 0
+		if syncing {
+			status = "syncing"
+			progress = 65
+		}
+		entry := map[string]interface{}{
+			"path":             metadata.Path,
+			"size_bytes":       metadata.Size,
+			"dirty_since":      metadata.DirtySince.Format(time.RFC3339Nano),
+			"age_seconds":      now.Sub(metadata.DirtySince).Seconds(),
+			"sync_attempts":    metadata.SyncAttempts,
+			"status":           status,
+			"progress_percent": progress,
+		}
+		if metadata.LastSyncError != nil {
+			entry["last_error"] = metadata.LastSyncError.Error()
+		}
+		pendingFiles = append(pendingFiles, entry)
 	}
 
 	depth, queueBytes, oldestAge := sw.manager.SyncQueueStats()
 	pressure := sw.manager.CurrentPressure()
 	sw.uploadMu.Lock()
 	lastSync := sw.lastSync
+	recentSyncs := append([]syncObservation(nil), sw.recentSyncs...)
 	totalSyncedFiles := sw.totalSyncedFiles
 	totalUploadedBytes := sw.totalUploadedBytes
 	sw.uploadMu.Unlock()
@@ -741,6 +774,8 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 		"staging_used_bytes":      pressure.UsedBytes,
 		"staging_available_bytes": pressure.AvailableBytes,
 		"staging_pressure_level":  pressure.Level,
+		"pending_files":           pendingFiles,
+		"recent_synced_files":     formatSyncObservations(recentSyncs),
 	}
 
 	if !oldestDirty.IsZero() {
@@ -761,6 +796,23 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+func formatSyncObservations(observations []syncObservation) []map[string]interface{} {
+	files := make([]map[string]interface{}, 0, len(observations))
+	for _, observation := range observations {
+		files = append(files, map[string]interface{}{
+			"path":                           observation.Path,
+			"bytes":                          observation.SizeBytes,
+			"upload_duration_seconds":        observation.UploadDuration.Seconds(),
+			"cos_visibility_latency_seconds": observation.VisibilityLatency.Seconds(),
+			"upload_mib_per_second":          observation.ThroughputMiBps,
+			"completed_at":                   observation.CompletedAt.Format(time.RFC3339Nano),
+			"status":                         "synced",
+			"progress_percent":               100,
+		})
+	}
+	return files
 }
 
 // processMultipartFiles processes progressive multi-part chunk streaming

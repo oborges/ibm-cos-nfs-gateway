@@ -9,28 +9,32 @@ import (
 // PerformanceCounters tracks detailed performance metrics
 type PerformanceCounters struct {
 	// ReadDir metrics
-	ReadDirCalls       atomic.Int64
-	ReadDirTotalTime   atomic.Int64 // nanoseconds
-	ReadDirMaxTime     atomic.Int64 // nanoseconds
-	
+	ReadDirCalls     atomic.Int64
+	ReadDirTotalTime atomic.Int64 // nanoseconds
+	ReadDirMaxTime   atomic.Int64 // nanoseconds
+
 	// ListDirectory metrics
 	ListDirCalls       atomic.Int64
 	ListDirCacheHits   atomic.Int64
 	ListDirCacheMisses atomic.Int64
 	ListDirTotalTime   atomic.Int64 // nanoseconds
-	
+
 	// COS operation metrics
-	COSListObjects     atomic.Int64
-	COSHeadObject      atomic.Int64
-	COSGetObject       atomic.Int64
-	
+	COSListObjects atomic.Int64
+	COSHeadObject  atomic.Int64
+	COSGetObject   atomic.Int64
+
+	// Transfer metrics
+	BytesRead    atomic.Int64
+	BytesWritten atomic.Int64
+
 	// Conversion metrics
-	ConversionTime     atomic.Int64 // nanoseconds
-	
+	ConversionTime atomic.Int64 // nanoseconds
+
 	// Per-path tracking
-	pathCalls          sync.Map // map[string]*int64
-	mu                 sync.Mutex
-	startTime          time.Time
+	pathCalls sync.Map // map[string]*int64
+	mu        sync.Mutex
+	startTime time.Time
 }
 
 var globalCounters = &PerformanceCounters{
@@ -54,7 +58,7 @@ func RecordReadDir(duration time.Duration) {
 	globalCounters.ReadDirCalls.Add(1)
 	nanos := duration.Nanoseconds()
 	globalCounters.ReadDirTotalTime.Add(nanos)
-	
+
 	// Update max time
 	for {
 		oldMax := globalCounters.ReadDirMaxTime.Load()
@@ -93,6 +97,28 @@ func RecordCOSGetObject() {
 	globalCounters.COSGetObject.Add(1)
 }
 
+// RecordBytesReadCounter records bytes read in the debug counters.
+func RecordBytesReadCounter(bytes int64) {
+	if bytes > 0 {
+		globalCounters.BytesRead.Add(bytes)
+	}
+}
+
+// RecordBytesWrittenCounter records bytes written in the debug counters.
+func RecordBytesWrittenCounter(bytes int64) {
+	if bytes > 0 {
+		globalCounters.BytesWritten.Add(bytes)
+	}
+}
+
+// GetTransferReport returns aggregate transfer counters for debug consumers.
+func GetTransferReport() map[string]interface{} {
+	return map[string]interface{}{
+		"bytes_read_total":    globalCounters.BytesRead.Load(),
+		"bytes_written_total": globalCounters.BytesWritten.Load(),
+	}
+}
+
 // RecordConversion records time spent in conversion
 func RecordConversion(duration time.Duration) {
 	globalCounters.ConversionTime.Add(duration.Nanoseconds())
@@ -118,39 +144,43 @@ func (pc *PerformanceCounters) GetPathCallCount(path string) int64 {
 func (pc *PerformanceCounters) GetReport() map[string]interface{} {
 	readDirCalls := pc.ReadDirCalls.Load()
 	listDirCalls := pc.ListDirCalls.Load()
-	
+
 	avgReadDir := int64(0)
 	if readDirCalls > 0 {
 		avgReadDir = pc.ReadDirTotalTime.Load() / readDirCalls
 	}
-	
+
 	avgListDir := int64(0)
 	if listDirCalls > 0 {
 		avgListDir = pc.ListDirTotalTime.Load() / listDirCalls
 	}
-	
+
 	return map[string]interface{}{
 		"uptime_seconds": time.Since(pc.startTime).Seconds(),
 		"readdir": map[string]interface{}{
-			"total_calls":      readDirCalls,
-			"avg_latency_ms":   float64(avgReadDir) / 1e6,
-			"max_latency_ms":   float64(pc.ReadDirMaxTime.Load()) / 1e6,
-			"total_time_ms":    float64(pc.ReadDirTotalTime.Load()) / 1e6,
+			"total_calls":    readDirCalls,
+			"avg_latency_ms": float64(avgReadDir) / 1e6,
+			"max_latency_ms": float64(pc.ReadDirMaxTime.Load()) / 1e6,
+			"total_time_ms":  float64(pc.ReadDirTotalTime.Load()) / 1e6,
 		},
 		"listdirectory": map[string]interface{}{
-			"total_calls":      listDirCalls,
-			"cache_hits":       pc.ListDirCacheHits.Load(),
-			"cache_misses":     pc.ListDirCacheMisses.Load(),
-			"avg_latency_ms":   float64(avgListDir) / 1e6,
-			"total_time_ms":    float64(pc.ListDirTotalTime.Load()) / 1e6,
+			"total_calls":    listDirCalls,
+			"cache_hits":     pc.ListDirCacheHits.Load(),
+			"cache_misses":   pc.ListDirCacheMisses.Load(),
+			"avg_latency_ms": float64(avgListDir) / 1e6,
+			"total_time_ms":  float64(pc.ListDirTotalTime.Load()) / 1e6,
 		},
 		"cos_operations": map[string]interface{}{
-			"list_objects":     pc.COSListObjects.Load(),
-			"head_object":      pc.COSHeadObject.Load(),
-			"get_object":       pc.COSGetObject.Load(),
+			"list_objects": pc.COSListObjects.Load(),
+			"head_object":  pc.COSHeadObject.Load(),
+			"get_object":   pc.COSGetObject.Load(),
+		},
+		"transfers": map[string]interface{}{
+			"bytes_read_total":    pc.BytesRead.Load(),
+			"bytes_written_total": pc.BytesWritten.Load(),
 		},
 		"conversion": map[string]interface{}{
-			"total_time_ms":    float64(pc.ConversionTime.Load()) / 1e6,
+			"total_time_ms": float64(pc.ConversionTime.Load()) / 1e6,
 		},
 	}
 }
