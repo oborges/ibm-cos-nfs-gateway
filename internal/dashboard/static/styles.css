@@ -10,7 +10,7 @@
   --blue: #266bd3;
   --amber: #d18a00;
   --red: #ce3d3d;
-  --shadow: 0 18px 48px rgba(23, 32, 42, 0.11);
+  --shadow: 0 12px 30px rgba(23, 32, 42, 0.08);
 }
 
 * {
@@ -28,9 +28,9 @@ body {
 }
 
 .shell {
-  width: min(1500px, calc(100% - 40px));
+  width: min(1440px, calc(100% - 40px));
   margin: 0 auto;
-  padding: 28px 0 42px;
+  padding: 22px 0 36px;
 }
 
 .topbar,
@@ -66,7 +66,7 @@ h2 {
 }
 
 h1 {
-  font-size: clamp(30px, 4vw, 52px);
+  font-size: clamp(30px, 4vw, 46px);
   line-height: 1;
 }
 
@@ -113,12 +113,13 @@ h2 {
 
 .hero-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 
 .content-grid {
-  grid-template-columns: minmax(0, 1.45fr) minmax(260px, 0.55fr) minmax(260px, 0.55fr);
-  margin-bottom: 16px;
+  grid-template-columns: minmax(520px, 1.35fr) minmax(260px, 0.5fr) minmax(300px, 0.55fr);
+  align-items: stretch;
+  margin-bottom: 14px;
 }
 
 .tables-grid {
@@ -137,8 +138,8 @@ h2 {
 .metric-card {
   justify-content: space-between;
   gap: 16px;
-  min-height: 130px;
-  padding: 20px;
+  min-height: 112px;
+  padding: 18px;
   overflow: hidden;
 }
 
@@ -166,8 +167,12 @@ h2 {
 
 .metric-card strong {
   display: block;
-  font-size: clamp(24px, 3vw, 38px);
+  font-size: clamp(24px, 3vw, 34px);
   line-height: 1.05;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .metric-card small {
@@ -180,10 +185,11 @@ h2 {
 .panel {
   min-width: 0;
   padding: 18px;
+  overflow: hidden;
 }
 
 .panel.wide {
-  min-height: 360px;
+  min-height: 326px;
 }
 
 .panel-head {
@@ -199,23 +205,35 @@ h2 {
 }
 
 .flow {
-  gap: 12px;
-  margin: 12px 0 22px;
+  display: grid;
+  grid-template-columns: minmax(82px, 104px) minmax(90px, 1fr) minmax(82px, 104px) minmax(90px, 1fr) minmax(82px, 104px);
+  gap: 14px;
+  margin: 10px 0 18px;
+  width: 100%;
 }
 
 .flow-node {
   justify-content: center;
   flex-direction: column;
-  width: 108px;
-  aspect-ratio: 1;
+  width: 100%;
+  min-width: 0;
+  height: 86px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #f8fbfd;
+  padding: 10px;
 }
 
 .flow-node span {
-  font-size: 34px;
+  width: 100%;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: clamp(23px, 3.5vw, 32px);
   font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 
 .flow-node small {
@@ -235,7 +253,8 @@ h2 {
 
 .flow-line {
   position: relative;
-  flex: 1;
+  align-self: center;
+  min-width: 0;
   height: 8px;
   border-radius: 8px;
   background: #dce8f0;
@@ -259,13 +278,37 @@ h2 {
 canvas {
   display: block;
   width: 100%;
+  height: 100%;
   max-width: 100%;
+}
+
+.chart-frame {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(248,251,253,0.78), rgba(255,255,255,0.96));
+}
+
+.history-frame {
+  height: 142px;
+}
+
+.donut-frame {
+  width: min(220px, 100%);
+  height: 220px;
+}
+
+.transfer-frame {
+  height: 218px;
 }
 
 .donut-wrap {
   position: relative;
   justify-content: center;
-  min-height: 252px;
+  min-height: 236px;
 }
 
 .donut-label {
@@ -400,16 +443,20 @@ td {
   }
 
   .flow {
-    flex-direction: column;
+    grid-template-columns: 1fr;
+    gap: 10px;
   }
 
   .flow-node {
-    width: 100%;
-    aspect-ratio: auto;
-    min-height: 82px;
+    height: 74px;
   }
 
   .flow-line {
-    height: 30px;
+    height: 8px;
+  }
+
+  .history-frame,
+  .transfer-frame {
+    height: 170px;
   }
 }

@@ -75,7 +75,9 @@
               <small>Synced</small>
             </div>
           </div>
-          <canvas id="historyChart" height="150" aria-label="Sync backlog history"></canvas>
+          <div class="chart-frame history-frame">
+            <canvas id="historyChart" aria-label="Sync backlog history"></canvas>
+          </div>
         </article>
 
         <article class="panel">
@@ -86,7 +88,9 @@
             </div>
           </div>
           <div class="donut-wrap">
-            <canvas id="capacityChart" width="220" height="220" aria-label="Staging disk usage"></canvas>
+            <div class="chart-frame donut-frame">
+              <canvas id="capacityChart" aria-label="Staging disk usage"></canvas>
+            </div>
             <div class="donut-label">
               <strong id="capacityPercent">0%</strong>
               <span>used</span>
@@ -101,7 +105,9 @@
               <h2>Upload vs Download</h2>
             </div>
           </div>
-          <canvas id="transferChart" height="240" aria-label="Upload and download totals"></canvas>
+          <div class="chart-frame transfer-frame">
+            <canvas id="transferChart" aria-label="Upload and download totals"></canvas>
+          </div>
         </article>
       </section>
 

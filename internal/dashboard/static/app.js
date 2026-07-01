@@ -156,19 +156,25 @@ function escapeHtml(value) {
 }
 
 function canvasContext(canvas) {
-  const rect = canvas.getBoundingClientRect();
+  const frame = canvas.parentElement || canvas;
+  const rect = frame.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.floor(rect.width * ratio));
-  canvas.height = Math.max(1, Math.floor(Number(canvas.getAttribute("height")) * ratio));
+  const width = Math.max(1, rect.width);
+  const height = Math.max(1, rect.height);
+  canvas.width = Math.floor(width * ratio);
+  canvas.height = Math.floor(height * ratio);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  return { ctx, width: rect.width, height: Number(canvas.getAttribute("height")) };
+  return { ctx, width, height };
 }
 
 function drawHistoryChart() {
   const { ctx, width, height } = canvasContext(historyCanvas);
   ctx.clearRect(0, 0, width, height);
   drawGrid(ctx, width, height);
+  drawAxisLabel(ctx, width, height, "Sync backlog");
   drawLine(ctx, width, height, state.queue, "#008c95", true);
 }
 
@@ -203,12 +209,12 @@ function drawTransferChart(uploaded, downloaded, written) {
     { label: "Written", value: written, color: "#d18a00" },
   ];
   const max = Math.max(...values.map((item) => item.value), 1);
-  const barWidth = Math.min(72, width / 6);
+  const barWidth = Math.min(58, width / 6);
   const gap = (width - values.length * barWidth) / (values.length + 1);
   values.forEach((item, index) => {
     const x = gap + index * (barWidth + gap);
-    const barHeight = (height - 70) * (item.value / max);
-    const y = height - 44 - barHeight;
+    const barHeight = Math.max(3, (height - 76) * (item.value / max));
+    const y = height - 42 - barHeight;
     ctx.fillStyle = item.color;
     roundRect(ctx, x, y, barWidth, barHeight, 8);
     ctx.fill();
@@ -219,6 +225,16 @@ function drawTransferChart(uploaded, downloaded, written) {
     ctx.fillStyle = "#5c6876";
     ctx.fillText(formatBytes(item.value), x + barWidth / 2, Math.max(18, y - 8));
   });
+}
+
+function drawAxisLabel(ctx, width, height, label) {
+  ctx.fillStyle = "#5c6876";
+  ctx.font = "700 11px system-ui";
+  ctx.textAlign = "left";
+  ctx.fillText(label, 10, 18);
+  ctx.textAlign = "right";
+  const latest = state.queue[state.queue.length - 1] || 0;
+  ctx.fillText(formatBytes(latest), width - 10, 18);
 }
 
 function drawGrid(ctx, width, height) {
@@ -236,10 +252,12 @@ function drawGrid(ctx, width, height) {
 function drawLine(ctx, width, height, values, color, fill) {
   if (!values.length) return;
   const max = Math.max(...values, 1);
-  const pad = 8;
+  const pad = 10;
+  const topPad = 26;
+  const bottomPad = 10;
   const points = values.map((value, index) => ({
     x: values.length === 1 ? pad : pad + (index / (values.length - 1)) * (width - pad * 2),
-    y: height - pad - (Number(value || 0) / max) * (height - pad * 2),
+    y: height - bottomPad - (Number(value || 0) / max) * (height - topPad - bottomPad),
   }));
   ctx.strokeStyle = color;
   ctx.lineWidth = 3;
@@ -250,8 +268,8 @@ function drawLine(ctx, width, height, values, color, fill) {
   });
   ctx.stroke();
   if (!fill) return;
-  ctx.lineTo(points[points.length - 1].x, height - pad);
-  ctx.lineTo(points[0].x, height - pad);
+  ctx.lineTo(points[points.length - 1].x, height - bottomPad);
+  ctx.lineTo(points[0].x, height - bottomPad);
   ctx.closePath();
   const gradient = ctx.createLinearGradient(0, 0, 0, height);
   gradient.addColorStop(0, "rgba(0, 140, 149, 0.22)");
