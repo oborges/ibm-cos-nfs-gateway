@@ -126,6 +126,19 @@ Run the gateway:
 sudo ./bin/nfs-gateway --config configs/config.yaml
 ```
 
+Or install it as a Linux `systemd` service:
+
+```bash
+sudo ./scripts/install-linux-service.sh --build
+sudoedit /etc/nfs-gateway/config.yaml
+sudo systemctl enable --now nfs-gateway
+```
+
+The installer creates a dedicated `nfs-gateway` system user, installs the unit
+file, preserves existing config by default, and prepares cache and staging
+directories. See [Linux Service Installation](docs/LINUX_SERVICE.md) for the
+operator runbook.
+
 Mount it from the same Linux host:
 
 ```bash

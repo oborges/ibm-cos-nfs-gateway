@@ -1,0 +1,49 @@
+[Unit]
+Description=IBM Cloud COS NFS Gateway
+Documentation=https://github.com/oborges/ibm-cos-nfs-gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nfs-gateway
+Group=nfs-gateway
+Environment=NFS_GATEWAY_CONFIG=/etc/nfs-gateway/config.yaml
+EnvironmentFile=-/etc/default/nfs-gateway
+ExecStart=/usr/local/bin/nfs-gateway --config ${NFS_GATEWAY_CONFIG}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+KillSignal=SIGTERM
+LimitNOFILE=1048576
+UMask=0027
+
+# Allow the unprivileged service user to bind the default NFS port, TCP/2049.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Keep the service tightly scoped while preserving writable cache/staging state.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/cache/nfs-gateway /var/staging/nfs-gateway /var/log/nfs-gateway
+CacheDirectory=nfs-gateway
+LogsDirectory=nfs-gateway
+RuntimeDirectory=nfs-gateway
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

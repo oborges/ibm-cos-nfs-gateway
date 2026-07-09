@@ -1,4 +1,4 @@
-.PHONY: all build test clean install run docker-build docker-push k8s-deploy benchmark-suite help
+.PHONY: all build test clean install install-service run docker-build docker-push k8s-deploy benchmark-suite help
 
 # Variables
 BINARY_NAME=nfs-gateway
@@ -75,6 +75,11 @@ install:
 	@echo "Installing dependencies..."
 	${GO} mod download
 	${GO} mod tidy
+
+# Install as a Linux systemd service
+install-service:
+	@echo "Installing ${BINARY_NAME} as a Linux systemd service..."
+	./scripts/install-linux-service.sh --build
 
 # Run the application
 run:
@@ -160,6 +165,7 @@ help:
 	@echo "  make benchmark-suite - Run mounted gateway benchmark suite"
 	@echo "  make clean           - Clean build artifacts"
 	@echo "  make install         - Install dependencies"
+	@echo "  make install-service - Install as a Linux systemd service"
 	@echo "  make run             - Run the application"
 	@echo "  make run-dev         - Run in development mode"
 	@echo "  make fmt             - Format code"

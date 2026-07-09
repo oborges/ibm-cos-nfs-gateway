@@ -9,7 +9,44 @@ The IBM Cloud COS NFS Gateway provides NFS filesystem access to IBM Cloud Object
 - IBM Cloud account with COS service
 - IBM Cloud API key or HMAC credentials
 - COS bucket created
-- Docker or Kubernetes cluster (for deployment)
+- Docker, Kubernetes cluster, or a Linux host with systemd (for deployment)
+
+## Quick Start with Linux systemd
+
+### 1. Install the Service
+
+```bash
+git clone https://github.com/oborges/ibm-cos-nfs-gateway.git
+cd ibm-cos-nfs-gateway
+sudo ./scripts/install-linux-service.sh --build
+```
+
+### 2. Configure COS
+
+```bash
+sudoedit /etc/nfs-gateway/config.yaml
+```
+
+Set your COS endpoint, bucket, region, and credentials. Secrets may also be
+placed in `/etc/default/nfs-gateway` as `NFS_GATEWAY_` environment overrides.
+
+### 3. Start the Service
+
+```bash
+sudo systemctl enable --now nfs-gateway
+sudo systemctl status nfs-gateway
+sudo journalctl -u nfs-gateway -f
+```
+
+### 4. Mount the Export
+
+```bash
+sudo mkdir -p /mnt/cos
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos
+```
+
+For service hardening details, custom staging/cache paths, and upgrade notes,
+see [Linux Service Installation](LINUX_SERVICE.md).
 
 ## Quick Start with Docker
 
