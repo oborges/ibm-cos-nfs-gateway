@@ -13,7 +13,7 @@ sudo env NFS_GATEWAY_STAGING_ENABLED=true NFS_GATEWAY_STAGING_ROOT_DIR=/tmp/nfs-
 sleep 5
 
 echo "Mounting natively to COS..."
-sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs
 
 echo "Executing custom metrics evaluation dashboard..."
 sudo ./scripts/run_stress_tests.sh

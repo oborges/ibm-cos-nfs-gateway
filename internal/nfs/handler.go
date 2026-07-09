@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v5"
@@ -574,17 +575,29 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 	oldFull := fs.Join(fs.root, oldpath)
 	newFull := fs.Join(fs.root, newpath)
+	if err := fs.ensureNoDirtyStagedData("rename", oldFull); err != nil {
+		return err
+	}
+	if err := fs.ensureNoDirtyStagedData("rename", newFull); err != nil {
+		return err
+	}
 	return fs.ops.RenameFile(context.Background(), oldFull, newFull)
 }
 
 // Remove removes a file or directory
 func (fs *COSFilesystem) Remove(filename string) error {
 	fullPath := fs.Join(fs.root, filename)
+	if err := fs.ensureNoDirtyStagedData("remove", fullPath); err != nil {
+		return err
+	}
 
 	// Check if it's a directory (intercepting Staging files via fs.Stat)
 	info, err := fs.Stat(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if dirtyErr := fs.ensureNoDirtyStagedData("remove", fullPath); dirtyErr != nil {
+				return dirtyErr
+			}
 			fs.logger.Debug("Remove called on non-existent path (likely implicit directory), treating as success", zap.String("path", fullPath))
 			return nil
 		}
@@ -592,22 +605,68 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	}
 
 	if info.IsDir() {
+		if err := fs.ensureNoDirtyStagedData("rmdir", fullPath); err != nil {
+			return err
+		}
 		return fs.ops.DeleteDirectory(context.Background(), fullPath)
 	}
 
-	// Before deleting file, cleanup any active sessions to prevent data loss
-	// This ensures any buffered writes are flushed to COS before deletion
-	if err := fs.cleanupSessionsBeforeDelete(fullPath); err != nil {
-		fs.logger.Error("Failed to cleanup sessions before delete",
-			zap.String("path", fullPath),
-			zap.Error(err))
-		// Continue with deletion anyway - session cleanup is best-effort
+	if err := fs.ensureNoDirtyStagedData("delete", fullPath); err != nil {
+		return err
 	}
 
-	return fs.ops.DeleteFile(context.Background(), fullPath)
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() {
+		if err := fs.cleanupSessionsBeforeDelete(fullPath); err != nil {
+			fs.logger.Error("Failed to cleanup sessions before delete",
+				zap.String("path", fullPath),
+				zap.Error(err))
+			return err
+		}
+	}
+
+	if err := fs.ops.DeleteFile(context.Background(), fullPath); err != nil {
+		return err
+	}
+
+	fs.cleanupCleanStagingSessionAfterDelete(fullPath)
+	return nil
 }
 
-// cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion
+func (fs *COSFilesystem) ensureNoDirtyStagedData(op, path string) error {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return nil
+	}
+
+	dirtyPaths := fs.stagingManager.DirtyPathsUnder(path)
+	if len(dirtyPaths) == 0 {
+		return nil
+	}
+
+	return &os.PathError{
+		Op:   op,
+		Path: path,
+		Err:  fmt.Errorf("dirty staged data exists at %s; wait for sync before %s: %w", strings.Join(dirtyPaths, ","), op, syscall.EBUSY),
+	}
+}
+
+func (fs *COSFilesystem) cleanupCleanStagingSessionAfterDelete(path string) {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return
+	}
+	if dirtyPaths := fs.stagingManager.DirtyPathsUnder(path); len(dirtyPaths) > 0 {
+		return
+	}
+	if _, exists := fs.stagingManager.GetSession(path); !exists {
+		return
+	}
+	if err := fs.stagingManager.CleanupSession(path, true); err != nil {
+		fs.logger.Error("Failed to cleanup clean staging session after delete",
+			zap.String("path", path),
+			zap.Error(err))
+	}
+}
+
+// cleanupSessionsBeforeDelete ensures any active sessions are flushed before file deletion.
 func (fs *COSFilesystem) cleanupSessionsBeforeDelete(path string) error {
 	ctx := context.Background()
 

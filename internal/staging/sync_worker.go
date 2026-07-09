@@ -153,6 +153,12 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 		if !sw.shouldSync(metadata) {
 			continue
 		}
+		if sw.manager.IsConflicted(metadata.Path) {
+			logging.Warn("Skipping sync for conflicted staged path",
+				zap.Int("worker_id", workerID),
+				zap.String("path", metadata.Path))
+			continue
+		}
 
 		if !sw.manager.dirtyIndex.LockFile(metadata.Path) {
 			continue
@@ -185,6 +191,10 @@ func (sw *SyncWorker) processDirtyFiles(workerID int) {
 
 // shouldSync determines if a file should be synced based on triggers
 func (sw *SyncWorker) shouldSync(metadata *DirtyFileMetadata) bool {
+	if sw.manager.IsConflicted(metadata.Path) {
+		return false
+	}
+
 	now := time.Now()
 	if !metadata.LastModified.IsZero() {
 		idleSinceModified := now.Sub(metadata.LastModified)
@@ -270,6 +280,10 @@ func (sw *SyncWorker) syncFileWithWorker(path string, workerID int) error {
 }
 
 func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
+	if sw.manager.IsConflicted(path) {
+		return fmt.Errorf("%w: %s", ErrPathConflicted, path)
+	}
+
 	// Get the session
 	session, exists := sw.manager.GetSession(path)
 	if !exists {
@@ -702,6 +716,10 @@ func (sw *SyncWorker) TriggerSync(path string) error {
 	unlockObject := sw.lockObject(path)
 	defer unlockObject()
 
+	if sw.manager.IsConflicted(path) {
+		return fmt.Errorf("%w: %s", ErrPathConflicted, path)
+	}
+
 	if !sw.manager.IsDirty(path) {
 		return nil // Nothing to sync
 	}
@@ -755,6 +773,7 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 
 	depth, queueBytes, oldestAge := sw.manager.SyncQueueStats()
 	pressure := sw.manager.CurrentPressure()
+	conflictCount, conflictedPaths, lastConflict := sw.manager.ConflictStats()
 	sw.uploadMu.Lock()
 	lastSync := sw.lastSync
 	recentSyncs := append([]syncObservation(nil), sw.recentSyncs...)
@@ -769,6 +788,8 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 		"sync_queue_depth":        depth,
 		"sync_queue_bytes":        queueBytes,
 		"syncing_files":           sw.manager.dirtyIndex.SyncingCount(),
+		"conflict_count":          conflictCount,
+		"conflicted_paths":        conflictedPaths,
 		"total_synced_files":      totalSyncedFiles,
 		"total_uploaded_bytes":    totalUploadedBytes,
 		"staging_used_bytes":      pressure.UsedBytes,
@@ -783,6 +804,9 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 	}
 	if oldestAge > 0 {
 		stats["oldest_dirty_age_seconds"] = oldestAge.Seconds()
+	}
+	if !lastConflict.IsZero() {
+		stats["last_conflict_time"] = lastConflict.Format(time.RFC3339Nano)
 	}
 	if !lastSync.CompletedAt.IsZero() {
 		stats["last_sync"] = map[string]interface{}{

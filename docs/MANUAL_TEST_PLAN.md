@@ -4,7 +4,7 @@ This document serves as the foundational validation runbook for the Gateway Daem
 
 Before starting, ensure your gateway is running and correctly mounted organically:
 ```bash
-sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
 ---

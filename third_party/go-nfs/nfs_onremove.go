@@ -3,7 +3,9 @@ package nfs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"syscall"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -54,6 +56,9 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		if os.IsPermission(err) {
 			return &NFSStatusError{NFSStatusAccess, err}
+		}
+		if errors.Is(err, syscall.EBUSY) {
+			return &NFSStatusError{NFSStatusJukebox, err}
 		}
 		return &NFSStatusError{NFSStatusIO, err}
 	}

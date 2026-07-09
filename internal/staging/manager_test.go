@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 )
@@ -166,6 +167,76 @@ func TestStagingManager_MarkClean(t *testing.T) {
 	dirtyFiles := manager.GetDirtyFiles()
 	if len(dirtyFiles) != 0 {
 		t.Errorf("Expected 0 dirty files, got %d", len(dirtyFiles))
+	}
+}
+
+func TestStagingManager_RecordConflictPreservesLocalStagedContent(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/test/conflicted.txt"
+	localData := []byte("local dirty data")
+
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write(localData, 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	activePath := session.StagingPath
+	manager.MarkDirty(path, int64(len(localData)))
+
+	conflict, err := manager.RecordConflict(path, ExternalChangeSnapshot{
+		ObjectKey:    "test/conflicted.txt",
+		Size:         22,
+		ETag:         `"external"`,
+		LastModified: time.Unix(200, 0),
+		Reason:       "test_external_change",
+	})
+	if err != nil {
+		t.Fatalf("RecordConflict() error = %v", err)
+	}
+	if conflict == nil {
+		t.Fatal("RecordConflict() returned nil conflict")
+	}
+
+	preserved, err := os.ReadFile(conflict.PreservedPath)
+	if err != nil {
+		t.Fatalf("Read preserved conflict file error = %v", err)
+	}
+	if string(preserved) != string(localData) {
+		t.Fatalf("preserved data = %q, want %q", preserved, localData)
+	}
+	if _, err := os.Stat(conflict.PreservedMetadataPath); err != nil {
+		t.Fatalf("conflict metadata was not written: %v", err)
+	}
+	if _, err := os.Stat(activePath); !os.IsNotExist(err) {
+		t.Fatalf("active staging file should be removed after preservation, stat err = %v", err)
+	}
+	if manager.IsDirty(path) {
+		t.Fatal("conflicted path should be removed from dirty sync queue")
+	}
+	if !manager.IsConflicted(path) {
+		t.Fatal("path should have an unresolved conflict record")
+	}
+	if _, exists := manager.GetSession(path); exists {
+		t.Fatal("conflicted path should not expose the old staging session")
+	}
+
+	count, paths, last := manager.ConflictStats()
+	if count != 1 || len(paths) != 1 || paths[0] != path {
+		t.Fatalf("ConflictStats() = count %d paths %v, want one %s", count, paths, path)
+	}
+	if last.IsZero() {
+		t.Fatal("last conflict time should be set")
 	}
 }
 
@@ -463,6 +534,178 @@ func TestStagingManager_RecoverFromDisk(t *testing.T) {
 
 	// Recovery should not fail (though it may not fully restore state in MVP)
 	// This test mainly ensures RecoverFromDisk doesn't panic
+}
+
+func TestStagingManager_RecoverFromDiskRestoresPathMetadataState(t *testing.T) {
+	cfg := createTestConfig(t)
+	path := "/test/recovered-state.txt"
+	data := []byte("durable dirty bytes")
+	observedLastModified := time.Unix(1234, 0).UTC()
+
+	manager1, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+
+	session, err := manager1.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write(data, 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	manager1.MarkDirty(path, int64(len(data)))
+
+	state, err := readPathMetadataState(session.StagingPath + ".metadata")
+	if err != nil {
+		t.Fatalf("readPathMetadataState() error = %v", err)
+	}
+	state.ObservedETag = `"before-write"`
+	state.ObservedSize = 99
+	state.ObservedLastModified = observedLastModified
+	if err := writePathMetadataState(session.StagingPath+".metadata", state); err != nil {
+		t.Fatalf("writePathMetadataState() error = %v", err)
+	}
+
+	if err := manager1.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	manager2, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	defer manager2.Shutdown()
+
+	if !manager2.IsDirty(path) {
+		t.Fatal("Recovered path should be dirty")
+	}
+	dirty := manager2.GetDirtyFiles()
+	if len(dirty) != 1 {
+		t.Fatalf("dirty files = %d, want 1", len(dirty))
+	}
+	got := dirty[0]
+	if got.Path != path || got.ObjectKey != "test/recovered-state.txt" {
+		t.Fatalf("recovered path/object key = %q/%q", got.Path, got.ObjectKey)
+	}
+	if got.ObservedETag != `"before-write"` || got.ObservedSize != 99 || !got.ObservedLastModified.Equal(observedLastModified) {
+		t.Fatalf("observed state = etag %q size %d last_modified %v", got.ObservedETag, got.ObservedSize, got.ObservedLastModified)
+	}
+	if got.LocalDirtyGeneration != state.LocalDirtyGeneration {
+		t.Fatalf("dirty generation = %d, want %d", got.LocalDirtyGeneration, state.LocalDirtyGeneration)
+	}
+	if got.StagedPath != session.StagingPath {
+		t.Fatalf("staged path = %q, want %q", got.StagedPath, session.StagingPath)
+	}
+	if got.ConflictStatus != ConflictStatusNone {
+		t.Fatalf("conflict status = %q, want %q", got.ConflictStatus, ConflictStatusNone)
+	}
+}
+
+func TestStagingManager_RecoverFromDiskRemovesStaleMetadata(t *testing.T) {
+	cfg := createTestConfig(t)
+	path := "/test/stale-metadata.txt"
+
+	manager1, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	session, err := manager1.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("stale"), 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	manager1.MarkDirty(path, session.Size)
+	stagingPath := session.StagingPath
+	metadataPath := stagingPath + ".metadata"
+	if _, err := os.Stat(metadataPath); err != nil {
+		t.Fatalf("metadata should exist before stale recovery test: %v", err)
+	}
+	if err := manager1.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("failed to remove staged data file: %v", err)
+	}
+
+	manager2, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	defer manager2.Shutdown()
+
+	if manager2.IsDirty(path) {
+		t.Fatal("stale metadata without staged data should not recover as dirty")
+	}
+	if _, err := os.Stat(metadataPath); !os.IsNotExist(err) {
+		t.Fatalf("stale metadata should be removed, stat err = %v", err)
+	}
+}
+
+func TestStagingManager_RecoverFromDiskRestoresConflictState(t *testing.T) {
+	cfg := createTestConfig(t)
+	path := "/test/recovered-conflict.txt"
+
+	manager1, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	session, err := manager1.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("local conflicted bytes"), 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	manager1.MarkDirty(path, session.Size)
+	conflict, err := manager1.RecordConflict(path, ExternalChangeSnapshot{
+		ObjectKey:    "test/recovered-conflict.txt",
+		Size:         42,
+		ETag:         `"external-conflict"`,
+		LastModified: time.Unix(5678, 0).UTC(),
+		Reason:       "test_recovery",
+	})
+	if err != nil {
+		t.Fatalf("RecordConflict() error = %v", err)
+	}
+	if conflict == nil {
+		t.Fatal("RecordConflict() returned nil")
+	}
+	if err := manager1.Shutdown(); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	manager2, err := NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create staging manager: %v", err)
+	}
+	defer manager2.Shutdown()
+
+	if !manager2.IsConflicted(path) {
+		t.Fatal("conflict should be recovered after restart")
+	}
+	count, paths, _ := manager2.ConflictStats()
+	if count != 1 || len(paths) != 1 || paths[0] != path {
+		t.Fatalf("ConflictStats() = count %d paths %v, want one %s", count, paths, path)
+	}
+	recovered := manager2.GetConflicts()[0]
+	if recovered.ConflictStatus != ConflictStatusConflicted {
+		t.Fatalf("conflict status = %q, want %q", recovered.ConflictStatus, ConflictStatusConflicted)
+	}
+	if recovered.ObservedETag != `"external-conflict"` || recovered.ObservedSize != 42 {
+		t.Fatalf("observed conflict state = etag %q size %d", recovered.ObservedETag, recovered.ObservedSize)
+	}
 }
 
 // Made with Bob

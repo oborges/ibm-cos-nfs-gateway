@@ -24,6 +24,13 @@ type PerformanceCounters struct {
 	COSHeadObject  atomic.Int64
 	COSGetObject   atomic.Int64
 
+	// Object-side refresh metrics
+	RefreshScans              atomic.Int64
+	RefreshObjectsChanged     atomic.Int64
+	RefreshCacheInvalidations atomic.Int64
+	RefreshSkippedDirtyPaths  atomic.Int64
+	RefreshConflicts          atomic.Int64
+
 	// Transfer metrics
 	BytesRead    atomic.Int64
 	BytesWritten atomic.Int64
@@ -95,6 +102,39 @@ func RecordCOSHeadObject() {
 // RecordCOSGetObject records a COS GetObject call
 func RecordCOSGetObject() {
 	globalCounters.COSGetObject.Add(1)
+}
+
+// RecordObjectRefreshScan records one completed object-side refresh scan.
+func RecordObjectRefreshScan() {
+	globalCounters.RefreshScans.Add(1)
+}
+
+// RecordObjectRefreshObjectsChanged records objects whose list signature changed.
+func RecordObjectRefreshObjectsChanged(count int) {
+	if count > 0 {
+		globalCounters.RefreshObjectsChanged.Add(int64(count))
+	}
+}
+
+// RecordObjectRefreshCacheInvalidations records cache invalidations caused by refresh.
+func RecordObjectRefreshCacheInvalidations(count int) {
+	if count > 0 {
+		globalCounters.RefreshCacheInvalidations.Add(int64(count))
+	}
+}
+
+// RecordObjectRefreshSkippedDirtyPaths records dirty staged paths skipped by refresh.
+func RecordObjectRefreshSkippedDirtyPaths(count int) {
+	if count > 0 {
+		globalCounters.RefreshSkippedDirtyPaths.Add(int64(count))
+	}
+}
+
+// RecordObjectRefreshConflicts records dirty local paths that became conflicts.
+func RecordObjectRefreshConflicts(count int) {
+	if count > 0 {
+		globalCounters.RefreshConflicts.Add(int64(count))
+	}
 }
 
 // RecordBytesReadCounter records bytes read in the debug counters.
@@ -174,6 +214,13 @@ func (pc *PerformanceCounters) GetReport() map[string]interface{} {
 			"list_objects": pc.COSListObjects.Load(),
 			"head_object":  pc.COSHeadObject.Load(),
 			"get_object":   pc.COSGetObject.Load(),
+		},
+		"object_refresh": map[string]interface{}{
+			"scans":               pc.RefreshScans.Load(),
+			"objects_changed":     pc.RefreshObjectsChanged.Load(),
+			"cache_invalidations": pc.RefreshCacheInvalidations.Load(),
+			"skipped_dirty_paths": pc.RefreshSkippedDirtyPaths.Load(),
+			"conflicts":           pc.RefreshConflicts.Load(),
 		},
 		"transfers": map[string]interface{}{
 			"bytes_read_total":    pc.BytesRead.Load(),

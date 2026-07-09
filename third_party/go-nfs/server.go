@@ -13,21 +13,30 @@ import (
 type Server struct {
 	Handler
 	ID [8]byte
+	// EnabledNFSVersions limits NFS program versions served by this server.
+	// Empty means all registered versions are enabled.
+	EnabledNFSVersions []uint32
 	context.Context
 }
 
-// RegisterMessageHandler registers a handler for a specific
+// RegisterMessageHandler registers a handler for a specific NFSv3/MOUNTv3
 // XDR procedure.
 func RegisterMessageHandler(protocol uint32, proc uint32, handler HandleFunc) error {
+	return RegisterVersionedMessageHandler(protocol, 3, proc, handler)
+}
+
+// RegisterVersionedMessageHandler registers a handler for a specific RPC
+// program, version, and procedure.
+func RegisterVersionedMessageHandler(protocol uint32, version uint32, proc uint32, handler HandleFunc) error {
 	if registeredHandlers == nil {
 		registeredHandlers = make(map[registeredHandlerID]HandleFunc)
 	}
 	for k := range registeredHandlers {
-		if k.protocol == protocol && k.proc == proc {
+		if k.protocol == protocol && k.version == version && k.proc == proc {
 			return errors.New("already registered")
 		}
 	}
-	id := registeredHandlerID{protocol, proc}
+	id := registeredHandlerID{protocol, version, proc}
 	registeredHandlers[id] = handler
 	return nil
 }
@@ -38,6 +47,7 @@ type HandleFunc func(ctx context.Context, w *response, userHandler Handler) erro
 // TODO: store directly as a uint64 for more efficient lookups
 type registeredHandlerID struct {
 	protocol uint32
+	version  uint32
 	proc     uint32
 }
 
@@ -91,13 +101,31 @@ func (s *Server) newConn(nc net.Conn) *conn {
 
 // TODO: keep an immutable map for each server instance to have less
 // chance of races.
-func (s *Server) handlerFor(prog uint32, proc uint32) HandleFunc {
+func (s *Server) handlerFor(prog uint32, version uint32, proc uint32) HandleFunc {
+	if (prog == nfsServiceID || prog == mountServiceID) && !s.nfsVersionAllowed(prog, version) {
+		return nil
+	}
 	for k, v := range registeredHandlers {
-		if k.protocol == prog && k.proc == proc {
+		if k.protocol == prog && k.version == version && k.proc == proc {
 			return v
 		}
 	}
 	return nil
+}
+
+func (s *Server) nfsVersionAllowed(prog uint32, version uint32) bool {
+	if len(s.EnabledNFSVersions) == 0 {
+		return true
+	}
+	if prog == mountServiceID {
+		version = 3
+	}
+	for _, enabled := range s.EnabledNFSVersions {
+		if enabled == version {
+			return true
+		}
+	}
+	return false
 }
 
 // Serve is a singleton listener paralleling http.Serve

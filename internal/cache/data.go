@@ -244,6 +244,25 @@ func (c *DataCache) DeleteObject(objectKey string) error {
 	return nil
 }
 
+// DeleteObjectPrefix removes full-object and chunk cache entries for all
+// logical objects under an object path prefix.
+func (c *DataCache) DeleteObjectPrefix(objectPrefix string) error {
+	if !c.enabled {
+		return nil
+	}
+
+	if objectPrefix != "/" && !strings.HasSuffix(objectPrefix, "/") {
+		objectPrefix += "/"
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.index.DeletePrefix(objectPrefix)
+	c.index.DeletePrefix(c.chunkPrefix(objectPrefix))
+	return nil
+}
+
 // ChunkSize returns the configured cache chunk size.
 func (c *DataCache) ChunkSize() int64 {
 	if c == nil || !c.enabled || c.chunkSize <= 0 {

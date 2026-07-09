@@ -3,6 +3,7 @@
 
 server:
   nfs_port: 2049
+  nfs_version: "4"        # "4" (default), "3", or "dual"
   metrics_port: 8080
   health_port: 8081
   max_connections: 1000
@@ -62,6 +63,11 @@ performance:
   max_full_object_read_mb: 512   # Max size for whole-object reads into memory
   max_buffered_write_mb: 512     # Max size for legacy append/random-write merges
   max_directory_entries: 100000  # Max objects returned for a single directory listing
+
+object_refresh:
+  enabled: false      # Enable periodic COS prefix scans for object-side changes
+  interval: "5m"      # Scan interval when enabled
+  prefix: ""          # COS key prefix to scan; empty scans the mounted bucket view
 
 logging:
   level: "info"     # debug, info, warn, error

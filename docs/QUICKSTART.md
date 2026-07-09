@@ -71,7 +71,7 @@ On your client machine:
 sudo mkdir -p /mnt/cos
 
 # Mount the NFS share
-sudo mount -t nfs -o vers=3,tcp localhost:/ /mnt/cos
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos
 
 # Verify mount
 df -h /mnt/cos
@@ -162,7 +162,7 @@ kubectl get svc nfs-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
 
 ```bash
 # Replace <SERVICE_IP> with the actual IP
-sudo mount -t nfs -o vers=3,tcp <SERVICE_IP>:/ /mnt/cos
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 <SERVICE_IP>:/ /mnt/cos
 ```
 
 ## Monitoring
@@ -288,7 +288,7 @@ docker logs cos-nfs-gateway
 telnet localhost 2049
 
 # Try mounting with verbose output
-sudo mount -t nfs -o vers=3,tcp,v localhost:/ /mnt/cos
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049,v localhost:/ /mnt/cos
 
 # Check mount options
 mount | grep /mnt/cos

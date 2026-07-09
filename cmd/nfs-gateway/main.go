@@ -79,10 +79,14 @@ func main() {
 		zap.Int("max_full_object_read_mb", cfg.Performance.MaxFullObjectReadMB),
 		zap.Int("max_buffered_write_mb", cfg.Performance.MaxBufferedWriteMB),
 		zap.Int("max_directory_entries", cfg.Performance.MaxDirectoryEntries),
+		zap.String("nfs_version", cfg.Server.NFSVersion),
 		zap.Bool("data_cache_enabled", cfg.Cache.Data.Enabled),
 		zap.Bool("metadata_cache_enabled", cfg.Cache.Metadata.Enabled),
 		zap.Int("data_cache_size_gb", cfg.Cache.Data.SizeGB),
 		zap.Int("metadata_cache_size_mb", cfg.Cache.Metadata.SizeMB),
+		zap.Bool("object_refresh_enabled", cfg.ObjectRefresh.Enabled),
+		zap.String("object_refresh_interval", cfg.ObjectRefresh.Interval),
+		zap.String("object_refresh_prefix", cfg.ObjectRefresh.Prefix),
 		zap.String("log_level", cfg.Logging.Level),
 	)
 
@@ -202,6 +206,36 @@ func main() {
 		logging.Info("Staging architecture initialized successfully")
 	}
 
+	if cfg.ObjectRefresh.Enabled {
+		refreshInterval, err := cfg.ObjectRefresh.GetInterval()
+		if err != nil {
+			logging.Fatal("Invalid object refresh interval", zap.Error(err))
+		}
+		var dirtyChecker posix.DirtyPathChecker
+		var conflictRecorder posix.ConflictRecorder
+		if stagingManager != nil {
+			dirtyChecker = stagingManager.IsDirty
+			conflictRecorder = func(conflict posix.ObjectConflict) error {
+				_, err := stagingManager.RecordConflict(conflict.Path, staging.ExternalChangeSnapshot{
+					ObjectKey:    conflict.Key,
+					Size:         conflict.Size,
+					ETag:         conflict.ETag,
+					LastModified: conflict.LastModified,
+					Deleted:      conflict.Deleted,
+					Reason:       "object_refresh_external_change",
+				})
+				return err
+			}
+		}
+		refreshScanner := posix.NewObjectRefreshScanner(operations, &cfg.ObjectRefresh, dirtyChecker, conflictRecorder)
+		refreshScanner.Start(ctx, refreshInterval)
+		logging.Info("Object-side refresh scanner started",
+			zap.Duration("interval", refreshInterval),
+			zap.String("prefix", cfg.ObjectRefresh.Prefix))
+	} else {
+		logging.Info("Object-side refresh scanner disabled by configuration")
+	}
+
 	// Initialize NFS filesystem and server
 	zapLogger := logging.GetLogger()
 	nfsLogger := nfs.NewLogger(zapLogger)
@@ -229,7 +263,8 @@ func main() {
 	stableHandler := nfs.NewStableVerifierHandler(cachedHandler, nfsLogger)
 
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
-	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger)
+	nfsVersions := cfg.Server.GetNFSVersions()
+	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger, nfsVersions)
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
 	}
@@ -241,6 +276,7 @@ func main() {
 
 	logging.Info("NFS Gateway started successfully",
 		zap.Int("nfs_port", cfg.Server.NFSPort),
+		zap.String("nfs_version", cfg.Server.NFSVersion),
 		zap.Int("metrics_port", cfg.Server.MetricsPort),
 		zap.Int("health_port", cfg.Server.HealthPort),
 	)

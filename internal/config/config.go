@@ -10,17 +10,19 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	Server      ServerConfig      `mapstructure:"server"`
-	COS         COSConfig         `mapstructure:"cos"`
-	Cache       CacheConfig       `mapstructure:"cache"`
-	Performance PerformanceConfig `mapstructure:"performance"`
-	Logging     LoggingConfig     `mapstructure:"logging"`
-	Staging     StagingConfig     `mapstructure:"staging"`
+	Server        ServerConfig        `mapstructure:"server"`
+	COS           COSConfig           `mapstructure:"cos"`
+	Cache         CacheConfig         `mapstructure:"cache"`
+	Performance   PerformanceConfig   `mapstructure:"performance"`
+	ObjectRefresh ObjectRefreshConfig `mapstructure:"object_refresh"`
+	Logging       LoggingConfig       `mapstructure:"logging"`
+	Staging       StagingConfig       `mapstructure:"staging"`
 }
 
 // ServerConfig represents NFS server configuration
 type ServerConfig struct {
 	NFSPort        int    `mapstructure:"nfs_port"`
+	NFSVersion     string `mapstructure:"nfs_version"`
 	MetricsEnabled bool   `mapstructure:"metrics_enabled"`
 	MetricsPort    int    `mapstructure:"metrics_port"`
 	HealthEnabled  bool   `mapstructure:"health_enabled"`
@@ -80,6 +82,13 @@ type PerformanceConfig struct {
 	MaxFullObjectReadMB  int `mapstructure:"max_full_object_read_mb"`
 	MaxBufferedWriteMB   int `mapstructure:"max_buffered_write_mb"`
 	MaxDirectoryEntries  int `mapstructure:"max_directory_entries"`
+}
+
+// ObjectRefreshConfig controls object-side change scans.
+type ObjectRefreshConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	Interval string `mapstructure:"interval"`
+	Prefix   string `mapstructure:"prefix"`
 }
 
 const (
@@ -174,6 +183,7 @@ func Load(configPath string) (*Config, error) {
 func bindEnvOverrides(v *viper.Viper) error {
 	keys := []string{
 		"server.nfs_port",
+		"server.nfs_version",
 		"server.metrics_enabled",
 		"server.metrics_port",
 		"server.health_enabled",
@@ -211,6 +221,9 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"performance.max_full_object_read_mb",
 		"performance.max_buffered_write_mb",
 		"performance.max_directory_entries",
+		"object_refresh.enabled",
+		"object_refresh.interval",
+		"object_refresh.prefix",
 		"logging.level",
 		"logging.format",
 		"logging.output",
@@ -250,6 +263,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 func setDefaults(v *viper.Viper) {
 	// Server defaults
 	v.SetDefault("server.nfs_port", 2049)
+	v.SetDefault("server.nfs_version", "4")
 	v.SetDefault("server.metrics_enabled", false)
 	v.SetDefault("server.metrics_port", 8080)
 	v.SetDefault("server.health_enabled", false)
@@ -288,6 +302,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("performance.max_full_object_read_mb", DefaultMaxFullObjectReadMB)
 	v.SetDefault("performance.max_buffered_write_mb", DefaultMaxBufferedWriteMB)
 	v.SetDefault("performance.max_directory_entries", DefaultMaxDirectoryEntries)
+
+	// Object-side refresh defaults (disabled unless explicitly enabled)
+	v.SetDefault("object_refresh.enabled", false)
+	v.SetDefault("object_refresh.interval", "5m")
+	v.SetDefault("object_refresh.prefix", "")
 
 	// Logging defaults
 	v.SetDefault("logging.level", "info")
@@ -328,6 +347,18 @@ func (c *ServerConfig) GetWriteTimeout() (time.Duration, error) {
 	return time.ParseDuration(c.WriteTimeout)
 }
 
+// GetNFSVersions returns the enabled NFS protocol versions.
+func (c *ServerConfig) GetNFSVersions() []uint32 {
+	switch strings.ToLower(strings.TrimSpace(c.NFSVersion)) {
+	case "3", "v3", "nfsv3":
+		return []uint32{3}
+	case "dual", "both", "3,4", "4,3":
+		return []uint32{3, 4}
+	default:
+		return []uint32{4}
+	}
+}
+
 // GetTimeout returns the parsed COS timeout duration
 func (c *COSConfig) GetTimeout() (time.Duration, error) {
 	return time.ParseDuration(c.Timeout)
@@ -336,6 +367,11 @@ func (c *COSConfig) GetTimeout() (time.Duration, error) {
 // GetTTL returns the metadata cache TTL as a duration
 func (c *MetadataCacheConfig) GetTTL() time.Duration {
 	return time.Duration(c.TTLSeconds) * time.Second
+}
+
+// GetInterval returns the parsed object refresh interval.
+func (c *ObjectRefreshConfig) GetInterval() (time.Duration, error) {
+	return time.ParseDuration(c.Interval)
 }
 
 // GetSyncInterval returns the parsed sync interval duration

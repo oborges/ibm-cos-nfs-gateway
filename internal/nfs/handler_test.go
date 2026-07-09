@@ -1,8 +1,10 @@
 package nfs
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
@@ -179,4 +181,152 @@ func TestCOSFileCloseReleasesStagingSessionOnce(t *testing.T) {
 	if got := session.GetRefCount(); got != 1 {
 		t.Fatalf("refcount after Close() = %d, want 1", got)
 	}
+}
+
+func TestCOSFilesystemRenameDirtyStagedFileIsBlocked(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/dirty.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	stagingPath := session.StagingPath
+
+	fs := newDirtyStagingTestFilesystem(t, manager)
+	err = fs.Rename("dirty.txt", "renamed.txt")
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Rename() error = %v, want EBUSY", err)
+	}
+	if !manager.IsDirty(path) {
+		t.Fatal("dirty source path should remain dirty after blocked rename")
+	}
+	if _, exists := manager.GetSession("/renamed.txt"); exists {
+		t.Fatal("blocked rename should not create a destination staging session")
+	}
+	if _, err := os.Stat(stagingPath); err != nil {
+		t.Fatalf("dirty staging file should remain after blocked rename: %v", err)
+	}
+}
+
+func TestCOSFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/dir/dirty.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+
+	fs := newDirtyStagingTestFilesystem(t, manager)
+	err = fs.Rename("dir", "renamed-dir")
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Rename(directory) error = %v, want EBUSY", err)
+	}
+	if !manager.IsDirty(path) {
+		t.Fatal("dirty child path should remain dirty after blocked directory rename")
+	}
+}
+
+func TestCOSFilesystemRemoveDirtyStagedFileIsBlocked(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/dirty-delete.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	stagingPath := session.StagingPath
+
+	fs := newDirtyStagingTestFilesystem(t, manager)
+	err = fs.Remove("dirty-delete.txt")
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Remove() error = %v, want EBUSY", err)
+	}
+	if !manager.IsDirty(path) {
+		t.Fatal("dirty path should remain dirty after blocked delete")
+	}
+	if _, err := os.Stat(stagingPath); err != nil {
+		t.Fatalf("dirty staging file should remain after blocked delete: %v", err)
+	}
+}
+
+func TestCOSFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/dir/dirty-delete.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+
+	fs := newDirtyStagingTestFilesystem(t, manager)
+	err = fs.Remove("dir")
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("Remove(directory) error = %v, want EBUSY", err)
+	}
+	if !manager.IsDirty(path) {
+		t.Fatal("dirty child path should remain dirty after blocked directory remove")
+	}
+}
+
+func newDirtyStagingTestFilesystem(t *testing.T, manager *staging.StagingManager) *COSFilesystem {
+	t.Helper()
+
+	perfConfig := &config.PerformanceConfig{
+		WriteBufferKB:       4096,
+		MaxBufferedWriteMB:  config.DefaultMaxBufferedWriteMB,
+		MaxDirectoryEntries: config.DefaultMaxDirectoryEntries,
+	}
+	metadataCache := cache.NewMetadataCache(&config.MetadataCacheConfig{
+		Enabled:    true,
+		MaxEntries: 10,
+		TTLSeconds: 60,
+	})
+	ops := posix.NewOperationsHandler(nil, metadataCache, nil, perfConfig)
+	return NewCOSFilesystemWithConfig(
+		ops,
+		NewLogger(zap.NewNop()),
+		"/",
+		perfConfig,
+		manager,
+		nil,
+		&feature.FeatureFlags{UseStagingPath: true},
+	)
 }

@@ -2,6 +2,7 @@ package staging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -384,6 +385,62 @@ func TestSyncWorker_TriggerSync_NotDirty(t *testing.T) {
 	_, exists := cosClient.GetUpload(path)
 	if exists {
 		t.Error("Clean file should not be uploaded")
+	}
+}
+
+func TestSyncWorker_DoesNotUploadConflictedStaleContent(t *testing.T) {
+	cfg := createTestConfig(t)
+	manager, _ := NewStagingManager(cfg)
+	defer manager.Shutdown()
+
+	cosClient := NewMockCOSClient()
+	worker := NewSyncWorker(manager, cosClient, cfg)
+
+	path := "/test/conflicted.txt"
+	localData := []byte("stale local dirty data")
+	externalData := []byte("external object winner")
+	cosClient.uploads[path] = append([]byte(nil), externalData...)
+
+	session, _ := manager.GetOrCreateSession(path)
+	if _, err := session.Write(localData, 0); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("Sync() error = %v", err)
+	}
+	manager.MarkDirty(path, int64(len(localData)))
+
+	if _, err := manager.RecordConflict(path, ExternalChangeSnapshot{
+		ObjectKey: path,
+		Size:      int64(len(externalData)),
+		ETag:      `"external"`,
+		Reason:    "test_external_change",
+	}); err != nil {
+		t.Fatalf("RecordConflict() error = %v", err)
+	}
+
+	if err := worker.TriggerSync(path); !errors.Is(err, ErrPathConflicted) {
+		t.Fatalf("TriggerSync() error = %v, want ErrPathConflicted", err)
+	}
+
+	uploaded, exists := cosClient.GetUpload(path)
+	if !exists {
+		t.Fatal("external object should still exist in mock COS")
+	}
+	if string(uploaded) != string(externalData) {
+		t.Fatalf("conflicted stale content uploaded = %q, want external object %q", uploaded, externalData)
+	}
+
+	stats := worker.Stats()
+	if stats["conflict_count"].(int) != 1 {
+		t.Fatalf("conflict_count = %v, want 1", stats["conflict_count"])
+	}
+	conflictedPaths := stats["conflicted_paths"].([]string)
+	if len(conflictedPaths) != 1 || conflictedPaths[0] != path {
+		t.Fatalf("conflicted_paths = %v, want [%s]", conflictedPaths, path)
+	}
+	if _, ok := stats["last_conflict_time"]; !ok {
+		t.Fatal("last_conflict_time should be present in sync stats")
 	}
 }
 

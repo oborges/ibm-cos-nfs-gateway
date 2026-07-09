@@ -20,13 +20,13 @@ type MetadataCache struct {
 
 // MetadataEntry represents cached metadata
 type MetadataEntry struct {
-	FileInfo   os.FileInfo
-	Attributes *types.POSIXAttributes
-	IsDir      bool
-	Children   []string    // DEPRECATED: Use ChildEntries instead
+	FileInfo     os.FileInfo
+	Attributes   *types.POSIXAttributes
+	IsDir        bool
+	Children     []string      // DEPRECATED: Use ChildEntries instead
 	ChildEntries []os.FileInfo // Full FileInfo for directory listings (O(1) cache hit)
-	CachedAt   time.Time
-	IsImplicit bool     // True if directory has no marker object (needs validation)
+	CachedAt     time.Time
+	IsImplicit   bool // True if directory has no marker object (needs validation)
 }
 
 // NewMetadataCache creates a new metadata cache
@@ -37,7 +37,7 @@ func NewMetadataCache(cfg *config.MetadataCacheConfig) *MetadataCache {
 	}
 
 	cache := NewLRUCache(cfg.MaxEntries, cfg.GetTTL())
-	
+
 	// Set eviction callback for logging
 	cache.SetEvictCallback(func(key string, value interface{}) {
 		logging.Debug("Metadata cache entry evicted", zap.String("key", key))
@@ -205,7 +205,7 @@ func (c *MetadataCache) InvalidatePath(path string) {
 	}
 
 	c.Delete(path)
-	
+
 	// Also invalidate parent directory listing
 	if path != "/" && path != "" {
 		parentPath := getParentPath(path)
@@ -234,6 +234,7 @@ func (c *MetadataCache) InvalidateDirectory(dirPath string) int {
 		return 0
 	}
 
+	originalPath := dirPath
 	// Ensure path ends with /
 	if dirPath != "/" && dirPath[len(dirPath)-1] != '/' {
 		dirPath += "/"
@@ -241,9 +242,13 @@ func (c *MetadataCache) InvalidateDirectory(dirPath string) int {
 
 	count := c.InvalidatePrefix(dirPath)
 	c.Delete(dirPath)
-	
+	c.Delete(originalPath)
+	if originalPath != "/" && originalPath != "" {
+		c.Delete(getParentPath(originalPath))
+	}
+
 	logging.Debug("Directory cache invalidated",
-		zap.String("dir", dirPath),
+		zap.String("dir", originalPath),
 		zap.Int("count", count),
 	)
 	return count

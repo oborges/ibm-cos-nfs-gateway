@@ -4,9 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,6 +32,8 @@ type StagingManager struct {
 	reservedBytes int64
 }
 
+var ErrPathConflicted = errors.New("staging path has unresolved conflict")
+
 const (
 	PressureLevelNormal   = "normal"
 	PressureLevelHigh     = "high"
@@ -49,6 +54,103 @@ type PressureState struct {
 	Level                  string
 }
 
+// ExternalChangeSnapshot describes the object-store change that caused a local
+// dirty staged path to become conflicted.
+type ExternalChangeSnapshot struct {
+	ObjectKey    string
+	Size         int64
+	ETag         string
+	LastModified time.Time
+	Deleted      bool
+	Reason       string
+}
+
+// EnsurePathMetadata creates or refreshes the durable sidecar for a staged path
+// without marking it dirty. Existing observed COS state and generation are
+// preserved.
+func (sm *StagingManager) EnsurePathMetadata(path, stagingPath string, size int64) error {
+	metadataPath := sm.pathMetadataPath(stagingPath)
+	state, err := readPathMetadataState(metadataPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if state == nil {
+		state = &PathMetadataState{
+			Version:        pathMetadataVersion,
+			OriginalPath:   path,
+			ObjectKey:      objectKeyFromPath(path),
+			StagedFilePath: stagingPath,
+			ConflictStatus: ConflictStatusNone,
+			Size:           size,
+		}
+	}
+	state.Version = pathMetadataVersion
+	state.OriginalPath = path
+	if state.ObjectKey == "" {
+		state.ObjectKey = objectKeyFromPath(path)
+	}
+	state.StagedFilePath = stagingPath
+	state.Size = size
+	if state.ConflictStatus == "" {
+		state.ConflictStatus = ConflictStatusNone
+	}
+	return writePathMetadataState(metadataPath, state)
+}
+
+// MarkPathDirtyMetadata persists the local dirty generation and staged file
+// details used to compare a staged write with the object state observed before
+// or during the write.
+func (sm *StagingManager) MarkPathDirtyMetadata(path string, size int64) (*PathMetadataState, error) {
+	stagingPath := sm.stagingFilePath(path)
+	metadataPath := sm.pathMetadataPath(stagingPath)
+	state, err := readPathMetadataState(metadataPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		state = &PathMetadataState{
+			Version:      pathMetadataVersion,
+			OriginalPath: path,
+			ObjectKey:    objectKeyFromPath(path),
+		}
+	}
+
+	now := time.Now()
+	state.Version = pathMetadataVersion
+	state.OriginalPath = path
+	if state.ObjectKey == "" {
+		state.ObjectKey = objectKeyFromPath(path)
+	}
+	state.LocalDirtyGeneration++
+	if state.LocalDirtyGeneration <= 0 {
+		state.LocalDirtyGeneration = 1
+	}
+	state.StagedFilePath = stagingPath
+	state.ConflictStatus = ConflictStatusNone
+	state.Size = size
+	if state.DirtySince.IsZero() {
+		state.DirtySince = now
+	}
+	state.LastModified = now
+
+	if err := writePathMetadataState(metadataPath, state); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (sm *StagingManager) pathMetadataPath(stagingPath string) string {
+	return stagingPath + ".metadata"
+}
+
+func (sm *StagingManager) removePathMetadata(path string) error {
+	metadataPath := sm.pathMetadataPath(sm.stagingFilePath(path))
+	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // NewStagingManager creates a new staging manager
 func NewStagingManager(cfg *config.StagingConfig) (*StagingManager, error) {
 	normalizeBackpressureConfig(cfg)
@@ -57,6 +159,9 @@ func NewStagingManager(cfg *config.StagingConfig) (*StagingManager, error) {
 	activeDir := filepath.Join(cfg.RootDir, "active")
 	if err := os.MkdirAll(activeDir, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create staging directory: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.RootDir, "lost+found"), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create staging lost+found directory: %w", err)
 	}
 
 	sm := &StagingManager{
@@ -76,6 +181,7 @@ func NewStagingManager(cfg *config.StagingConfig) (*StagingManager, error) {
 			zap.Error(err))
 	}
 	sm.updatePressureMetrics()
+	sm.updateConflictMetrics()
 
 	return sm, nil
 }
@@ -102,6 +208,10 @@ func normalizeBackpressureConfig(cfg *config.StagingConfig) {
 func (sm *StagingManager) GetOrCreateSession(path string) (*WriteSession, error) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
+
+	if sm.dirtyIndex.IsConflicted(path) {
+		return nil, fmt.Errorf("%w: %s", ErrPathConflicted, path)
+	}
 
 	// Check if session exists
 	if session, exists := sm.sessions[path]; exists {
@@ -160,6 +270,9 @@ func (sm *StagingManager) GetSessionsInDirectory(dirPath string) []*WriteSession
 	}
 
 	for path, session := range sm.sessions {
+		if sm.dirtyIndex.IsConflicted(path) {
+			continue
+		}
 		if strings.HasPrefix(path, prefix) && len(path) > len(prefix) {
 			// Extracting only precisely adjacent file instances, ignoring deep nested arrays seamlessly!
 			remainder := strings.TrimPrefix(path, prefix)
@@ -173,7 +286,21 @@ func (sm *StagingManager) GetSessionsInDirectory(dirPath string) []*WriteSession
 
 // MarkDirty marks a file as dirty (needs sync)
 func (sm *StagingManager) MarkDirty(path string, size int64) {
-	sm.dirtyIndex.MarkDirty(path, size)
+	if sm.dirtyIndex.IsConflicted(path) {
+		logging.Warn("Refusing to queue conflicted staged path for sync",
+			zap.String("path", path),
+			zap.Int64("size", size))
+		return
+	}
+
+	state, err := sm.MarkPathDirtyMetadata(path, size)
+	if err != nil {
+		logging.Warn("Failed to persist dirty path metadata",
+			zap.String("path", path),
+			zap.Error(err))
+	}
+
+	sm.dirtyIndex.MarkDirtyWithState(path, size, state)
 	sm.updateSyncQueueMetrics()
 	sm.updatePressureMetrics()
 
@@ -186,6 +313,11 @@ func (sm *StagingManager) MarkDirty(path string, size int64) {
 // MarkClean marks a file as clean (synced)
 func (sm *StagingManager) MarkClean(path string) {
 	sm.dirtyIndex.MarkClean(path)
+	if err := sm.removePathMetadata(path); err != nil {
+		logging.Warn("Failed to remove clean path metadata",
+			zap.String("path", path),
+			zap.Error(err))
+	}
 	sm.updateSyncQueueMetrics()
 	sm.updatePressureMetrics()
 
@@ -197,6 +329,11 @@ func (sm *StagingManager) MarkClean(path string) {
 // ForgetDirty removes stale dirty bookkeeping when staged data is intentionally gone.
 func (sm *StagingManager) ForgetDirty(path, reason string) {
 	sm.dirtyIndex.MarkClean(path)
+	if err := sm.removePathMetadata(path); err != nil {
+		logging.Warn("Failed to remove forgotten path metadata",
+			zap.String("path", path),
+			zap.Error(err))
+	}
 	sm.updateSyncQueueMetrics()
 	sm.updatePressureMetrics()
 
@@ -206,13 +343,176 @@ func (sm *StagingManager) ForgetDirty(path, reason string) {
 		zap.Int("total_dirty", sm.dirtyIndex.Count()))
 }
 
+// RecordConflict preserves dirty local staged data and makes the COS object the
+// default winner for subsequent operations on the original path.
+func (sm *StagingManager) RecordConflict(path string, change ExternalChangeSnapshot) (*ConflictMetadata, error) {
+	if sm == nil {
+		return nil, fmt.Errorf("staging manager is nil")
+	}
+	if !sm.dirtyIndex.IsDirty(path) {
+		return nil, nil
+	}
+
+	sm.mu.RLock()
+	session, sessionExists := sm.sessions[path]
+	sm.mu.RUnlock()
+
+	stagingPath := sm.stagingFilePath(path)
+	if sessionExists {
+		if err := session.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to sync conflicted staging file: %w", err)
+		}
+		stagingPath, _, _, _, _, _, _, _ = session.Snapshot()
+	}
+
+	info, err := os.Stat(stagingPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat conflicted staging file: %w", err)
+	}
+
+	detectedAt := time.Now()
+	preservedPath := sm.conflictFilePath(path, detectedAt)
+	if err := os.MkdirAll(filepath.Dir(preservedPath), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create conflict directory: %w", err)
+	}
+	if err := copyFile(preservedPath, stagingPath); err != nil {
+		return nil, fmt.Errorf("failed to preserve conflicted staging file: %w", err)
+	}
+
+	reason := change.Reason
+	if reason == "" {
+		reason = "external_object_change"
+	}
+	metadataPath := preservedPath + ".metadata.json"
+	conflict := &ConflictMetadata{
+		Path:                  path,
+		ObjectKey:             change.ObjectKey,
+		Size:                  info.Size(),
+		PreservedPath:         preservedPath,
+		PreservedMetadataPath: metadataPath,
+		DetectedAt:            detectedAt,
+		Reason:                reason,
+		StagedPath:            stagingPath,
+		ConflictStatus:        ConflictStatusConflicted,
+		ObservedSize:          change.Size,
+		ObservedETag:          change.ETag,
+		ObservedLastModified:  change.LastModified,
+		ExternalSize:          change.Size,
+		ExternalETag:          change.ETag,
+		ExternalLastModified:  change.LastModified,
+		ExternalDeleted:       change.Deleted,
+	}
+	if dirty := sm.dirtyIndex.GetMetadata(path); dirty != nil {
+		conflict.LocalDirtyGeneration = dirty.LocalDirtyGeneration
+		if conflict.ObjectKey == "" {
+			conflict.ObjectKey = dirty.ObjectKey
+		}
+		if conflict.ObservedETag == "" {
+			conflict.ObservedETag = dirty.ObservedETag
+			conflict.ObservedSize = dirty.ObservedSize
+			conflict.ObservedLastModified = dirty.ObservedLastModified
+		}
+	}
+
+	metadataBytes, err := json.MarshalIndent(conflict, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal conflict metadata: %w", err)
+	}
+	if err := os.WriteFile(metadataPath, metadataBytes, 0600); err != nil {
+		return nil, fmt.Errorf("failed to write conflict metadata: %w", err)
+	}
+
+	sm.mu.Lock()
+	if current, exists := sm.sessions[path]; exists {
+		session = current
+		delete(sm.sessions, path)
+	}
+	sm.mu.Unlock()
+
+	if session != nil {
+		session.Dirty = false
+		if err := session.Close(); err != nil {
+			logging.Warn("Failed to close conflicted staging session",
+				zap.String("path", path),
+				zap.Error(err))
+		}
+	}
+
+	if err := os.Remove(stagingPath); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to remove conflicted active staging file: %w", err)
+	}
+	if err := os.Remove(stagingPath + ".metadata"); err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to remove conflicted active staging metadata: %w", err)
+	}
+
+	sm.dirtyIndex.MarkConflicted(conflict)
+	sm.updateSyncQueueMetrics()
+	sm.updatePressureMetrics()
+	sm.updateConflictMetrics()
+	metrics.RecordStagingConflict()
+
+	logging.Warn("Recorded staging conflict after external COS change",
+		zap.String("path", path),
+		zap.String("object_key", change.ObjectKey),
+		zap.String("preserved_path", preservedPath),
+		zap.Int64("local_size", info.Size()),
+		zap.Int64("external_size", change.Size),
+		zap.Bool("external_deleted", change.Deleted),
+		zap.Time("external_last_modified", change.LastModified))
+
+	return conflict, nil
+}
+
 // IsDirty returns true if the file is dirty
 func (sm *StagingManager) IsDirty(path string) bool {
 	return sm.dirtyIndex.IsDirty(path)
 }
 
+// IsConflicted returns true when a path has an unresolved staging conflict.
+func (sm *StagingManager) IsConflicted(path string) bool {
+	return sm.dirtyIndex.IsConflicted(path)
+}
+
+// DirtyPathsUnder returns dirty staged paths at path or below it.
+func (sm *StagingManager) DirtyPathsUnder(path string) []string {
+	if sm == nil {
+		return nil
+	}
+
+	path = filepath.ToSlash(filepath.Clean(path))
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	prefix := path
+	if prefix != "/" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	dirtyFiles := sm.GetDirtyFiles()
+	paths := make([]string, 0, len(dirtyFiles))
+	for _, metadata := range dirtyFiles {
+		if metadata == nil {
+			continue
+		}
+		dirtyPath := filepath.ToSlash(filepath.Clean(metadata.Path))
+		if !strings.HasPrefix(dirtyPath, "/") {
+			dirtyPath = "/" + dirtyPath
+		}
+		if dirtyPath == path || path == "/" || strings.HasPrefix(dirtyPath, prefix) {
+			paths = append(paths, dirtyPath)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 // GetSession returns an existing session (without creating)
 func (sm *StagingManager) GetSession(path string) (*WriteSession, bool) {
+	if sm.dirtyIndex.IsConflicted(path) {
+		return nil, false
+	}
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
@@ -272,6 +572,11 @@ func (sm *StagingManager) GetDirtyFiles() []*DirtyFileMetadata {
 	return sm.dirtyIndex.GetDirtyFiles()
 }
 
+// GetConflicts returns unresolved staging conflict records.
+func (sm *StagingManager) GetConflicts() []*ConflictMetadata {
+	return sm.dirtyIndex.GetConflicts()
+}
+
 // SyncQueueStats returns the current staging sync backlog.
 func (sm *StagingManager) SyncQueueStats() (depth int, totalBytes int64, oldestAge time.Duration) {
 	dirtyFiles := sm.GetDirtyFiles()
@@ -292,9 +597,29 @@ func (sm *StagingManager) SyncQueueStats() (depth int, totalBytes int64, oldestA
 	return depth, totalBytes, oldestAge
 }
 
+// ConflictStats returns unresolved conflict count, paths, and newest conflict time.
+func (sm *StagingManager) ConflictStats() (int, []string, time.Time) {
+	conflicts := sm.GetConflicts()
+	paths := make([]string, 0, len(conflicts))
+	var last time.Time
+	for _, conflict := range conflicts {
+		paths = append(paths, conflict.Path)
+		if conflict.DetectedAt.After(last) {
+			last = conflict.DetectedAt
+		}
+	}
+	sort.Strings(paths)
+	return len(conflicts), paths, last
+}
+
 func (sm *StagingManager) updateSyncQueueMetrics() {
 	depth, totalBytes, oldestAge := sm.SyncQueueStats()
 	metrics.SetStagingSyncQueue(depth, totalBytes, oldestAge)
+}
+
+func (sm *StagingManager) updateConflictMetrics() {
+	count, _, last := sm.ConflictStats()
+	metrics.SetStagingConflicts(count, last)
 }
 
 // ReserveWrite applies staging backpressure and reserves new bytes before a write.
@@ -477,6 +802,43 @@ func (sm *StagingManager) logBackpressureDecision(path string, requestedBytes in
 		zap.String("decision", decision))
 }
 
+func (sm *StagingManager) conflictFilePath(path string, detectedAt time.Time) string {
+	hash := sha256.Sum256([]byte(path))
+	filename := fmt.Sprintf("%s_%s.data",
+		detectedAt.UTC().Format("20060102T150405.000000000Z"),
+		hex.EncodeToString(hash[:8]))
+	return filepath.Join(sm.stagingRoot, "lost+found", filename)
+}
+
+func copyFile(dstPath, srcPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	removeOnError := true
+	defer func() {
+		if removeOnError {
+			_ = os.Remove(dstPath)
+		}
+	}()
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+	if err := dst.Sync(); err != nil {
+		return err
+	}
+	removeOnError = false
+	return nil
+}
+
 // stagingFilePath generates the staging file path for a logical path
 func (sm *StagingManager) stagingFilePath(path string) string {
 	// Use SHA256 hash of path as filename
@@ -516,25 +878,42 @@ func (sm *StagingManager) RecoverFromDisk() error {
 			continue
 		}
 
-		// Resolve original path metadata gracefully
-		metadataPath := filePath + ".metadata"
-		metadataPayload := make(map[string]interface{})
-		if metadataBytes, err := os.ReadFile(metadataPath); err == nil {
-			json.Unmarshal(metadataBytes, &metadataPayload)
-		}
-
-		rawPath, ok := metadataPayload["original_path"]
-		originalPath, isString := rawPath.(string)
-		if !ok || !isString || originalPath == "" {
-			logging.Warn("Failed to extract valid metadata maps for orphaned file. Leaving stranded.",
-				zap.String("file", entry.Name()))
+		metadataPath := sm.pathMetadataPath(filePath)
+		state, err := readPathMetadataState(metadataPath)
+		if err != nil {
+			logging.Warn("Failed to read valid staging metadata. Leaving data file stranded.",
+				zap.String("file", entry.Name()),
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
 			continue
+		}
+		if state.ConflictStatus == ConflictStatusConflicted {
+			logging.Warn("Skipping conflicted active staging metadata during recovery",
+				zap.String("file", entry.Name()),
+				zap.String("path", state.OriginalPath))
+			continue
+		}
+		state.StagedFilePath = filePath
+		state.Size = info.Size()
+		if state.LastModified.IsZero() {
+			state.LastModified = info.ModTime()
+		}
+		if state.DirtySince.IsZero() {
+			state.DirtySince = info.ModTime()
+		}
+		if err := writePathMetadataState(metadataPath, state); err != nil {
+			logging.Warn("Failed to refresh recovered staging metadata",
+				zap.String("file", entry.Name()),
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
 		}
 
 		// Mark as dirty for re-sync safely preserving original maps!
-		session, err := sm.GetOrCreateSession(originalPath)
+		session, err := sm.RecoverSessionFromStaging(state.OriginalPath)
 		if err != nil {
-			logging.Warn("Failed to reconstruct Write Session for orphaned file", zap.Error(err))
+			logging.Warn("Failed to reconstruct Write Session for staged file",
+				zap.String("path", state.OriginalPath),
+				zap.Error(err))
 			continue
 		}
 
@@ -544,23 +923,130 @@ func (sm *StagingManager) RecoverFromDisk() error {
 		session.LastWrite = info.ModTime()
 		session.LastAccess = info.ModTime()
 
-		// Flag the index triggering immediate background upload evaluation!
-		sm.MarkDirty(originalPath, info.Size())
+		sm.dirtyIndex.RestoreDirty(dirtyMetadataFromPathState(state, info.Size(), info.ModTime()))
 
 		logging.Debug("Orphaned staging file recovered natively",
 			zap.String("file", entry.Name()),
-			zap.String("original_path", originalPath),
+			zap.String("original_path", state.OriginalPath),
 			zap.Int64("size", info.Size()))
 
 		recovered++
 	}
 
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".metadata") {
+			continue
+		}
+		dataPath := filepath.Join(activeDir, strings.TrimSuffix(entry.Name(), ".metadata"))
+		if _, err := os.Stat(dataPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			logging.Warn("Failed to stat staging file for metadata stale check",
+				zap.String("metadata", entry.Name()),
+				zap.Error(err))
+			continue
+		}
+		metadataPath := filepath.Join(activeDir, entry.Name())
+		if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+			logging.Warn("Failed to remove stale staging metadata",
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
+		} else {
+			logging.Info("Removed stale staging metadata without data file",
+				zap.String("metadata_path", metadataPath))
+		}
+	}
+
+	recoveredConflicts := sm.recoverConflictsFromDisk()
+
 	if recovered > 0 {
 		logging.Info("Recovered staging files automatically after daemon crash",
 			zap.Int("count", recovered))
 	}
+	if recoveredConflicts > 0 {
+		logging.Info("Recovered staging conflicts automatically after daemon crash",
+			zap.Int("count", recoveredConflicts))
+	}
+	sm.updateSyncQueueMetrics()
+	sm.updatePressureMetrics()
+	sm.updateConflictMetrics()
 
 	return nil
+}
+
+func (sm *StagingManager) recoverConflictsFromDisk() int {
+	lostFoundDir := filepath.Join(sm.stagingRoot, "lost+found")
+	entries, err := os.ReadDir(lostFoundDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logging.Warn("Failed to read staging conflict directory",
+				zap.String("dir", lostFoundDir),
+				zap.Error(err))
+		}
+		return 0
+	}
+
+	recovered := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".metadata.json") {
+			continue
+		}
+		metadataPath := filepath.Join(lostFoundDir, entry.Name())
+		metadataBytes, err := os.ReadFile(metadataPath)
+		if err != nil {
+			logging.Warn("Failed to read conflict metadata",
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
+			continue
+		}
+		var conflict ConflictMetadata
+		if err := json.Unmarshal(metadataBytes, &conflict); err != nil {
+			logging.Warn("Failed to decode conflict metadata",
+				zap.String("metadata_path", metadataPath),
+				zap.Error(err))
+			continue
+		}
+		if conflict.Path == "" {
+			logging.Warn("Skipping conflict metadata without original path",
+				zap.String("metadata_path", metadataPath))
+			continue
+		}
+		if conflict.PreservedMetadataPath == "" {
+			conflict.PreservedMetadataPath = metadataPath
+		}
+		if conflict.PreservedPath == "" {
+			conflict.PreservedPath = strings.TrimSuffix(metadataPath, ".metadata.json")
+		}
+		if _, err := os.Stat(conflict.PreservedPath); err != nil {
+			if os.IsNotExist(err) {
+				if removeErr := os.Remove(metadataPath); removeErr != nil && !os.IsNotExist(removeErr) {
+					logging.Warn("Failed to remove stale conflict metadata",
+						zap.String("metadata_path", metadataPath),
+						zap.Error(removeErr))
+				}
+				continue
+			}
+			logging.Warn("Failed to stat preserved conflict data",
+				zap.String("preserved_path", conflict.PreservedPath),
+				zap.Error(err))
+			continue
+		}
+		if conflict.ObjectKey == "" {
+			conflict.ObjectKey = objectKeyFromPath(conflict.Path)
+		}
+		if conflict.ConflictStatus == "" {
+			conflict.ConflictStatus = ConflictStatusConflicted
+		}
+		if conflict.ObservedETag == "" {
+			conflict.ObservedETag = conflict.ExternalETag
+			conflict.ObservedSize = conflict.ExternalSize
+			conflict.ObservedLastModified = conflict.ExternalLastModified
+		}
+		sm.dirtyIndex.MarkConflicted(&conflict)
+		recovered++
+	}
+
+	return recovered
 }
 
 // CleanupSession removes a session and optionally deletes the staging file
@@ -654,16 +1140,23 @@ func (sm *StagingManager) Stats() map[string]interface{} {
 	}
 
 	pressure := sm.CurrentPressure()
+	conflictCount, conflictedPaths, lastConflict := sm.ConflictStats()
 
-	return map[string]interface{}{
+	stats := map[string]interface{}{
 		"total_sessions":          len(sm.sessions),
 		"active_sessions":         activeSessions,
 		"dirty_files":             sm.dirtyIndex.Count(),
 		"syncing_files":           sm.dirtyIndex.SyncingCount(),
+		"conflict_count":          conflictCount,
+		"conflicted_paths":        conflictedPaths,
 		"staging_used_bytes":      pressure.UsedBytes,
 		"staging_available_bytes": pressure.AvailableBytes,
 		"staging_pressure_level":  pressure.Level,
 	}
+	if !lastConflict.IsZero() {
+		stats["last_conflict_time"] = lastConflict.Format(time.RFC3339Nano)
+	}
+	return stats
 }
 
 // Made with Bob

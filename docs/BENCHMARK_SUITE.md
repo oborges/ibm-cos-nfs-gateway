@@ -15,7 +15,7 @@ The suite writes every run into a timestamped directory under `benchmark-results
 Recommended mount command:
 
 ```bash
-sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
 ## Quick Start
@@ -86,7 +86,7 @@ Enable crash-safety scenarios with a non-blocking restart command:
   --categories crash-safety \
   --allow-crash \
   --gateway-command 'cd ~/ibm-cos-nfs-gateway && sudo nohup ./bin/nfs-gateway --config configs/config.yaml >/tmp/nfs-gateway-benchmark.log 2>&1 &' \
-  --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs'
+  --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs'
 ```
 
 ## Profiles

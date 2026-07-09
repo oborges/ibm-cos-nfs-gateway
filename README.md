@@ -1,8 +1,9 @@
 # IBM Cloud COS NFS Gateway
 
 IBM Cloud COS NFS Gateway exposes an IBM Cloud Object Storage bucket through an
-NFSv3 mount. It is intended for Linux workloads that need a filesystem-shaped
-interface while storing file data in COS.
+NFSv4 mount by default, with optional NFSv3 compatibility. It is intended for
+Linux workloads that need a filesystem-shaped interface while storing file data
+in COS.
 
 This is an unofficial community project. It is not an IBM product, is not
 endorsed by IBM, and is provided as-is without warranty or official support.
@@ -10,7 +11,8 @@ Test carefully with your own workload before relying on it.
 
 ## What This Gateway Does
 
-- Serves an NFSv3 export backed by one IBM Cloud COS bucket.
+- Serves an NFSv4 export backed by one IBM Cloud COS bucket, with optional
+  NFSv3 or dual-protocol serving.
 - Accepts POSIX-style file operations from Linux NFS clients.
 - Uses a local staging layer for writes.
 - Syncs staged dirty files to COS asynchronously in background workers.
@@ -44,6 +46,36 @@ In short:
 - "Sync complete" means the staged file was uploaded to COS.
 - "Durable in COS" means the uploaded object is visible in COS with the
   expected size/checksum for your validation process.
+
+## Filesystem Operation Limits Over COS
+
+COS/S3 is an object store, not a local filesystem. The gateway keeps these
+operations explicit:
+
+- File rename is copy to the new key followed by delete of the old key. It is
+  not atomic. If copy fails, the old object remains and a destination object may
+  or may not have been created by COS. If delete fails after copy succeeds, both
+  old and new objects may exist; the gateway does not try to delete the new
+  copy as rollback.
+- Directory rename is a best-effort recursive prefix operation. The gateway
+  lists keys under the old directory prefix, copies every listed key to the new
+  prefix, and only then deletes old keys. It is not atomic. If a copy fails,
+  source keys are not deleted and already copied destination keys are left in
+  place. If a delete fails, both prefixes may contain objects.
+- Directory rename to an existing destination path is rejected to avoid
+  implicit merges. Renaming a directory into its own subtree is rejected.
+- Rename or delete of a dirty staged file is rejected until the staged data has
+  synced or otherwise been resolved. The filesystem layer returns busy; the NFS
+  layer maps that to a retryable status. Directory rename is also rejected when
+  any dirty staged child exists under the source or destination tree. This
+  avoids losing accepted writes that are still only in local staging.
+- `mkdir` creates a trailing-slash directory marker object. `rmdir` removes the
+  marker only when the gateway's current listing sees the directory as empty.
+  Implicit directories still come from object key prefixes and may converge
+  through cache expiry or refresh scans.
+- Mutating operations invalidate the target metadata, affected parent and
+  ancestor directory listings, and affected data cache entries. Directory
+  rename/delete invalidates cached data under the old and new prefixes.
 
 ## Prerequisites
 
@@ -98,7 +130,7 @@ Mount it from the same Linux host:
 
 ```bash
 sudo mkdir -p /mnt/cos-nfs
-sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
 Unmount when finished:
@@ -118,6 +150,7 @@ For example, `cos.api_key` becomes `NFS_GATEWAY_COS_API_KEY`.
 ```yaml
 server:
   nfs_port: 2049
+  nfs_version: "4" # "4" by default; use "3" for NFSv3 or "dual" for both
   metrics_enabled: true
   metrics_port: 8080
   health_enabled: true
@@ -202,6 +235,59 @@ Reads can be served from local chunk cache when available. Cold reads fetch
 object ranges from COS, warm reads can hit local cache, and read-ahead can fetch
 nearby chunks in parallel for sequential access patterns.
 
+### Object-Side Change Refresh
+
+By default, object-side changes made directly in COS converge through normal
+cache expiry. Metadata entries and directory listings expire after
+`cache.metadata.ttl_seconds`; the NFS directory wrapper has its own short
+listing TTL.
+
+You can also enable a periodic prefix scan:
+
+```yaml
+object_refresh:
+  enabled: true
+  interval: "5m"
+  prefix: ""
+```
+
+When enabled, the gateway lists the configured COS prefix and compares each
+object's list signature: key, size, ETag, and last-modified time. Created,
+updated, and deleted objects invalidate the affected metadata cache entry, its
+parent directory listing, and the object's data cache. The scanner keeps only an
+in-memory previous-scan map; it does not require a database.
+
+Dirty staged files stay authoritative until the scanner observes that the same
+COS key changed after the scanner's base observation. At that point the gateway
+records a conflict: the local dirty staging file is copied under
+`staging.root_dir/lost+found/` with a JSON metadata sidecar, the original path is
+removed from the sync queue, and the refreshed COS object becomes the default
+visible version. If conflict recording fails, refresh keeps the older dirty-path
+skip behavior and does not overwrite local staged bytes. Parent directory
+listings may still be invalidated, and staged files are re-added to listings by
+the staging layer when no conflict exists. The supported write model remains
+one gateway owning writes for the mounted export; multi-gateway active/active
+writes still require external coordination.
+
+The exact consistency model is:
+
+- Local writes are visible through staging immediately on the same gateway.
+- Direct COS creates, updates, and deletes become visible after metadata/NFS
+  listing cache expiry, or after a successful refresh scan plus any remaining
+  NFS wrapper listing TTL.
+- Clean cached object data is invalidated when the refresh scan sees a changed
+  object list signature.
+- Dirty staged files are never overwritten by refresh. When a dirty path also
+  has an external COS change, the local staged bytes are preserved in
+  `lost+found`, sync is blocked for the stale staged copy, and COS is the
+  default winner for the original path.
+- Deletions are detected after the scanner has seen the object in a previous
+  scan; otherwise they converge through normal cache expiry and COS stat/list
+  misses.
+- User metadata changes are detected when COS list results expose a changed
+  list signature, usually last-modified time for copy-to-self updates; otherwise
+  they converge on metadata cache expiry.
+
 ### Multipart Upload
 
 ```yaml
@@ -237,8 +323,17 @@ Important metrics include:
 - `staging_cos_visibility_latency_seconds`
 - `staging_upload_duration_seconds`
 - `staging_upload_throughput_mib_per_second`
+- `staging_conflict_count`
+- `staging_conflicts_total`
+- `staging_last_conflict_timestamp_seconds`
 - `cache_hits_total`
 - `cache_misses_total`
+- `object_refresh_scans_total`
+- `object_refresh_duration_seconds`
+- `object_refresh_objects_changed_total`
+- `object_refresh_cache_invalidations_total`
+- `object_refresh_skipped_dirty_paths_total`
+- `object_refresh_conflicts_total`
 - `nfs_requests_total`
 - `cos_api_calls_total`
 
@@ -258,7 +353,8 @@ curl http://127.0.0.1:8082/debug/perf
 ```
 
 Use `/debug/staging/sync` to check dirty files, sync queue depth, queue bytes,
-staging pressure, last sync timing, and upload throughput.
+staging pressure, conflict count, conflicted paths, last conflict time, last
+sync timing, and upload throughput.
 
 ## Benchmarking
 
@@ -292,7 +388,7 @@ staging capacity or kill the gateway:
   --categories crash-safety \
   --allow-crash \
   --gateway-command 'cd ~/ibm-cos-nfs-gateway && sudo nohup ./bin/nfs-gateway --config configs/config.yaml >/tmp/nfs-gateway-benchmark.log 2>&1 &' \
-  --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs'
+  --post-restart-command 'sudo umount /mnt/cos-nfs -f || true; sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs'
 ```
 
 Each benchmark run produces:
@@ -357,7 +453,7 @@ Mount fails:
 
 ```bash
 sudo umount /mnt/cos-nfs -f
-sudo mount -t nfs -o vers=3,tcp,nolock,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,port=2049 localhost:/ /mnt/cos-nfs
 ```
 
 Writes succeed but objects are not visible in COS yet:
@@ -392,6 +488,7 @@ Useful local documentation:
 - `docs/BENCHMARK_SUITE.md`
 - `docs/BENCHMARKING.md`
 - `ARCHITECTURE.md`
+- `docs/AWS_S3_FILES_COMPARISON.md`
 - `docs/STAGING_ARCHITECTURE.md`
 
 ## License

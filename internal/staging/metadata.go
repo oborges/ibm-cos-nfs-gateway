@@ -7,46 +7,98 @@ import (
 
 // DirtyFileIndex tracks which files are dirty (not yet synced to COS)
 type DirtyFileIndex struct {
-	dirty   map[string]*DirtyFileMetadata
-	syncing map[string]bool
-	mu      sync.RWMutex
+	dirty     map[string]*DirtyFileMetadata
+	syncing   map[string]bool
+	conflicts map[string]*ConflictMetadata
+	mu        sync.RWMutex
 }
 
 // DirtyFileMetadata contains metadata about a dirty file
 type DirtyFileMetadata struct {
-	Path          string
-	Size          int64
-	DirtySince    time.Time
-	LastModified  time.Time
-	SyncAttempts  int
-	LastSyncError error
+	Path                 string
+	ObjectKey            string
+	ObservedETag         string
+	ObservedSize         int64
+	ObservedLastModified time.Time
+	LocalDirtyGeneration int64
+	StagedPath           string
+	ConflictStatus       string
+	Size                 int64
+	DirtySince           time.Time
+	LastModified         time.Time
+	SyncAttempts         int
+	LastSyncError        error
+}
+
+// ConflictMetadata records a dirty staged path whose COS object changed before
+// the local staged bytes could be synced.
+type ConflictMetadata struct {
+	Path                  string
+	ObjectKey             string
+	Size                  int64
+	PreservedPath         string
+	PreservedMetadataPath string
+	DetectedAt            time.Time
+	Reason                string
+	LocalDirtyGeneration  int64
+	StagedPath            string
+	ConflictStatus        string
+	ObservedETag          string
+	ObservedSize          int64
+	ObservedLastModified  time.Time
+	ExternalSize          int64
+	ExternalETag          string
+	ExternalLastModified  time.Time
+	ExternalDeleted       bool
 }
 
 // NewDirtyFileIndex creates a new dirty file index
 func NewDirtyFileIndex() *DirtyFileIndex {
 	return &DirtyFileIndex{
-		dirty:   make(map[string]*DirtyFileMetadata),
-		syncing: make(map[string]bool),
+		dirty:     make(map[string]*DirtyFileMetadata),
+		syncing:   make(map[string]bool),
+		conflicts: make(map[string]*ConflictMetadata),
 	}
 }
 
 // MarkDirty marks a file as dirty (needs sync)
 func (dfi *DirtyFileIndex) MarkDirty(path string, size int64) {
+	dfi.MarkDirtyWithState(path, size, nil)
+}
+
+// MarkDirtyWithState marks a file as dirty and attaches any durable state known
+// about the staged write.
+func (dfi *DirtyFileIndex) MarkDirtyWithState(path string, size int64, state *PathMetadataState) {
 	dfi.mu.Lock()
 	defer dfi.mu.Unlock()
+
+	if _, conflicted := dfi.conflicts[path]; conflicted {
+		return
+	}
 
 	now := time.Now()
 	if meta, exists := dfi.dirty[path]; exists {
 		meta.Size = size
 		meta.LastModified = now
+		meta.LocalDirtyGeneration++
+		applyPathStateToDirtyMetadata(meta, state)
 	} else {
-		dfi.dirty[path] = &DirtyFileMetadata{
-			Path:         path,
-			Size:         size,
-			DirtySince:   now,
-			LastModified: now,
-			SyncAttempts: 0,
+		generation := int64(1)
+		if state != nil && state.LocalDirtyGeneration > 0 {
+			generation = state.LocalDirtyGeneration
 		}
+		meta := &DirtyFileMetadata{
+			Path:                 path,
+			ObjectKey:            objectKeyFromPath(path),
+			LocalDirtyGeneration: generation,
+			ConflictStatus:       ConflictStatusNone,
+			Size:                 size,
+			DirtySince:           now,
+			LastModified:         now,
+			SyncAttempts:         0,
+		}
+		applyPathStateToDirtyMetadata(meta, state)
+		dfi.dirty[path] = meta
 	}
 }
 
@@ -57,6 +109,47 @@ func (dfi *DirtyFileIndex) MarkClean(path string) {
 
 	delete(dfi.dirty, path)
 	delete(dfi.syncing, path)
+}
+
+// MarkConflicted records a conflict and removes the path from the upload queue.
+func (dfi *DirtyFileIndex) MarkConflicted(meta *ConflictMetadata) {
+	if meta == nil || meta.Path == "" {
+		return
+	}
+
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	metaCopy := *meta
+	delete(dfi.dirty, meta.Path)
+	delete(dfi.syncing, meta.Path)
+	dfi.conflicts[meta.Path] = &metaCopy
+}
+
+// RestoreDirty restores dirty metadata from a durable sidecar without bumping
+// the local dirty generation.
+func (dfi *DirtyFileIndex) RestoreDirty(meta DirtyFileMetadata) {
+	if meta.Path == "" {
+		return
+	}
+
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	if _, conflicted := dfi.conflicts[meta.Path]; conflicted {
+		return
+	}
+	metaCopy := meta
+	if metaCopy.ObjectKey == "" {
+		metaCopy.ObjectKey = objectKeyFromPath(metaCopy.Path)
+	}
+	if metaCopy.LocalDirtyGeneration <= 0 {
+		metaCopy.LocalDirtyGeneration = 1
+	}
+	if metaCopy.ConflictStatus == "" {
+		metaCopy.ConflictStatus = ConflictStatusNone
+	}
+	dfi.dirty[meta.Path] = &metaCopy
 }
 
 // LockFile securely claims the file for syncing by a background worker natively isolating multiple loops
@@ -96,6 +189,15 @@ func (dfi *DirtyFileIndex) IsDirty(path string) bool {
 	return exists
 }
 
+// IsConflicted returns true when the path has an unresolved staging conflict.
+func (dfi *DirtyFileIndex) IsConflicted(path string) bool {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	_, exists := dfi.conflicts[path]
+	return exists
+}
+
 // GetDirtyFiles returns a list of all dirty files
 func (dfi *DirtyFileIndex) GetDirtyFiles() []*DirtyFileMetadata {
 	dfi.mu.RLock()
@@ -111,6 +213,20 @@ func (dfi *DirtyFileIndex) GetDirtyFiles() []*DirtyFileMetadata {
 	return files
 }
 
+// GetConflicts returns copies of all unresolved conflict records.
+func (dfi *DirtyFileIndex) GetConflicts() []*ConflictMetadata {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	conflicts := make([]*ConflictMetadata, 0, len(dfi.conflicts))
+	for _, meta := range dfi.conflicts {
+		metaCopy := *meta
+		conflicts = append(conflicts, &metaCopy)
+	}
+
+	return conflicts
+}
+
 // GetMetadata returns metadata for a specific file
 func (dfi *DirtyFileIndex) GetMetadata(path string) *DirtyFileMetadata {
 	dfi.mu.RLock()
@@ -122,6 +238,27 @@ func (dfi *DirtyFileIndex) GetMetadata(path string) *DirtyFileMetadata {
 	}
 
 	return nil
+}
+
+func applyPathStateToDirtyMetadata(meta *DirtyFileMetadata, state *PathMetadataState) {
+	if meta == nil || state == nil {
+		return
+	}
+	if state.ObjectKey != "" {
+		meta.ObjectKey = state.ObjectKey
+	}
+	meta.ObservedETag = state.ObservedETag
+	meta.ObservedSize = state.ObservedSize
+	meta.ObservedLastModified = state.ObservedLastModified
+	if state.LocalDirtyGeneration > 0 {
+		meta.LocalDirtyGeneration = state.LocalDirtyGeneration
+	}
+	if state.StagedFilePath != "" {
+		meta.StagedPath = state.StagedFilePath
+	}
+	if state.ConflictStatus != "" {
+		meta.ConflictStatus = state.ConflictStatus
+	}
 }
 
 // IncrementSyncAttempts increments the sync attempt counter for a file
@@ -141,6 +278,28 @@ func (dfi *DirtyFileIndex) Count() int {
 	defer dfi.mu.RUnlock()
 
 	return len(dfi.dirty)
+}
+
+// ConflictCount returns the number of unresolved conflict records.
+func (dfi *DirtyFileIndex) ConflictCount() int {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	return len(dfi.conflicts)
+}
+
+// LastConflictTime returns the newest conflict timestamp.
+func (dfi *DirtyFileIndex) LastConflictTime() time.Time {
+	dfi.mu.RLock()
+	defer dfi.mu.RUnlock()
+
+	var last time.Time
+	for _, meta := range dfi.conflicts {
+		if meta.DetectedAt.After(last) {
+			last = meta.DetectedAt
+		}
+	}
+	return last
 }
 
 // SyncingCount returns the number of files currently claimed by sync workers.

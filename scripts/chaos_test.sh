@@ -15,7 +15,7 @@ sudo install -d -m 700 -o root -g root /tmp/nfs-staging
 cd /home/vpcuser/ibm-cos-nfs-gateway
 sudo env NFS_GATEWAY_STAGING_ENABLED=true NFS_GATEWAY_STAGING_ROOT_DIR=/tmp/nfs-staging ./bin/nfs-gateway --config configs/config.yaml > /tmp/nfs-chaos.log 2>&1 &
 sleep 5
-sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/ /mnt/cos-nfs
 
 echo "==== 🚀 TEST 1: Staging Crash Recovery ===="
 # Write 100MB of data, then explicitly freeze and SIGKILL the daemon before COS receives it!
@@ -34,7 +34,7 @@ echo "Rebooting Daemon to strictly evaluate Crash Recovery..."
 sudo umount -f /mnt/cos-nfs || true
 sudo env NFS_GATEWAY_STAGING_ENABLED=true NFS_GATEWAY_STAGING_ROOT_DIR=/tmp/nfs-staging ./bin/nfs-gateway --config configs/config.yaml >> /tmp/nfs-chaos.log 2>&1 &
 sleep 5
-sudo mount -t nfs -o vers=3,tcp,nolock,soft,timeo=30,retrans=2,mountport=2049,port=2049 localhost:/ /mnt/cos-nfs
+sudo mount -t nfs4 -o vers=4.0,tcp,soft,timeo=30,retrans=2,port=2049 localhost:/ /mnt/cos-nfs
 
 echo "Validating if the daemon successfully resumed synchronization sequences for orphaned files..."
 sleep 10

@@ -9,6 +9,7 @@ import (
 func TestLoadUsesNestedEnvironmentOverrides(t *testing.T) {
 	t.Setenv("NFS_GATEWAY_COS_API_KEY", "env-api-key")
 	t.Setenv("NFS_GATEWAY_COS_BUCKET", "env-bucket")
+	t.Setenv("NFS_GATEWAY_SERVER_NFS_VERSION", "dual")
 	t.Setenv("NFS_GATEWAY_CACHE_DATA_ENABLED", "false")
 	t.Setenv("NFS_GATEWAY_PERFORMANCE_MAX_FULL_OBJECT_READ_MB", "64")
 	t.Setenv("NFS_GATEWAY_PERFORMANCE_MAX_BUFFERED_WRITE_MB", "128")
@@ -18,6 +19,7 @@ func TestLoadUsesNestedEnvironmentOverrides(t *testing.T) {
 	configData := []byte(`
 server:
   nfs_port: 2049
+  nfs_version: "4"
   metrics_port: 8080
   health_port: 8081
   max_connections: 1000
@@ -71,6 +73,13 @@ staging:
 	}
 	if cfg.COS.Bucket != "env-bucket" {
 		t.Fatalf("COS.Bucket = %q, want env-bucket", cfg.COS.Bucket)
+	}
+	if cfg.Server.NFSVersion != "dual" {
+		t.Fatalf("Server.NFSVersion = %q, want dual", cfg.Server.NFSVersion)
+	}
+	versions := cfg.Server.GetNFSVersions()
+	if len(versions) != 2 || versions[0] != 3 || versions[1] != 4 {
+		t.Fatalf("Server.GetNFSVersions() = %v, want [3 4]", versions)
 	}
 	if cfg.Cache.Data.Enabled {
 		t.Fatalf("Cache.Data.Enabled = true, want false from env override")

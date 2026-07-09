@@ -3,15 +3,21 @@
 ## Overview
 
 IBM Cloud COS NFS Gateway exposes a single IBM Cloud Object Storage bucket as an
-NFSv3 filesystem. Linux clients speak NFS to the gateway; the gateway translates
-filesystem operations into COS object operations and uses local disk for staging,
-write-back sync, and read caching.
+NFSv4 filesystem by default, with optional NFSv3 compatibility. Linux clients
+speak NFS to the gateway; the gateway translates filesystem operations into COS
+object operations and uses local disk for staging, write-back sync, and read
+caching.
+
+For a direct comparison with AWS's newer S3 file-access direction, see
+[`docs/AWS_S3_FILES_COMPARISON.md`](docs/AWS_S3_FILES_COMPARISON.md).
 
 The current architecture is intentionally centered on local correctness:
 
 - Writes are accepted into local staging first.
 - Background workers sync dirty staged files to COS asynchronously.
 - Read paths prefer dirty/staged data when present, then local cache, then COS.
+- Object-side COS changes converge through cache expiry or optional refresh
+  scans.
 - Backpressure protects staging capacity before the local filesystem is full.
 - Multipart uploads are owned by final sync workers and protected from
   per-object races.
@@ -21,7 +27,7 @@ The current architecture is intentionally centered on local correctness:
 
 ```mermaid
 flowchart TB
-    client["Linux NFS client"] -->|NFSv3 TCP| nfs["NFS server layer"]
+    client["Linux NFS client"] -->|NFSv4 TCP by default| nfs["NFS server layer"]
 
     subgraph gateway["COS NFS Gateway"]
         nfs --> wrappers["NFS wrappers: auth, cache, instrumentation, stable verifier"]
@@ -31,7 +37,9 @@ flowchart TB
         staging --> sync["Async sync workers"]
         ops --> metadata["Metadata cache"]
         ops --> data["Chunk data cache"]
+        ops --> refresh["Object refresh scanner"]
         ops --> cos["COS client"]
+        refresh --> cos
         sync --> cos
         fs --> metrics["Metrics, health, debug endpoints"]
     end
@@ -46,14 +54,15 @@ flowchart TB
 
 ### NFS Layer
 
-The gateway serves NFSv3 over TCP, normally on port `2049`. The NFS stack is
-built on a vendored `go-nfs` dependency with local changes needed for gateway
-behavior, including filesystem statistics forwarding and deterministic ENOSPC
-mapping.
+The gateway serves NFSv4 over TCP by default, normally on port `2049`. It can
+also serve NFSv3 or dual NFSv3/NFSv4 from the same listener when configured.
+The NFS stack is built on a vendored `go-nfs` dependency with local changes
+needed for gateway behavior, including filesystem statistics forwarding,
+NFSv4 COMPOUND handling, and deterministic ENOSPC mapping.
 
 The request path is:
 
-1. NFS client sends an NFSv3 operation.
+1. NFS client sends an NFSv4 COMPOUND request or an enabled NFSv3 operation.
 2. `go-nfs` decodes the request.
 3. wrapper handlers apply caching, instrumentation, and stable directory
    verifier behavior.
@@ -116,6 +125,48 @@ entries store file attributes and directory listings with TTL-based expiration.
 
 Write, remove, rename, and metadata-changing operations invalidate relevant
 cache entries so clients do not keep reading stale metadata through the gateway.
+Mutations invalidate the target path, affected parent and ancestor directory
+listings, and affected data cache entries. Directory rename and delete also
+invalidate cached data under the affected prefixes so range/chunk reads do not
+serve stale bytes through old logical paths.
+
+### Object-Side Refresh Path
+
+Direct changes made in COS by tools outside the gateway are discovered in two
+ways:
+
+1. normal metadata and directory cache TTL expiry followed by fresh COS stat or
+   prefix-list operations.
+2. optional periodic refresh scans configured by `object_refresh`.
+
+The refresh scanner performs a COS `ListObjectsV2` over the configured prefix
+and compares the current in-memory object signatures with the previous scan.
+The signature is the object's key, size, ETag, and last-modified time as exposed
+by COS listing. When a clean object's signature is created, changed, or removed,
+the scanner invalidates:
+
+- the file metadata cache entry.
+- the parent directory listing cache entry.
+- the local data cache entries for that object.
+
+The scanner intentionally does not fetch object data and does not write COS
+data into staging files. Its first successful scan establishes the in-memory
+base observation. If a later scan sees the same key created, updated, or deleted
+while that path has dirty local staged data, the gateway records a staging
+conflict instead of uploading the stale local copy. Conflict recording copies
+the local dirty file under `staging.root_dir/lost+found/`, writes a JSON sidecar
+describing the object-side change, removes the original path from the dirty sync
+queue, invalidates caches, and leaves the COS/object-store state as the default
+winner for that path. If conflict recording fails, refresh keeps the older
+dirty-path skip behavior and avoids overwriting the local staged bytes. Parent
+listings may still be invalidated so unrelated object-side directory changes
+can converge; non-conflicted dirty staged files are merged back into listings by
+the NFS/staging layer.
+
+Deletion detection is in-memory and practical rather than database-backed. A
+delete is detected when an object seen in a previous scan is missing from the
+current scan. Deletes for objects the scanner has never observed still converge
+through normal cache expiry and subsequent COS stat/list misses.
 
 ## Core Components
 
@@ -150,6 +201,7 @@ This package implements object-backed POSIX-style operations:
 - range and whole-object reads.
 - chunk-cache and metadata-cache integration.
 - singleflight deduplication for concurrent COS range fetches.
+- object-side refresh scans and clean-cache invalidation.
 
 When staging is enabled, the primary write path is handled by `internal/nfs` and
 `internal/staging`; the POSIX handler remains responsible for COS-backed reads,
@@ -226,8 +278,8 @@ The gateway exposes optional HTTP endpoints for operations:
 - debug endpoints on `127.0.0.1:<debug_port>/debug/*`.
 
 The debug staging endpoint reports dirty files, sync queue depth, queue bytes,
-staging pressure, last sync timing, COS visibility latency, and upload
-throughput.
+staging pressure, conflict count, conflicted paths, last conflict time, last sync
+timing, COS visibility latency, and upload throughput.
 
 ## Staging Backpressure
 
@@ -280,10 +332,51 @@ The gateway provides local read-after-write consistency through staging: a
 client that writes a file can read the dirty version from the gateway before COS
 sync completes.
 
+For object-side changes made directly in COS:
+
+- Clean cached metadata and directory listings converge after
+  `cache.metadata.ttl_seconds`, or sooner when `object_refresh.enabled` is true
+  and a refresh scan observes a changed object list signature.
+- The NFS directory wrapper has its own short listing TTL, so a mounted client
+  may observe a refreshed POSIX listing only after that wrapper entry expires.
+- Clean cached data is invalidated by refresh when the object's key, size, ETag,
+  or last-modified time changes in COS list results.
+- Dirty staged files remain authoritative for reads, stats, and listings on the
+  gateway until refresh observes an external COS change for the same key. In
+  that conflict case, refresh preserves the local staged bytes under
+  `lost+found`, blocks upload of the stale staged copy, invalidates caches, and
+  makes COS the default winner for the original path.
+- Object deletions are detected by refresh only after the scanner has observed
+  the object in a previous scan. Otherwise deletes converge through ordinary
+  cache expiry and fresh COS misses.
+- COS user metadata changes are detected by refresh when they also change the
+  listed signature, commonly last-modified time after copy-to-self metadata
+  updates. Otherwise user metadata changes converge through metadata cache TTL.
+
+The supported write ownership model is one gateway owning writes for a mounted
+export. Direct COS writes are treated as external changes that clean gateway
+caches can learn about; simultaneous active/active writers still need external
+coordination.
+
 COS is still an object store, so some filesystem operations are approximations:
 
-- rename is implemented through object operations and is not equivalent to a
-  local filesystem atomic rename across every failure mode.
+- file rename is copy to the new object key followed by delete of the old key.
+  It is not atomic. If copy fails, the source remains and a destination may or
+  may not have been created by COS. If delete fails after copy succeeds, both
+  keys may exist; the gateway does not delete the destination as rollback.
+- directory rename is a best-effort recursive prefix copy followed by source
+  deletes only after all listed copies succeed. It is not atomic. Copy failure
+  leaves source keys in place and any already copied destination keys in place.
+  Delete failure after copy can leave both prefixes populated. Existing
+  destination directories are rejected to avoid implicit merges, and renaming a
+  directory into its own subtree is rejected.
+- dirty staged files are durable local state until sync completes. Rename or
+  delete of a dirty staged file is rejected as busy at the filesystem layer and
+  retryable at the NFS layer. Directory rename is also rejected when dirty
+  staged children exist under the source or destination tree.
+- `mkdir` creates a trailing-slash marker object. `rmdir` deletes that marker
+  only when the gateway's current listing sees the directory as empty. Implicit
+  directories are derived from object key prefixes.
 - hard links are not supported as native object-store constructs.
 - generated file identity is based on path/object metadata rather than true
   persistent inode allocation from COS.
@@ -297,6 +390,7 @@ The main configuration groups are:
 ```yaml
 server:
   nfs_port: 2049
+  nfs_version: "4"
   metrics_enabled: true
   metrics_port: 8080
   health_enabled: true
@@ -333,6 +427,11 @@ performance:
   max_full_object_read_mb: 512
   max_buffered_write_mb: 512
   max_directory_entries: 100000
+
+object_refresh:
+  enabled: false
+  interval: "5m"
+  prefix: ""
 
 staging:
   enabled: true
@@ -371,6 +470,11 @@ Important Prometheus metrics include:
 - `staging_upload_throughput_mib_per_second`
 - `cache_hits_total`
 - `cache_misses_total`
+- `object_refresh_scans_total`
+- `object_refresh_duration_seconds`
+- `object_refresh_objects_changed_total`
+- `object_refresh_cache_invalidations_total`
+- `object_refresh_skipped_dirty_paths_total`
 - `nfs_requests_total`
 - `cos_api_calls_total`
 
@@ -410,7 +514,7 @@ COS access is authenticated with the configured IBM Cloud credentials. Those
 credentials should be scoped to the target bucket and stored outside source
 control.
 
-COS API traffic uses HTTPS through the IBM COS SDK. NFS traffic is plain NFSv3
+COS API traffic uses HTTPS through the IBM COS SDK. NFS traffic is plain NFS
 and should be kept on trusted networks.
 
 ## Benchmark Architecture

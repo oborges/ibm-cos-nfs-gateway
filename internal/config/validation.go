@@ -24,6 +24,10 @@ func Validate(config *Config) error {
 		return fmt.Errorf("performance config: %w", err)
 	}
 
+	if err := validateObjectRefresh(&config.ObjectRefresh); err != nil {
+		return fmt.Errorf("object_refresh config: %w", err)
+	}
+
 	if err := validateLogging(&config.Logging); err != nil {
 		return fmt.Errorf("logging config: %w", err)
 	}
@@ -39,6 +43,12 @@ func Validate(config *Config) error {
 func validateServer(config *ServerConfig) error {
 	if config.NFSPort < 1 || config.NFSPort > 65535 {
 		return fmt.Errorf("invalid nfs_port: %d (must be 1-65535)", config.NFSPort)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(config.NFSVersion)) {
+	case "3", "v3", "nfsv3", "4", "v4", "nfsv4", "dual", "both", "3,4", "4,3":
+	default:
+		return fmt.Errorf("invalid nfs_version: %s (must be '4', '3', or 'dual')", config.NFSVersion)
 	}
 
 	if config.MetricsPort < 1 || config.MetricsPort > 65535 {
@@ -194,6 +204,27 @@ func validatePerformance(config *PerformanceConfig) error {
 
 	if config.MaxDirectoryEntries < 1 {
 		return fmt.Errorf("invalid max_directory_entries: %d (must be > 0)", config.MaxDirectoryEntries)
+	}
+
+	return nil
+}
+
+// validateObjectRefresh validates object-side refresh configuration.
+func validateObjectRefresh(config *ObjectRefreshConfig) error {
+	if !config.Enabled {
+		return nil
+	}
+
+	interval, err := config.GetInterval()
+	if err != nil {
+		return fmt.Errorf("invalid interval: %w", err)
+	}
+	if interval <= 0 {
+		return fmt.Errorf("invalid interval: %s (must be > 0)", interval)
+	}
+
+	if strings.Contains(config.Prefix, "\x00") {
+		return fmt.Errorf("invalid prefix: contains NUL byte")
 	}
 
 	return nil

@@ -186,6 +186,27 @@ var (
 		},
 	)
 
+	stagingConflictCount = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_conflict_count",
+			Help: "Current number of unresolved staging conflicts",
+		},
+	)
+
+	stagingConflictsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "staging_conflicts_total",
+			Help: "Total staging conflicts recorded after external object changes",
+		},
+	)
+
+	stagingLastConflictTimestampSeconds = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "staging_last_conflict_timestamp_seconds",
+			Help: "Unix timestamp for the most recent staging conflict, or 0 when none are recorded",
+		},
+	)
+
 	writesBlockedTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "writes_blocked_total",
@@ -205,6 +226,51 @@ var (
 			Name:    "backpressure_wait_seconds",
 			Help:    "Seconds spent waiting for staging backpressure to clear",
 			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
+		},
+	)
+
+	objectRefreshScansTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "object_refresh_scans_total",
+			Help: "Total number of object-side refresh scans",
+		},
+		[]string{"status"},
+	)
+
+	objectRefreshDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "object_refresh_duration_seconds",
+			Help:    "Wall-clock seconds spent scanning COS for object-side changes",
+			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+		},
+	)
+
+	objectRefreshObjectsChangedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "object_refresh_objects_changed_total",
+			Help: "Total number of created, updated, or deleted COS objects seen by refresh scans",
+		},
+	)
+
+	objectRefreshCacheInvalidationsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "object_refresh_cache_invalidations_total",
+			Help: "Total number of cache invalidations caused by object-side refresh",
+		},
+		[]string{"cache_type"},
+	)
+
+	objectRefreshSkippedDirtyPathsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "object_refresh_skipped_dirty_paths_total",
+			Help: "Total number of dirty staged paths skipped by object-side refresh",
+		},
+	)
+
+	objectRefreshConflictsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "object_refresh_conflicts_total",
+			Help: "Total number of object-side refresh changes that produced staging conflicts",
 		},
 	)
 )
@@ -234,9 +300,18 @@ func Initialize() {
 		stagingUsedBytes,
 		stagingAvailableBytes,
 		stagingPressureLevel,
+		stagingConflictCount,
+		stagingConflictsTotal,
+		stagingLastConflictTimestampSeconds,
 		writesBlockedTotal,
 		writesRejectedTotal,
 		backpressureWaitSeconds,
+		objectRefreshScansTotal,
+		objectRefreshDuration,
+		objectRefreshObjectsChangedTotal,
+		objectRefreshCacheInvalidationsTotal,
+		objectRefreshSkippedDirtyPathsTotal,
+		objectRefreshConflictsTotal,
 	)
 
 	logging.Info("Metrics initialized")
@@ -301,6 +376,44 @@ func RecordCacheEviction(cacheType string) {
 	cacheEvictionsTotal.WithLabelValues(cacheType).Inc()
 }
 
+// RecordObjectRefreshScanPrometheus records a refresh scan outcome and duration.
+func RecordObjectRefreshScanPrometheus(status string, duration time.Duration) {
+	objectRefreshScansTotal.WithLabelValues(status).Inc()
+	objectRefreshDuration.Observe(duration.Seconds())
+}
+
+// RecordObjectRefreshObjectsChangedPrometheus records changed objects seen by refresh.
+func RecordObjectRefreshObjectsChangedPrometheus(count int) {
+	if count > 0 {
+		objectRefreshObjectsChangedTotal.Add(float64(count))
+	}
+	RecordObjectRefreshObjectsChanged(count)
+}
+
+// RecordObjectRefreshCacheInvalidationsPrometheus records refresh cache invalidations.
+func RecordObjectRefreshCacheInvalidationsPrometheus(cacheType string, count int) {
+	if count > 0 {
+		objectRefreshCacheInvalidationsTotal.WithLabelValues(cacheType).Add(float64(count))
+	}
+	RecordObjectRefreshCacheInvalidations(count)
+}
+
+// RecordObjectRefreshSkippedDirtyPathsPrometheus records dirty paths skipped by refresh.
+func RecordObjectRefreshSkippedDirtyPathsPrometheus(count int) {
+	if count > 0 {
+		objectRefreshSkippedDirtyPathsTotal.Add(float64(count))
+	}
+	RecordObjectRefreshSkippedDirtyPaths(count)
+}
+
+// RecordObjectRefreshConflictsPrometheus records refresh-detected staging conflicts.
+func RecordObjectRefreshConflictsPrometheus(count int) {
+	if count > 0 {
+		objectRefreshConflictsTotal.Add(float64(count))
+	}
+	RecordObjectRefreshConflicts(count)
+}
+
 // RecordBytesRead records bytes read
 func RecordBytesRead(bytes int64) {
 	bytesReadTotal.Add(float64(bytes))
@@ -352,6 +465,21 @@ func SetStagingPressure(usedBytes, availableBytes int64, pressureLevel string) {
 	stagingUsedBytes.Set(float64(usedBytes))
 	stagingAvailableBytes.Set(float64(availableBytes))
 	stagingPressureLevel.Set(float64(pressureLevelValue(pressureLevel)))
+}
+
+// RecordStagingConflict increments the total conflict counter.
+func RecordStagingConflict() {
+	stagingConflictsTotal.Inc()
+}
+
+// SetStagingConflicts records unresolved staging conflict state.
+func SetStagingConflicts(count int, lastConflict time.Time) {
+	stagingConflictCount.Set(float64(count))
+	if lastConflict.IsZero() {
+		stagingLastConflictTimestampSeconds.Set(0)
+		return
+	}
+	stagingLastConflictTimestampSeconds.Set(float64(lastConflict.Unix()))
 }
 
 // RecordBackpressureBlocked records that a write entered backpressure wait.

@@ -11,7 +11,6 @@ import (
 
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
-	"github.com/oborges/cos-nfs-gateway/internal/cos"
 	"github.com/oborges/cos-nfs-gateway/internal/logging"
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
@@ -21,7 +20,7 @@ import (
 
 // OperationsHandler handles POSIX filesystem operations
 type OperationsHandler struct {
-	cosClient     *cos.Client
+	cosClient     ObjectStore
 	metadataCache *cache.MetadataCache
 	dataCache     *cache.DataCache
 	translator    *PathTranslator
@@ -29,9 +28,22 @@ type OperationsHandler struct {
 	readGroup     singleflight.Group
 }
 
+// ObjectStore is the COS API surface used by POSIX operations and refresh scans.
+type ObjectStore interface {
+	GetObject(ctx context.Context, key string) ([]byte, error)
+	GetObjectRange(ctx context.Context, key string, offset, length int64) ([]byte, error)
+	GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error)
+	PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error
+	DeleteObject(ctx context.Context, key string) error
+	HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error)
+	ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error)
+	CopyObject(ctx context.Context, sourceKey, destKey string) error
+	UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error
+}
+
 // NewOperationsHandler creates a new operations handler
 func NewOperationsHandler(
-	cosClient *cos.Client,
+	cosClient ObjectStore,
 	metadataCache *cache.MetadataCache,
 	dataCache *cache.DataCache,
 	perfConfig *config.PerformanceConfig,
@@ -83,6 +95,48 @@ func (h *OperationsHandler) readAheadBytes() int64 {
 
 func (h *OperationsHandler) dataCacheEnabled() bool {
 	return h.dataCache != nil && h.dataCache.IsEnabled()
+}
+
+func (h *OperationsHandler) invalidateFileMutation(path string) {
+	h.invalidateObjectPath(path)
+	h.invalidateDataPath(path)
+}
+
+func (h *OperationsHandler) invalidateDirectoryMutation(path string) {
+	if h == nil {
+		return
+	}
+
+	if h.metadataCache != nil {
+		normalized := NormalizePath(path)
+		prefix := normalized
+		if prefix != "/" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+
+		h.metadataCache.Delete(normalized)
+		h.metadataCache.InvalidatePrefix(prefix)
+		h.invalidateAncestorListings(GetParentPath(normalized))
+	}
+
+	if h.dataCacheEnabled() {
+		if err := h.dataCache.DeleteObjectPrefix(NormalizePath(path)); err != nil {
+			logging.Warn("Failed to invalidate data cache prefix",
+				zap.String("path", path),
+				zap.Error(err))
+		}
+	}
+}
+
+func (h *OperationsHandler) invalidateRenameMutation(oldPath, newPath string, isDir bool) {
+	if isDir {
+		h.invalidateDirectoryMutation(oldPath)
+		h.invalidateDirectoryMutation(newPath)
+		return
+	}
+
+	h.invalidateFileMutation(oldPath)
+	h.invalidateFileMutation(newPath)
 }
 
 func (h *OperationsHandler) ensureFullObjectReadAllowed(ctx context.Context, path string) error {
@@ -513,10 +567,7 @@ func (h *OperationsHandler) WriteFile(ctx context.Context, path string, data []b
 	}
 
 	// Invalidate caches
-	h.metadataCache.InvalidatePath(path)
-	if h.dataCacheEnabled() {
-		h.dataCache.DeleteObject(path)
-	}
+	h.invalidateFileMutation(path)
 
 	metrics.RecordBytesWritten(int64(len(data)))
 	log.Debug("File write successful")
@@ -541,10 +592,7 @@ func (h *OperationsHandler) DeleteFile(ctx context.Context, path string) error {
 	}
 
 	// Invalidate caches
-	h.metadataCache.InvalidatePath(path)
-	if h.dataCacheEnabled() {
-		h.dataCache.DeleteObject(path)
-	}
+	h.invalidateFileMutation(path)
 
 	log.Debug("File deleted successfully")
 	return nil
@@ -573,8 +621,8 @@ func (h *OperationsHandler) CreateDirectory(ctx context.Context, path string, at
 		return err
 	}
 
-	// Invalidate parent directory cache
-	h.metadataCache.InvalidatePath(GetParentPath(path))
+	// Invalidate the new directory metadata and all parent listings.
+	h.invalidateDirectoryMutation(path)
 
 	log.Debug("Directory created successfully")
 	return nil
@@ -608,7 +656,7 @@ func (h *OperationsHandler) DeleteDirectory(ctx context.Context, path string) er
 	}
 
 	// Invalidate caches
-	h.metadataCache.InvalidateDirectory(path)
+	h.invalidateDirectoryMutation(path)
 
 	log.Debug("Directory deleted successfully")
 	return nil
@@ -774,11 +822,27 @@ func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath str
 		metrics.RecordNFSRequest("rename", "success", time.Since(start))
 	}()
 
+	oldPath = NormalizePath(oldPath)
+	newPath = NormalizePath(newPath)
+	if oldPath == newPath {
+		return nil
+	}
+
+	info, err := h.Stat(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return h.renameDirectory(ctx, oldPath, newPath)
+	}
+
 	oldKey := h.translator.ToObjectKey(oldPath)
 	newKey := h.translator.ToObjectKey(newPath)
 
+	defer h.invalidateRenameMutation(oldPath, newPath, false)
+
 	// Copy to new location
-	err := h.cosClient.CopyObject(ctx, oldKey, newKey)
+	err = h.cosClient.CopyObject(ctx, oldKey, newKey)
 	if err != nil {
 		log.Error("Failed to copy object", zap.Error(err))
 		return err
@@ -788,20 +852,82 @@ func (h *OperationsHandler) RenameFile(ctx context.Context, oldPath, newPath str
 	err = h.cosClient.DeleteObject(ctx, oldKey)
 	if err != nil {
 		log.Error("Failed to delete old object", zap.Error(err))
-		// Try to clean up the copy
-		h.cosClient.DeleteObject(ctx, newKey)
-		return err
-	}
-
-	// Invalidate caches
-	h.metadataCache.InvalidatePath(oldPath)
-	h.metadataCache.InvalidatePath(newPath)
-	if h.dataCacheEnabled() {
-		h.dataCache.DeleteObject(oldPath)
-		h.dataCache.DeleteObject(newPath)
+		return fmt.Errorf("rename copied %s to %s but failed to delete source; both objects may exist: %w", oldPath, newPath, err)
 	}
 
 	log.Debug("File renamed successfully")
+	return nil
+}
+
+func (h *OperationsHandler) renameDirectory(ctx context.Context, oldPath, newPath string) error {
+	log := logging.WithOperation("RenameDirectory").With(
+		zap.String("oldPath", oldPath),
+		zap.String("newPath", newPath),
+	)
+
+	if oldPath == "/" {
+		return fmt.Errorf("cannot rename root directory")
+	}
+	if IsDescendant(oldPath, newPath) {
+		return fmt.Errorf("cannot rename directory %s into its own subtree %s", oldPath, newPath)
+	}
+
+	if existing, err := h.Stat(ctx, newPath); err == nil {
+		return fmt.Errorf("cannot rename directory %s to existing path %s (is_dir=%t)", oldPath, newPath, existing.IsDir())
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	oldPrefix := ListPrefix(oldPath)
+	newPrefix := ListPrefix(newPath)
+
+	defer h.invalidateRenameMutation(oldPath, newPath, true)
+
+	metrics.RecordCOSListObjects()
+	objects, err := h.cosClient.ListObjects(ctx, oldPrefix, 0)
+	if err != nil {
+		log.Error("Failed to list directory objects for rename", zap.Error(err))
+		return err
+	}
+	if len(objects) == 0 {
+		return os.ErrNotExist
+	}
+
+	copied := 0
+	for _, obj := range objects {
+		if obj == nil || !strings.HasPrefix(obj.Key, oldPrefix) {
+			continue
+		}
+		destKey := newPrefix + strings.TrimPrefix(obj.Key, oldPrefix)
+		if err := h.cosClient.CopyObject(ctx, obj.Key, destKey); err != nil {
+			log.Error("Failed to copy directory object",
+				zap.String("source_key", obj.Key),
+				zap.String("dest_key", destKey),
+				zap.Error(err))
+			return fmt.Errorf("directory rename copied %d of %d objects before copy failed at %s -> %s; source objects were not deleted and copied destination objects were left in place: %w",
+				copied, len(objects), obj.Key, destKey, err)
+		}
+		copied++
+	}
+
+	deleted := 0
+	for _, obj := range objects {
+		if obj == nil || !strings.HasPrefix(obj.Key, oldPrefix) {
+			continue
+		}
+		if err := h.cosClient.DeleteObject(ctx, obj.Key); err != nil {
+			log.Error("Failed to delete source directory object after copy",
+				zap.String("source_key", obj.Key),
+				zap.Error(err))
+			return fmt.Errorf("directory rename copied %d objects but deleted only %d source objects before delete failed at %s; source and destination may both contain objects: %w",
+				copied, deleted, obj.Key, err)
+		}
+		deleted++
+	}
+
+	log.Debug("Directory renamed successfully",
+		zap.Int("objects_copied", copied),
+		zap.Int("objects_deleted", deleted))
 	return nil
 }
 
