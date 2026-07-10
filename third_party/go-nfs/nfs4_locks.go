@@ -301,6 +301,9 @@ func (lm *nfs4LockManager) lockByStateID(other [nfs4OtherSize]byte, path string,
 func (lm *nfs4LockManager) lockLocked(owner lockOwnerID, path string, req lockRange) (*lockState, *lockDenied, nfs4Status) {
 	lm.touchClient(owner.clientID)
 
+	Log.Debugf("nfs4 LOCK owner={client:%x owner:%x} path=%q range=[%d,%d) type=%d states_on_file=%d",
+		owner.clientID, owner.owner, path, req.start, req.end, req.lockType, len(lm.byFile[path]))
+
 	if denied := lm.findConflictLocked(path, owner, req); denied != nil {
 		return nil, denied, nfs4ErrDenied
 	}

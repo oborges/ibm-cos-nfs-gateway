@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -239,6 +240,32 @@ func TestCoalesceMergesSameTypeRanges(t *testing.T) {
 	st, _, _ := lm.lock(owner, "/f", lockRange{start: 20, end: 30, lockType: writeLT})
 	if len(st.ranges) != 1 || st.ranges[0].start != 0 || st.ranges[0].end != 30 {
 		t.Fatalf("ranges = %+v, want single [0,30)", st.ranges)
+	}
+}
+
+func TestCompoundResponseKeepsDeniedLockBody(t *testing.T) {
+	// LOCK DENIED results must carry the LOCK4denied payload; clients fail
+	// to decode the response without it and retry until the conflict
+	// disappears, which reads as a granted lock. (Found via cross-client
+	// locking between two real NFS client machines.)
+	var deniedBody bytes.Buffer
+	wr := newNFS4Writer(&deniedBody)
+	writeLockDenied(wr, &lockDenied{offset: 0, length: 100, lockType: writeLT,
+		owner: lockOwnerID{clientID: 0xABCD, owner: "conflicting-owner"}})
+
+	results := []nfs4Result{
+		{op: opPutFH, status: nfs4OK},
+		{op: opLock, status: nfs4ErrDenied, body: deniedBody.Bytes()},
+	}
+
+	var out bytes.Buffer
+	w := &response{writer: &out, req: &request{xid: 7}}
+	if err := writeNFSv4CompoundResponse(w, nfs4ErrDenied, nil, results); err != nil {
+		t.Fatalf("writeNFSv4CompoundResponse() error = %v", err)
+	}
+
+	if !bytes.Contains(out.Bytes(), deniedBody.Bytes()) {
+		t.Fatal("compound response must include the LOCK4denied body for DENIED lock ops")
 	}
 }
 

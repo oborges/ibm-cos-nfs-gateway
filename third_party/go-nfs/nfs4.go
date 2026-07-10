@@ -1172,7 +1172,10 @@ func writeNFSv4CompoundResponse(w *response, status nfs4Status, tag []byte, resu
 	for _, res := range results {
 		wr.writeUint32(uint32(res.op))
 		wr.writeUint32(uint32(res.status))
-		if res.status == nfs4OK && len(res.body) > 0 {
+		// Failed ops have empty bodies except LOCK/LOCKT DENIED, whose
+		// results must carry the LOCK4denied conflict details; the dispatch
+		// layer already cleared bodies that must not be sent.
+		if len(res.body) > 0 {
 			wr.writeBytes(res.body)
 		}
 	}
