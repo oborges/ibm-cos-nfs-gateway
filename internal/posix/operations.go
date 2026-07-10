@@ -2,6 +2,7 @@ package posix
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -206,12 +207,39 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	metrics.RecordCacheMiss("metadata")
 	log.Info("Stat cache miss", zap.String("path", path))
 
+	// The export root exists by definition; never depend on the object store
+	// to answer for it. This keeps the mount usable (and creates at the root
+	// working) during a backend outage.
+	if NormalizePath(path) == "/" {
+		attrs := DefaultAttributes(true)
+		info := &FileInfo{
+			name:    "/",
+			size:    0,
+			mode:    attrs.Mode | os.ModeDir,
+			modTime: attrs.Mtime,
+			isDir:   true,
+		}
+		h.metadataCache.SetFileInfo(path, info, attrs)
+		return info, nil
+	}
+
 	// Translate path to object key
 	objectKey := h.translator.ToObjectKey(path)
+
+	// A backend failure that is not a definite "not found" must not be
+	// reported as nonexistence: false ENOENT during an object-store outage
+	// corrupts application behavior. Track it and surface an I/O error.
+	var backendErr error
+	trackBackendErr := func(err error) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) && backendErr == nil {
+			backendErr = err
+		}
+	}
 
 	// Try as file first
 	metrics.RecordCOSHeadObject()
 	metadata, err := h.cosClient.HeadObject(ctx, objectKey)
+	trackBackendErr(err)
 	if err == nil {
 		// It's a file
 		attrs := DecodePOSIXAttributes(metadata.Metadata, false)
@@ -234,6 +262,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	dirKey := ToDirectoryKey(objectKey)
 	metrics.RecordCOSHeadObject()
 	metadata, err = h.cosClient.HeadObject(ctx, dirKey)
+	trackBackendErr(err)
 	if err == nil {
 		// It's a directory
 		attrs := DecodePOSIXAttributes(metadata.Metadata, true)
@@ -261,6 +290,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 
 	metrics.RecordCOSListObjects()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, 1)
+	trackBackendErr(err)
 	if err == nil && len(objects) > 0 {
 		// It's an implicit directory - has children
 		log.Debug("Implicit directory detected", zap.String("prefix", prefix))
@@ -282,6 +312,12 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 
 		log.Debug("Implicit directory stat successful")
 		return info, nil
+	}
+
+	if backendErr != nil {
+		log.Error("Stat could not determine existence: object store unreachable",
+			zap.Error(backendErr))
+		return nil, fmt.Errorf("object store unreachable for %s: %w", path, backendErr)
 	}
 
 	log.Debug("Path not found")

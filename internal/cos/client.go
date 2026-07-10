@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -105,16 +106,25 @@ func NewClient(cfg *config.COSConfig) (*Client, error) {
 		config:   cfg,
 	}
 
-	// Verify connectivity
+	// Verify connectivity. An unreachable COS must not prevent startup: the
+	// gateway can serve cached reads and accept staged writes during an
+	// object-store outage, and crash recovery must be able to bring the
+	// export back while COS is still down. Misconfiguration surfaces here
+	// too, so log loudly either way; operations retry until COS responds.
 	if err := client.ping(); err != nil {
-		return nil, fmt.Errorf("failed to connect to COS: %w", err)
+		logging.Error("COS not reachable at startup; starting in degraded mode. "+
+			"Staged writes and cached reads continue; sync retries until COS responds. "+
+			"If this persists, verify endpoint, bucket, and credentials.",
+			zap.String("endpoint", cfg.Endpoint),
+			zap.String("bucket", cfg.Bucket),
+			zap.Error(err))
+	} else {
+		logging.Info("COS client initialized",
+			zap.String("endpoint", cfg.Endpoint),
+			zap.String("bucket", cfg.Bucket),
+			zap.String("region", cfg.Region),
+		)
 	}
-
-	logging.Info("COS client initialized",
-		zap.String("endpoint", cfg.Endpoint),
-		zap.String("bucket", cfg.Bucket),
-		zap.String("region", cfg.Region),
-	)
 
 	return client, nil
 }
@@ -442,6 +452,12 @@ func (c *Client) HeadObject(ctx context.Context, key string) (*types.ObjectMetad
 	result, err := c.s3Client.HeadObjectWithContext(ctx, input)
 	if err != nil {
 		log.Debug("object not found or error", zap.Error(err))
+		if isNotFoundError(err) {
+			// Typed miss so callers can distinguish "object does not exist"
+			// from "object store unreachable"; conflating them turns backend
+			// outages into false ENOENT answers.
+			return nil, fmt.Errorf("object %s: %w", key, os.ErrNotExist)
+		}
 		return nil, fmt.Errorf("failed to get object metadata: %w", err)
 	}
 
