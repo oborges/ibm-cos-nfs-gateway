@@ -56,10 +56,13 @@ const (
 	nfs4ErrTooSmall          nfs4Status = 10005
 	nfs4ErrServerFault       nfs4Status = 10006
 	nfs4ErrBadType           nfs4Status = 10007
+	nfs4ErrDenied            nfs4Status = 10010
+	nfs4ErrResource          nfs4Status = 10018
 	nfs4ErrNoFileHandle      nfs4Status = 10020
 	nfs4ErrMinorVersMismatch nfs4Status = 10021
 	nfs4ErrBadStateID        nfs4Status = 10025
 	nfs4ErrAttrNotSupp       nfs4Status = 10032
+	nfs4ErrNoGrace           nfs4Status = 10033
 	nfs4ErrBadXDR            nfs4Status = 10036
 	nfs4ErrOpenMode          nfs4Status = 10038
 	nfs4ErrBadName           nfs4Status = 10041
@@ -76,6 +79,9 @@ const (
 	opGetAttr            nfs4Op = 9
 	opGetFH              nfs4Op = 10
 	opLink               nfs4Op = 11
+	opLock               nfs4Op = 12
+	opLockT              nfs4Op = 13
+	opLockU              nfs4Op = 14
 	opLookup             nfs4Op = 15
 	opLookupP            nfs4Op = 16
 	opOpen               nfs4Op = 18
@@ -178,6 +184,11 @@ const (
 	nf4FIFO uint32 = 7
 
 	openDelegateNone uint32 = 0
+
+	// open4ResultLocktypePosix in OPEN rflags advertises POSIX byte-range
+	// lock semantics; without it the Linux client fails fcntl locks locally
+	// with ENOLCK and never sends LOCK. (0x2 is OPEN4_RESULT_CONFIRM.)
+	open4ResultLocktypePosix uint32 = 0x4
 
 	authFlavorNull uint32 = 0
 	authFlavorUnix uint32 = 1
@@ -330,6 +341,12 @@ func executeNFSv4Op(ctx context.Context, rd *nfs4Reader, w *response, userHandle
 		status = nfs4OpGetFH(wr, state)
 	case opLink:
 		status = nfs4ErrNotSupp
+	case opLock:
+		status = nfs4OpLock(rd, wr, w, state)
+	case opLockT:
+		status = nfs4OpLockT(rd, wr, w, state)
+	case opLockU:
+		status = nfs4OpLockU(rd, wr, w, state)
 	case opLookup:
 		status = nfs4OpLookup(rd, userHandle, state)
 	case opLookupP:
@@ -355,7 +372,7 @@ func executeNFSv4Op(ctx context.Context, rd *nfs4Reader, w *response, userHandle
 	case opRename:
 		status = nfs4OpRename(rd, wr, state)
 	case opRenew:
-		status = nfs4OpRenew(rd)
+		status = nfs4OpRenew(rd, w)
 	case opRestoreFH:
 		status = nfs4OpRestoreFH(state)
 	case opSaveFH:
@@ -371,14 +388,19 @@ func executeNFSv4Op(ctx context.Context, rd *nfs4Reader, w *response, userHandle
 	case opWrite:
 		status = nfs4OpWrite(rd, wr, w, state)
 	case opReleaseLockOwner:
-		status = nfs4OpReleaseLockOwner(rd)
+		status = nfs4OpReleaseLockOwner(rd, w)
 	default:
 		op = opIllegal
 		status = nfs4ErrOpIllegal
 	}
 
 	if status != nfs4OK {
-		body.Reset()
+		Log.Debugf("nfs4 op %d returned status %d", op, status)
+		// DENIED responses for LOCK/LOCKT carry the conflicting lock
+		// details; every other failure has an empty body.
+		if op != opLock && op != opLockT {
+			body.Reset()
+		}
 	}
 	return nfs4Result{op: op, status: status, body: body.Bytes()}
 }
@@ -675,7 +697,7 @@ func nfs4OpOpen(rd *nfs4Reader, wr *nfs4Writer, userHandle Handler, state *nfs4C
 
 	wr.writeFixedOpaque(makeStateID(seqid, childPath))
 	writeChangeInfo(wr, false, before, after)
-	wr.writeUint32(0) // rflags
+	wr.writeUint32(open4ResultLocktypePosix) // rflags
 	writeBitmap(wr, createAttrs.mask)
 	wr.writeUint32(openDelegateNone)
 	return nfs4OK
@@ -943,10 +965,12 @@ func nfs4OpRename(rd *nfs4Reader, wr *nfs4Writer, state *nfs4CompoundState) nfs4
 	return nfs4OK
 }
 
-func nfs4OpRenew(rd *nfs4Reader) nfs4Status {
-	if _, err := rd.readUint64(); err != nil {
+func nfs4OpRenew(rd *nfs4Reader, w *response) nfs4Status {
+	clientID, err := rd.readUint64()
+	if err != nil {
 		return nfs4ErrBadXDR
 	}
+	w.Server.lockManager().renewClient(clientID)
 	return nfs4OK
 }
 
@@ -1093,13 +1117,16 @@ func nfs4OpWrite(rd *nfs4Reader, wr *nfs4Writer, w *response, state *nfs4Compoun
 	return nfs4OK
 }
 
-func nfs4OpReleaseLockOwner(rd *nfs4Reader) nfs4Status {
-	if _, err := rd.readUint64(); err != nil {
+func nfs4OpReleaseLockOwner(rd *nfs4Reader, w *response) nfs4Status {
+	clientID, err := rd.readUint64()
+	if err != nil {
 		return nfs4ErrBadXDR
 	}
-	if _, err := rd.readOpaque(nfs4OpaqueLimit); err != nil {
+	ownerBytes, err := rd.readOpaque(nfs4OpaqueLimit)
+	if err != nil {
 		return nfs4ErrBadXDR
 	}
+	w.Server.lockManager().releaseOwner(lockOwnerID{clientID: clientID, owner: string(ownerBytes)})
 	return nfs4OK
 }
 

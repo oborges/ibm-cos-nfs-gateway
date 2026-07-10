@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,11 @@ type Server struct {
 	// (RFC 7530 section 9.1.7).
 	ConcurrentHandlers int
 	context.Context
+
+	// NFSv4 advisory byte-range lock state, created on first LOCK-family
+	// operation.
+	lockMgr     *nfs4LockManager
+	lockMgrOnce sync.Once
 }
 
 // RegisterMessageHandler registers a handler for a specific NFSv3/MOUNTv3

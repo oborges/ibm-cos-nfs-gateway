@@ -70,6 +70,17 @@ themselves (RFC 7530 section 9.1.7). Per-connection parallelism is tunable via
 CIDRs/IPs are dropped at TCP accept, before any RPC bytes are parsed, and
 logged — the same trust model as cloud security groups.
 
+The NFSv4 server implements advisory byte-range locking (LOCK, LOCKT, LOCKU,
+RELEASE_LOCKOWNER) with POSIX semantics: same-owner overlaps replace,
+different-owner conflicts return DENIED with the conflicting lock described,
+`fcntl` and `flock` both work from Linux clients. Locks are advisory only —
+never enforced against READ or WRITE — matching the managed-cloud file
+gateway model. Lock state is in-memory in the single gateway that owns the
+export, capped at 512 locks per file and 8,192 per client, and expires when a
+client stops renewing its lease (90s lease, 3 lease periods of grace). Lock
+state does not survive a gateway restart; reclaim attempts after restart
+return NFS4ERR_NO_GRACE and applications must re-acquire.
+
 The request path is:
 
 1. NFS client sends an NFSv4 COMPOUND request or an enabled NFSv3 operation.
@@ -401,6 +412,9 @@ COS is still an object store, so some filesystem operations are approximations:
   only when the gateway's current listing sees the directory as empty. Implicit
   directories are derived from object key prefixes.
 - hard links are not supported as native object-store constructs.
+- byte-range locks are advisory and single-node: they coordinate cooperating
+  applications on clients of this gateway, are never enforced against reads or
+  writes, and do not survive a gateway restart.
 - generated file identity is based on path/object metadata rather than true
   persistent inode allocation from COS.
 - multi-gateway active/active writes to the same bucket are not a supported
