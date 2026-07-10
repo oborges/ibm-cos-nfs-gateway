@@ -407,9 +407,16 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		featureFlags:   fs.featureFlags,
 	}
 
+	// A path with an accepted-but-unconfirmed delete must look nonexistent:
+	// non-create opens fail, and creates must not prefetch the doomed object.
+	pendingDelete := useStagingPath && fs.stagingManager != nil && fs.stagingManager.HasPendingDelete(fullPath)
+	if pendingDelete && flag&os.O_CREATE == 0 {
+		return nil, &os.PathError{Op: "open", Path: filename, Err: os.ErrNotExist}
+	}
+
 	// Check if file exists
 	_, err := fs.ops.Stat(context.Background(), fullPath)
-	fileExists := err == nil
+	fileExists := err == nil && !pendingDelete
 
 	// If using staging path, get or create staging session
 	// For writable files: create if needed
@@ -555,6 +562,9 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 	fullPath := fs.Join(fs.root, filename)
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		if fs.stagingManager.HasPendingDelete(fullPath) {
+			return nil, &os.PathError{Op: "stat", Path: filename, Err: os.ErrNotExist}
+		}
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists && (session.Dirty || session.Size == 0 || session.Prefetched) {
 			fs.logger.Debug("Stat intercepted by dirty staging session", zap.String("path", fullPath))
 			return &stagingFileInfo{
@@ -587,7 +597,19 @@ func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 // Remove removes a file or directory
 func (fs *COSFilesystem) Remove(filename string) error {
 	fullPath := fs.Join(fs.root, filename)
-	if err := fs.ensureNoDirtyStagedData("remove", fullPath); err != nil {
+
+	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
+	if stagingEnabled && fs.stagingManager.IsDirty(fullPath) {
+		// Only files are marked dirty, so this is an unlink. POSIX write-back
+		// semantics: removing a dirty file discards the staged bytes instead
+		// of failing the unlink. A durable tombstone keeps the delete
+		// crash-safe until the COS object is confirmed gone.
+		return fs.removeDirtyStagedFile(fullPath)
+	}
+
+	// The path itself is not dirty, so any dirty staged data under it means
+	// this is a directory with dirty children: block the rmdir.
+	if err := fs.ensureNoDirtyStagedData("rmdir", fullPath); err != nil {
 		return err
 	}
 
@@ -595,9 +617,6 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	info, err := fs.Stat(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if dirtyErr := fs.ensureNoDirtyStagedData("remove", fullPath); dirtyErr != nil {
-				return dirtyErr
-			}
 			fs.logger.Debug("Remove called on non-existent path (likely implicit directory), treating as success", zap.String("path", fullPath))
 			return nil
 		}
@@ -605,17 +624,10 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	}
 
 	if info.IsDir() {
-		if err := fs.ensureNoDirtyStagedData("rmdir", fullPath); err != nil {
-			return err
-		}
 		return fs.ops.DeleteDirectory(context.Background(), fullPath)
 	}
 
-	if err := fs.ensureNoDirtyStagedData("delete", fullPath); err != nil {
-		return err
-	}
-
-	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() {
+	if !stagingEnabled {
 		if err := fs.cleanupSessionsBeforeDelete(fullPath); err != nil {
 			fs.logger.Error("Failed to cleanup sessions before delete",
 				zap.String("path", fullPath),
@@ -628,6 +640,37 @@ func (fs *COSFilesystem) Remove(filename string) error {
 		return err
 	}
 
+	fs.cleanupCleanStagingSessionAfterDelete(fullPath)
+	return nil
+}
+
+// removeDirtyStagedFile accepts the delete of a dirty staged file. The
+// tombstone is persisted before any destructive step, so once this returns
+// success the delete survives crashes and cannot resurrect the file.
+func (fs *COSFilesystem) removeDirtyStagedFile(fullPath string) error {
+	immediate, err := fs.stagingManager.RegisterPendingDelete(fullPath)
+	if err != nil {
+		return err
+	}
+
+	if !immediate {
+		// An upload for this path is in flight; the sync worker completes the
+		// delete after the upload finishes. Hide the path now.
+		fs.ops.InvalidateFileMutation(fullPath)
+		fs.logger.Info("Delete deferred until in-flight sync completes",
+			zap.String("path", fullPath))
+		return nil
+	}
+
+	if err := fs.ops.DeleteFile(context.Background(), fullPath); err != nil {
+		// The tombstone persists; the sync worker retries the COS delete.
+		fs.logger.Error("COS delete failed after tombstone was accepted; sync worker will retry",
+			zap.String("path", fullPath),
+			zap.Error(err))
+		return nil
+	}
+
+	fs.stagingManager.ResolvePendingDelete(fullPath)
 	fs.cleanupCleanStagingSessionAfterDelete(fullPath)
 	return nil
 }
@@ -805,8 +848,23 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 
 	// Safely inject StagingManager Memory bounds natively into directories!
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+		// Hide paths whose delete was accepted but not yet confirmed in COS.
+		if fs.stagingManager.PendingDeleteCount() > 0 {
+			visible := result[:0]
+			for _, entry := range result {
+				if fs.stagingManager.HasPendingDelete(fs.Join(fullPath, entry.Name())) {
+					continue
+				}
+				visible = append(visible, entry)
+			}
+			result = visible
+		}
+
 		stagingSessions := fs.stagingManager.GetSessionsInDirectory(fullPath)
 		for _, session := range stagingSessions {
+			if fs.stagingManager.HasPendingDelete(session.Path) {
+				continue
+			}
 			// Ensure it doesn't already natively exist in COS results safely
 			exists := false
 			sessionName := filepath.Base(session.Path)

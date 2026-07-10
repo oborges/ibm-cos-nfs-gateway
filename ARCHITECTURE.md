@@ -370,10 +370,16 @@ COS is still an object store, so some filesystem operations are approximations:
   Delete failure after copy can leave both prefixes populated. Existing
   destination directories are rejected to avoid implicit merges, and renaming a
   directory into its own subtree is rejected.
-- dirty staged files are durable local state until sync completes. Rename or
-  delete of a dirty staged file is rejected as busy at the filesystem layer and
-  retryable at the NFS layer. Directory rename is also rejected when dirty
-  staged children exist under the source or destination tree.
+- dirty staged files are durable local state until sync completes. Delete of a
+  dirty staged file succeeds with POSIX write-back semantics: a durable
+  tombstone is persisted first, staged bytes are discarded, and the COS object
+  is deleted (by the sync worker after any in-flight upload finishes, retried
+  until confirmed). Tombstones survive restarts, so an accepted delete never
+  resurrects; recreating the path cancels its tombstone. Rename of a dirty
+  staged file is still rejected as busy at the filesystem layer and retryable
+  at the NFS layer. Directory rename is also rejected when dirty staged
+  children exist under the source or destination tree, and rmdir is rejected
+  while dirty staged children exist.
 - `mkdir` creates a trailing-slash marker object. `rmdir` deletes that marker
   only when the gateway's current listing sees the directory as empty. Implicit
   directories are derived from object key prefixes.

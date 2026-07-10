@@ -33,6 +33,7 @@ type COSClient interface {
 	UploadPart(ctx context.Context, key, uploadID string, partNumber int64, body io.ReadSeeker) (string, error)
 	CompleteMultipartUpload(ctx context.Context, key, uploadID string, completedParts []*s3.CompletedPart) error
 	AbortMultipartUpload(ctx context.Context, key, uploadID string) error
+	DeleteObject(ctx context.Context, key string) error
 }
 
 // SyncWorker handles background synchronization of dirty files to COS
@@ -44,6 +45,8 @@ type SyncWorker struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	syncTicker *time.Ticker
+
+	onObjectMutated func(path string)
 
 	uploadMu           sync.Mutex
 	uploadByPath       map[string]uploadAccumulator
@@ -130,9 +133,75 @@ func (sw *SyncWorker) workerLoop(workerID int) {
 
 		case <-sw.syncTicker.C:
 			sw.manager.updateSyncQueueMetrics()
+			sw.processPendingDeletes(workerID)
 			sw.processDirtyFiles(workerID)
 			sw.manager.updateSyncQueueMetrics()
 		}
+	}
+}
+
+// SetObjectMutatedCallback registers a hook invoked after the sync worker
+// changes an object in COS, so upstream caches never serve state observed
+// before the mutation. Must be called before Start.
+func (sw *SyncWorker) SetObjectMutatedCallback(fn func(path string)) {
+	sw.onObjectMutated = fn
+}
+
+func (sw *SyncWorker) notifyObjectMutated(path string) {
+	if sw.onObjectMutated != nil {
+		sw.onObjectMutated(path)
+	}
+}
+
+// processPendingDeletes completes accepted deletes whose COS object is not
+// confirmed gone yet. A tombstone is only resolved after the object delete
+// succeeds, so failures are retried on every tick.
+func (sw *SyncWorker) processPendingDeletes(workerID int) {
+	for _, tomb := range sw.manager.PendingDeletes() {
+		path := tomb.Path
+
+		// Claiming the sync lock guarantees no upload is in flight for the
+		// path; deletes must be ordered after any in-flight upload.
+		if !sw.manager.dirtyIndex.LockFile(path) {
+			continue
+		}
+
+		// Re-check under the lock: the path may have been recreated.
+		if !sw.manager.HasPendingDelete(path) {
+			sw.manager.dirtyIndex.UnlockFile(path)
+			continue
+		}
+
+		// The accepted delete supersedes any staged bytes left for the path.
+		sw.manager.ForgetDirty(path, "delete_pending")
+		if err := sw.manager.CleanupSession(path, true); err != nil {
+			logging.Warn("Failed to cleanup staged data for pending delete",
+				zap.Int("worker_id", workerID),
+				zap.String("path", path),
+				zap.Error(err))
+		}
+
+		ctx, cancel := context.WithTimeout(sw.ctx, 60*time.Second)
+		err := sw.cosClient.DeleteObject(ctx, tomb.ObjectKey)
+		cancel()
+		if err != nil {
+			logging.Error("Failed to delete COS object for pending delete; will retry",
+				zap.Int("worker_id", workerID),
+				zap.String("path", path),
+				zap.String("object_key", tomb.ObjectKey),
+				zap.Error(err))
+			sw.manager.dirtyIndex.UnlockFile(path)
+			continue
+		}
+
+		sw.manager.ResolvePendingDelete(path)
+		sw.manager.dirtyIndex.UnlockFile(path)
+		sw.notifyObjectMutated(path)
+
+		logging.Info("Completed deferred delete",
+			zap.Int("worker_id", workerID),
+			zap.String("path", path),
+			zap.String("object_key", tomb.ObjectKey))
 	}
 }
 
@@ -282,6 +351,13 @@ func (sw *SyncWorker) syncFileWithWorker(path string, workerID int) error {
 func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 	if sw.manager.IsConflicted(path) {
 		return fmt.Errorf("%w: %s", ErrPathConflicted, path)
+	}
+
+	if sw.manager.HasPendingDelete(path) {
+		logging.Info("Skipping sync for path with pending delete",
+			zap.Int("worker_id", workerID),
+			zap.String("path", path))
+		return nil
 	}
 
 	// Get the session
@@ -788,6 +864,7 @@ func (sw *SyncWorker) Stats() map[string]interface{} {
 		"sync_queue_depth":        depth,
 		"sync_queue_bytes":        queueBytes,
 		"syncing_files":           sw.manager.dirtyIndex.SyncingCount(),
+		"pending_deletes":         sw.manager.PendingDeleteCount(),
 		"conflict_count":          conflictCount,
 		"conflicted_paths":        conflictedPaths,
 		"total_synced_files":      totalSyncedFiles,

@@ -142,6 +142,14 @@ func (m *multipartLifecycleCOSClient) AbortMultipartUpload(ctx context.Context, 
 	return nil
 }
 
+func (m *multipartLifecycleCOSClient) DeleteObject(ctx context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.objects, key)
+	return nil
+}
+
 func (m *multipartLifecycleCOSClient) objectSize(key string) (int64, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

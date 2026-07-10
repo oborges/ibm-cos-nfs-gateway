@@ -1,9 +1,13 @@
 package nfs
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -12,6 +16,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/feature"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/internal/staging"
+	"github.com/oborges/cos-nfs-gateway/pkg/types"
 	"go.uber.org/zap"
 )
 
@@ -246,7 +251,7 @@ func TestCOSFilesystemRenameDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRemoveDirtyStagedFileIsBlocked(t *testing.T) {
+func TestCOSFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -262,19 +267,133 @@ func TestCOSFilesystemRemoveDirtyStagedFileIsBlocked(t *testing.T) {
 	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
 		t.Fatalf("session.Write() error = %v", err)
 	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("session.Sync() error = %v", err)
+	}
 	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
 	stagingPath := session.StagingPath
 
-	fs := newDirtyStagingTestFilesystem(t, manager)
-	err = fs.Remove("dirty-delete.txt")
-	if !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("Remove() error = %v, want EBUSY", err)
+	store := newFakeObjectStore()
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+	if err := fs.Remove("dirty-delete.txt"); err != nil {
+		t.Fatalf("Remove() of dirty staged file error = %v, want success (POSIX unlink semantics)", err)
 	}
-	if !manager.IsDirty(path) {
-		t.Fatal("dirty path should remain dirty after blocked delete")
+	if manager.IsDirty(path) {
+		t.Fatal("path should not be dirty after accepted delete")
 	}
-	if _, err := os.Stat(stagingPath); err != nil {
-		t.Fatalf("dirty staging file should remain after blocked delete: %v", err)
+	if manager.HasPendingDelete(path) {
+		t.Fatal("pending delete should be resolved after successful COS delete")
+	}
+	if _, err := os.Stat(stagingPath); !os.IsNotExist(err) {
+		t.Fatalf("staged data should be removed after accepted delete, stat err = %v", err)
+	}
+	if !store.deleted["dirty-delete.txt"] {
+		t.Fatal("COS object should have been deleted")
+	}
+	if _, err := fs.Stat("dirty-delete.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat() after delete = %v, want not-exist", err)
+	}
+}
+
+func TestCOSFilesystemHidesPendingDeletePaths(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/doomed.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("doomed data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
+
+	// Simulate the deferred state: tombstone registered but COS delete not
+	// yet confirmed (as when an upload is in flight during Remove).
+	if _, err := manager.RegisterPendingDelete(path); err != nil {
+		t.Fatalf("RegisterPendingDelete() error = %v", err)
+	}
+	if !manager.HasPendingDelete(path) {
+		t.Fatal("expected pending delete to be registered")
+	}
+
+	store := newFakeObjectStore()
+	// The object is still visible in COS until the deferred delete completes.
+	store.objects["doomed.txt"] = []byte("doomed data")
+	store.objects["survivor.txt"] = []byte("survivor")
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if _, err := fs.Stat("doomed.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat() of pending-delete path = %v, want not-exist", err)
+	}
+	if _, err := fs.Open("doomed.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Open() of pending-delete path = %v, want not-exist", err)
+	}
+
+	entries, err := fs.ReadDir("/")
+	if err != nil {
+		t.Fatalf("ReadDir() error = %v", err)
+	}
+	for _, entry := range entries {
+		if entry.Name() == "doomed.txt" {
+			t.Fatal("ReadDir() must not list a pending-delete path")
+		}
+	}
+	foundSurvivor := false
+	for _, entry := range entries {
+		if entry.Name() == "survivor.txt" {
+			foundSurvivor = true
+		}
+	}
+	if !foundSurvivor {
+		t.Fatal("ReadDir() should still list unaffected paths")
+	}
+}
+
+func TestCOSFilesystemRecreateCancelsPendingDelete(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	path := "/recreated.txt"
+	session, err := manager.GetOrCreateSession(path)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("old data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(path, session.Size)
+	manager.ReleaseSession(path)
+
+	if _, err := manager.RegisterPendingDelete(path); err != nil {
+		t.Fatalf("RegisterPendingDelete() error = %v", err)
+	}
+
+	store := newFakeObjectStore()
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	file, err := fs.Create("recreated.txt")
+	if err != nil {
+		t.Fatalf("Create() over pending-delete path error = %v", err)
+	}
+	defer file.Close()
+
+	if manager.HasPendingDelete(path) {
+		t.Fatal("recreating the file must cancel the pending delete")
+	}
+	if _, err := fs.Stat("recreated.txt"); err != nil {
+		t.Fatalf("Stat() after recreate error = %v", err)
 	}
 }
 
@@ -306,7 +425,101 @@ func TestCOSFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 	}
 }
 
+// fakeObjectStore is an in-memory posix.ObjectStore for handler tests.
+type fakeObjectStore struct {
+	objects map[string][]byte
+	deleted map[string]bool
+}
+
+func newFakeObjectStore() *fakeObjectStore {
+	return &fakeObjectStore{
+		objects: make(map[string][]byte),
+		deleted: make(map[string]bool),
+	}
+}
+
+func (s *fakeObjectStore) GetObject(ctx context.Context, key string) ([]byte, error) {
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return data, nil
+}
+
+func (s *fakeObjectStore) GetObjectRange(ctx context.Context, key string, offset, length int64) ([]byte, error) {
+	data, err := s.GetObject(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if offset >= int64(len(data)) {
+		return nil, nil
+	}
+	end := offset + length
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	return data[offset:end], nil
+}
+
+func (s *fakeObjectStore) GetObjectStream(ctx context.Context, key string) (io.ReadCloser, error) {
+	data, err := s.GetObject(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (s *fakeObjectStore) PutObject(ctx context.Context, key string, data []byte, metadata map[string]string) error {
+	s.objects[key] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
+	delete(s.objects, key)
+	s.deleted[key] = true
+	return nil
+}
+
+func (s *fakeObjectStore) HeadObject(ctx context.Context, key string) (*types.ObjectMetadata, error) {
+	data, ok := s.objects[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &types.ObjectMetadata{Key: key, Size: int64(len(data))}, nil
+}
+
+func (s *fakeObjectStore) ListObjects(ctx context.Context, prefix string, maxKeys int) ([]*types.ObjectMetadata, error) {
+	var result []*types.ObjectMetadata
+	for key, data := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			result = append(result, &types.ObjectMetadata{Key: key, Size: int64(len(data))})
+		}
+		if len(result) >= maxKeys {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (s *fakeObjectStore) CopyObject(ctx context.Context, sourceKey, destKey string) error {
+	data, ok := s.objects[sourceKey]
+	if !ok {
+		return os.ErrNotExist
+	}
+	s.objects[destKey] = append([]byte(nil), data...)
+	return nil
+}
+
+func (s *fakeObjectStore) UpdateObjectMetadata(ctx context.Context, key string, metadata map[string]string) error {
+	return nil
+}
+
 func newDirtyStagingTestFilesystem(t *testing.T, manager *staging.StagingManager) *COSFilesystem {
+	t.Helper()
+	return newDirtyStagingTestFilesystemWithStore(t, manager, nil)
+}
+
+func newDirtyStagingTestFilesystemWithStore(t *testing.T, manager *staging.StagingManager, store *fakeObjectStore) *COSFilesystem {
 	t.Helper()
 
 	perfConfig := &config.PerformanceConfig{
@@ -319,7 +532,11 @@ func newDirtyStagingTestFilesystem(t *testing.T, manager *staging.StagingManager
 		MaxEntries: 10,
 		TTLSeconds: 60,
 	})
-	ops := posix.NewOperationsHandler(nil, metadataCache, nil, perfConfig)
+	var objectStore posix.ObjectStore
+	if store != nil {
+		objectStore = store
+	}
+	ops := posix.NewOperationsHandler(objectStore, metadataCache, nil, perfConfig)
 	return NewCOSFilesystemWithConfig(
 		ops,
 		NewLogger(zap.NewNop()),

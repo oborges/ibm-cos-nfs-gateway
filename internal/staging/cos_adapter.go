@@ -100,4 +100,9 @@ func (a *COSClientAdapter) AbortMultipartUpload(ctx context.Context, key, upload
 	return a.Client.AbortMultipartUpload(ctx, key, uploadID)
 }
 
+// DeleteObject deletes an object from COS
+func (a *COSClientAdapter) DeleteObject(ctx context.Context, key string) error {
+	return a.Client.DeleteObject(ctx, key)
+}
+
 // Made with Bob

@@ -16,6 +16,7 @@ import (
 type MockCOSClient struct {
 	uploads     map[string][]byte
 	errors      map[string]error
+	deletes     []string
 	putObjectFn func(ctx context.Context, path string, data []byte, metadata map[string]string) error
 }
 
@@ -79,6 +80,19 @@ func (m *MockCOSClient) CompleteMultipartUpload(ctx context.Context, key, upload
 
 func (m *MockCOSClient) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
 	return nil
+}
+
+func (m *MockCOSClient) DeleteObject(ctx context.Context, key string) error {
+	if err, exists := m.errors[key]; exists {
+		return err
+	}
+	delete(m.uploads, key)
+	m.deletes = append(m.deletes, key)
+	return nil
+}
+
+func (m *MockCOSClient) GetDeletes() []string {
+	return append([]string(nil), m.deletes...)
 }
 
 func TestSyncWorker_New(t *testing.T) {

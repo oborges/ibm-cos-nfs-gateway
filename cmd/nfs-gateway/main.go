@@ -199,6 +199,10 @@ func main() {
 		// Create sync worker
 		syncWorker = staging.NewSyncWorker(stagingManager, cosClientAdapter, &cfg.Staging)
 
+		// Deferred deletes bypass the operations handler, so invalidate its
+		// caches once the object is confirmed gone from COS.
+		syncWorker.SetObjectMutatedCallback(operations.InvalidateFileMutation)
+
 		// Start sync worker
 		syncWorker.Start()
 		defer syncWorker.Stop()

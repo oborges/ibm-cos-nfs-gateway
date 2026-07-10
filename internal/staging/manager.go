@@ -27,7 +27,9 @@ type StagingManager struct {
 	stagingRoot   string
 	sessions      map[string]*WriteSession
 	dirtyIndex    *DirtyFileIndex
+	tombstones    map[string]*TombstoneState
 	mu            sync.RWMutex
+	tombstoneMu   sync.RWMutex
 	pressureMu    sync.Mutex
 	reservedBytes int64
 }
@@ -169,6 +171,7 @@ func NewStagingManager(cfg *config.StagingConfig) (*StagingManager, error) {
 		stagingRoot: cfg.RootDir,
 		sessions:    make(map[string]*WriteSession),
 		dirtyIndex:  NewDirtyFileIndex(),
+		tombstones:  make(map[string]*TombstoneState),
 	}
 
 	logging.Info("Staging manager initialized",
@@ -212,6 +215,9 @@ func (sm *StagingManager) GetOrCreateSession(path string) (*WriteSession, error)
 	if sm.dirtyIndex.IsConflicted(path) {
 		return nil, fmt.Errorf("%w: %s", ErrPathConflicted, path)
 	}
+
+	// A new write session recreates the path, superseding any accepted delete.
+	sm.CancelPendingDelete(path)
 
 	// Check if session exists
 	if session, exists := sm.sessions[path]; exists {
@@ -849,6 +855,10 @@ func (sm *StagingManager) stagingFilePath(path string) string {
 
 // RecoverFromDisk scans the staging directory and rebuilds state
 func (sm *StagingManager) RecoverFromDisk() error {
+	// Tombstones load first: an accepted delete supersedes any staged bytes
+	// left on disk for the same path.
+	sm.recoverTombstonesFromDisk()
+
 	activeDir := filepath.Join(sm.stagingRoot, "active")
 
 	// Check if directory exists
@@ -890,6 +900,21 @@ func (sm *StagingManager) RecoverFromDisk() error {
 		if state.ConflictStatus == ConflictStatusConflicted {
 			logging.Warn("Skipping conflicted active staging metadata during recovery",
 				zap.String("file", entry.Name()),
+				zap.String("path", state.OriginalPath))
+			continue
+		}
+		if sm.HasPendingDelete(state.OriginalPath) {
+			if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+				logging.Warn("Failed to remove staged data superseded by pending delete",
+					zap.String("file", filePath),
+					zap.Error(err))
+			}
+			if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
+				logging.Warn("Failed to remove staged metadata superseded by pending delete",
+					zap.String("metadata_path", metadataPath),
+					zap.Error(err))
+			}
+			logging.Info("Dropped staged data superseded by pending delete during recovery",
 				zap.String("path", state.OriginalPath))
 			continue
 		}
@@ -1147,6 +1172,7 @@ func (sm *StagingManager) Stats() map[string]interface{} {
 		"active_sessions":         activeSessions,
 		"dirty_files":             sm.dirtyIndex.Count(),
 		"syncing_files":           sm.dirtyIndex.SyncingCount(),
+		"pending_deletes":         sm.PendingDeleteCount(),
 		"conflict_count":          conflictCount,
 		"conflicted_paths":        conflictedPaths,
 		"staging_used_bytes":      pressure.UsedBytes,

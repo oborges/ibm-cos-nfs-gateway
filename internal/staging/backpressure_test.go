@@ -44,6 +44,10 @@ func (noReadCOSClient) AbortMultipartUpload(context.Context, string, string) err
 	return nil
 }
 
+func (noReadCOSClient) DeleteObject(context.Context, string) error {
+	return nil
+}
+
 type emptyReader struct{}
 
 func (*emptyReader) Read([]byte) (int, error) {

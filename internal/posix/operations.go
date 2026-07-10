@@ -102,6 +102,12 @@ func (h *OperationsHandler) invalidateFileMutation(path string) {
 	h.invalidateDataPath(path)
 }
 
+// InvalidateFileMutation exposes cache invalidation for components that mutate
+// objects outside this handler (e.g. deferred staged deletes).
+func (h *OperationsHandler) InvalidateFileMutation(path string) {
+	h.invalidateFileMutation(path)
+}
+
 func (h *OperationsHandler) invalidateDirectoryMutation(path string) {
 	if h == nil {
 		return
