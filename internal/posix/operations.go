@@ -391,24 +391,27 @@ func (h *OperationsHandler) readRangeWithCache(ctx context.Context, path, object
 
 	requestEnd := offset + length
 
-	fetchLength := h.readAheadBytes()
-	if fetchLength < length {
-		fetchLength = length
-	}
-	fetchEnd := offset + fetchLength
-
 	chunkSize := h.dataCache.ChunkSize()
 	if chunkSize <= 0 {
 		chunkSize = 1024 * 1024
 	}
 
 	firstChunk := (offset / chunkSize) * chunkSize
-	lastChunk := ((fetchEnd - 1) / chunkSize) * chunkSize
 	lastRequiredChunk := ((requestEnd - 1) / chunkSize) * chunkSize
+
+	// Fast path: when every required chunk is cached, serve the request with
+	// one ranged read per chunk — exactly the requested bytes, no whole-chunk
+	// materialization. This is the hot path for warm sequential reads (NFS
+	// clients issue large reads at arbitrary alignment, often spanning two
+	// chunks) and for small random reads.
+	if data, ok := h.readWarmChunks(path, offset, length, chunkSize, firstChunk, lastRequiredChunk); ok {
+		return data, nil
+	}
+
+	// Gather the chunks the request actually needs.
 	chunks := make(map[int64][]byte)
 	var missing []int64
-
-	for chunkStart := firstChunk; chunkStart <= lastChunk; chunkStart += chunkSize {
+	for chunkStart := firstChunk; chunkStart <= lastRequiredChunk; chunkStart += chunkSize {
 		if cached, err := h.dataCache.ReadChunk(path, chunkStart, chunkSize); err == nil {
 			metrics.RecordCacheHit("data")
 			chunks[chunkStart] = cached
@@ -418,7 +421,30 @@ func (h *OperationsHandler) readRangeWithCache(ctx context.Context, path, object
 		missing = append(missing, chunkStart)
 	}
 
+	// Read-ahead engages only when the request itself missed: fully warm
+	// reads must not re-touch chunks beyond what was asked for. Read-ahead
+	// candidates use an index-only existence probe so already-cached chunks
+	// cost nothing, and the window is clamped to the known object size so
+	// small files do not trigger doomed past-EOF range requests.
 	if len(missing) > 0 {
+		fetchLength := h.readAheadBytes()
+		if fetchLength < length {
+			fetchLength = length
+		}
+		fetchEnd := offset + fetchLength
+		if size, ok := h.cachedObjectSize(path); ok && fetchEnd > size {
+			fetchEnd = size
+		}
+		if fetchEnd < requestEnd {
+			fetchEnd = requestEnd
+		}
+		readAheadLast := ((fetchEnd - 1) / chunkSize) * chunkSize
+		for chunkStart := lastRequiredChunk + chunkSize; chunkStart <= readAheadLast; chunkStart += chunkSize {
+			if !h.dataCache.ContainsChunk(path, chunkStart, chunkSize) {
+				missing = append(missing, chunkStart)
+			}
+		}
+
 		fetched, err := h.fetchMissingChunks(ctx, path, objectKey, missing, chunkSize, lastRequiredChunk)
 		if err != nil {
 			return nil, err
@@ -429,7 +455,7 @@ func (h *OperationsHandler) readRangeWithCache(ctx context.Context, path, object
 	}
 
 	out := make([]byte, 0, requestEnd-offset)
-	for chunkStart := firstChunk; chunkStart <= lastChunk && int64(len(out)) < requestEnd-offset; chunkStart += chunkSize {
+	for chunkStart := firstChunk; chunkStart <= lastRequiredChunk && int64(len(out)) < requestEnd-offset; chunkStart += chunkSize {
 		chunk := chunks[chunkStart]
 		if len(chunk) == 0 {
 			continue
@@ -455,6 +481,53 @@ func (h *OperationsHandler) readRangeWithCache(ctx context.Context, path, object
 	}
 
 	return out, nil
+}
+
+// readWarmChunks serves a read purely from cached chunks with ranged reads,
+// or reports ok=false if any required chunk is missing. A short chunk means
+// object EOF, which ends the read.
+func (h *OperationsHandler) readWarmChunks(path string, offset, length, chunkSize, firstChunk, lastRequiredChunk int64) ([]byte, bool) {
+	requestEnd := offset + length
+	out := make([]byte, 0, length)
+	for chunkStart := firstChunk; chunkStart <= lastRequiredChunk; chunkStart += chunkSize {
+		readStart := int64(0)
+		if offset > chunkStart {
+			readStart = offset - chunkStart
+		}
+		readEnd := chunkSize
+		if requestEnd < chunkStart+chunkSize {
+			readEnd = requestEnd - chunkStart
+		}
+		data, err := h.dataCache.ReadChunkRange(path, chunkStart, chunkSize, readStart, readEnd-readStart)
+		if err != nil {
+			return nil, false
+		}
+		metrics.RecordCacheHit("data")
+		out = append(out, data...)
+		if int64(len(data)) < readEnd-readStart {
+			// Short chunk: object EOF.
+			break
+		}
+	}
+	return out, true
+}
+
+// cachedObjectSize returns the object size from the metadata cache when a
+// fresh file entry exists. Used to bound read-ahead; callers must tolerate
+// absence.
+func (h *OperationsHandler) cachedObjectSize(path string) (int64, bool) {
+	if h == nil || h.metadataCache == nil {
+		return 0, false
+	}
+	entry, ok := h.metadataCache.Get(path)
+	if !ok || entry == nil || entry.IsDir || entry.FileInfo == nil {
+		return 0, false
+	}
+	info, ok := entry.FileInfo.(os.FileInfo)
+	if !ok {
+		return 0, false
+	}
+	return info.Size(), true
 }
 
 func (h *OperationsHandler) fetchMissingChunks(ctx context.Context, path, objectKey string, missing []int64, chunkSize, lastRequiredChunk int64) (map[int64][]byte, error) {

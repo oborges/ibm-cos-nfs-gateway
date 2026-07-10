@@ -124,16 +124,27 @@ func (c *DataCache) Read(key string, offset, length int64) ([]byte, error) {
 	}
 
 	if length <= 0 {
-		data, err := io.ReadAll(file)
+		// Size the buffer exactly from the file instead of io.ReadAll's
+		// grow-and-copy loop; this path runs per cached chunk on hot reads.
+		info, err := file.Stat()
 		if err != nil {
+			return nil, fmt.Errorf("failed to stat cache file: %w", err)
+		}
+		remaining := info.Size() - offset
+		if remaining < 0 {
+			remaining = 0
+		}
+		data := make([]byte, remaining)
+		n, err := io.ReadFull(file, data)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return nil, fmt.Errorf("failed to read cache file: %w", err)
 		}
 		logging.Debug("Data cache hit",
 			zap.String("key", key),
 			zap.Int64("offset", offset),
-			zap.Int("length", len(data)),
+			zap.Int("length", n),
 		)
-		return data, nil
+		return data[:n], nil
 	}
 
 	// Read data
@@ -221,6 +232,26 @@ func (c *DataCache) Write(key string, data []byte) error {
 // ReadChunk reads an object chunk from cache.
 func (c *DataCache) ReadChunk(objectKey string, chunkStart, chunkSize int64) ([]byte, error) {
 	return c.Read(c.chunkKey(objectKey, chunkStart, chunkSize), 0, 0)
+}
+
+// ReadChunkRange reads only the requested byte range from a cached chunk, so
+// small reads (e.g. 4k random I/O) cost one pread of the requested size
+// instead of materializing the whole chunk.
+func (c *DataCache) ReadChunkRange(objectKey string, chunkStart, chunkSize, offsetInChunk, length int64) ([]byte, error) {
+	return c.Read(c.chunkKey(objectKey, chunkStart, chunkSize), offsetInChunk, length)
+}
+
+// ContainsChunk reports whether a chunk is present in the cache index without
+// touching the chunk file. Used to decide read-ahead, where reading the bytes
+// into memory would defeat the point.
+func (c *DataCache) ContainsChunk(objectKey string, chunkStart, chunkSize int64) bool {
+	if !c.enabled {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.index.Get(c.chunkKey(objectKey, chunkStart, chunkSize))
+	return ok
 }
 
 // WriteChunk stores an object chunk in cache.

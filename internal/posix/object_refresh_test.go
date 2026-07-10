@@ -269,6 +269,7 @@ type fakeObjectStore struct {
 	objects      map[string]fakeObject
 	copyErrors   map[string]error
 	deleteErrors map[string]error
+	rangeCalls   int
 }
 
 type fakeObject struct {
@@ -310,7 +311,17 @@ func (s *fakeObjectStore) GetObject(_ context.Context, key string) ([]byte, erro
 	return append([]byte(nil), obj.data...), nil
 }
 
+func (s *fakeObjectStore) rangeCallCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rangeCalls
+}
+
 func (s *fakeObjectStore) GetObjectRange(_ context.Context, key string, offset, length int64) ([]byte, error) {
+	s.mu.Lock()
+	s.rangeCalls++
+	s.mu.Unlock()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

@@ -58,7 +58,13 @@ The gateway serves NFSv4 over TCP by default, normally on port `2049`. It can
 also serve NFSv3 or dual NFSv3/NFSv4 from the same listener when configured.
 The NFS stack is built on a vendored `go-nfs` dependency with local changes
 needed for gateway behavior, including filesystem statistics forwarding,
-NFSv4 COMPOUND handling, and deterministic ENOSPC mapping.
+NFSv4 COMPOUND handling, deterministic ENOSPC mapping, and concurrent
+per-connection request handling: Linux clients multiplex a whole mount over
+one TCP connection, so each request body is buffered as it is read and
+dispatched to a bounded handler pool (default 64 per connection, like a kernel
+nfsd thread pool). RPC replies carry XIDs so out-of-order completion is legal,
+and NFSv4.0 clients serialize seqid-ordered state operations per owner
+themselves (RFC 7530 section 9.1.7).
 
 The request path is:
 
@@ -113,7 +119,10 @@ Reads follow a consistency-first order:
 3. Otherwise fetch from COS using object/range reads.
 4. Populate the chunk cache when configured.
 
-Sequential COS reads can use read-ahead and parallel range fetches. Repeated
+Warm reads are served with one ranged read per cached chunk, returning exactly
+the requested bytes without materializing whole chunks. Read-ahead engages
+only when the request misses the cache, is clamped to the known object size
+(no past-EOF range requests), and uses parallel range fetches. Repeated
 concurrent fetches for the same range are deduplicated with singleflight to
 avoid stampeding COS.
 

@@ -16,6 +16,13 @@ type Server struct {
 	// EnabledNFSVersions limits NFS program versions served by this server.
 	// Empty means all registered versions are enabled.
 	EnabledNFSVersions []uint32
+	// ConcurrentHandlers bounds how many requests are processed in parallel
+	// per connection (Linux clients multiplex a whole mount over one TCP
+	// connection). Zero selects the default. RPC replies carry XIDs, so
+	// out-of-order completion is legal; NFSv4.0 clients are required to
+	// serialize seqid-ordered state operations per owner themselves
+	// (RFC 7530 section 9.1.7).
+	ConcurrentHandlers int
 	context.Context
 }
 
