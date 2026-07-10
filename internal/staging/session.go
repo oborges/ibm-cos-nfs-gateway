@@ -82,6 +82,15 @@ func (ws *WriteSession) UpdateAttributes(mode os.FileMode, uid uint32, gid uint3
 	ws.GID = gid
 }
 
+// Rekey points the session at a renamed path. The open descriptor still
+// addresses the moved staging file, so only the naming changes.
+func (ws *WriteSession) Rekey(newPath, newStagingPath string) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+	ws.Path = newPath
+	ws.StagingPath = newStagingPath
+}
+
 // Write writes data to the staging file at the specified offset
 func (ws *WriteSession) Write(data []byte, offset int64) (int, error) {
 	currentSize := ws.GetSize()

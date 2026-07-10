@@ -141,8 +141,8 @@ func (sw *SyncWorker) workerLoop(workerID int) {
 }
 
 // SetObjectMutatedCallback registers a hook invoked after the sync worker
-// changes an object in COS, so upstream caches never serve state observed
-// before the mutation. Must be called before Start.
+// changes an object in COS (upload or deferred delete), so upstream caches
+// never serve state observed before the mutation. Must be called before Start.
 func (sw *SyncWorker) SetObjectMutatedCallback(fn func(path string)) {
 	sw.onObjectMutated = fn
 }
@@ -464,6 +464,10 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 
 	// Mark as clean
 	sw.manager.MarkClean(path)
+
+	// The object just changed in COS; caches that observed the pre-sync
+	// object (e.g. a stat during the dirty window) must not outlive it.
+	sw.notifyObjectMutated(path)
 
 	if sw.config.CleanAfterSync && session.GetRefCount() == 0 {
 		if err := sw.manager.CleanupSession(path, true); err != nil {
@@ -926,5 +930,9 @@ func (sw *SyncWorker) processMultipartFiles(workerID int) {
 
 // UploadToCOS uploads data directly to COS (used for immediate sync before delete)
 func (sw *SyncWorker) UploadToCOS(ctx context.Context, path string, data []byte, metadata map[string]string) error {
-	return sw.uploadWithRetry(path, data, metadata)
+	if err := sw.uploadWithRetry(path, data, metadata); err != nil {
+		return err
+	}
+	sw.notifyObjectMutated(path)
+	return nil
 }

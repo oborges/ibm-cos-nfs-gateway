@@ -69,11 +69,15 @@ operations explicit:
   the COS object (after any in-flight upload completes, retried until
   confirmed). Tombstones survive restarts so an accepted delete cannot
   resurrect the file; recreating the path cancels the pending delete.
-- Rename of a dirty staged file is rejected until the staged data has synced.
-  The filesystem layer returns busy; the NFS layer maps that to a retryable
-  status. Directory rename is also rejected when any dirty staged child exists
-  under the source or destination tree. This avoids losing accepted writes that
-  are still only in local staging.
+- Rename of a dirty staged file succeeds with POSIX write-back semantics: the
+  staged bytes and dirty bookkeeping move to the destination name, a durable
+  tombstone retires the source COS object (after any in-flight upload), and
+  the moved bytes sync to the destination key. This supports the
+  write-tmp-then-rename atomic-save pattern used by editors and sync tools.
+  Renaming a clean file over a destination whose staged bytes are mid-upload
+  returns busy (retryable); directory rename is rejected when any dirty staged
+  child exists under the source or destination tree. This avoids losing
+  accepted writes that are still only in local staging.
 - `mkdir` creates a trailing-slash directory marker object. `rmdir` removes the
   marker only when the gateway's current listing sees the directory as empty.
   Implicit directories still come from object key prefixes and may converge

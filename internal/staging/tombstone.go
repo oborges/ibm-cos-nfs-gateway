@@ -55,13 +55,9 @@ func writeTombstoneState(tombstonePath string, state *TombstoneState) error {
 	return nil
 }
 
-// RegisterPendingDelete accepts a delete of a dirty staged path with POSIX
-// write-back semantics: the staged bytes are discarded rather than failing the
-// unlink. A durable tombstone is persisted first so the delete survives a
-// crash. Returns immediate=true when the caller can proceed to delete the COS
-// object now; immediate=false means an upload for the path is in flight and
-// the sync worker completes the delete after the upload finishes.
-func (sm *StagingManager) RegisterPendingDelete(path string) (bool, error) {
+// addTombstone durably records that the object for path must be removed from
+// COS. It only persists intent; callers handle staged bytes and dirty state.
+func (sm *StagingManager) addTombstone(path string) (*TombstoneState, error) {
 	tomb := &TombstoneState{
 		Version:   tombstoneVersion,
 		Path:      path,
@@ -72,10 +68,37 @@ func (sm *StagingManager) RegisterPendingDelete(path string) (bool, error) {
 	sm.tombstoneMu.Lock()
 	if err := writeTombstoneState(sm.tombstoneFilePath(path), tomb); err != nil {
 		sm.tombstoneMu.Unlock()
-		return false, fmt.Errorf("failed to persist delete tombstone: %w", err)
+		return nil, fmt.Errorf("failed to persist delete tombstone: %w", err)
 	}
 	sm.tombstones[path] = tomb
 	sm.tombstoneMu.Unlock()
+
+	return tomb, nil
+}
+
+// TryLockSync attempts to claim the per-path sync lock, preventing sync
+// workers (uploads and tombstone processing) from touching the path. Returns
+// false when a worker already holds the claim. Callers must UnlockSync.
+func (sm *StagingManager) TryLockSync(path string) bool {
+	return sm.dirtyIndex.LockFile(path)
+}
+
+// UnlockSync releases a claim taken with TryLockSync.
+func (sm *StagingManager) UnlockSync(path string) {
+	sm.dirtyIndex.UnlockFile(path)
+}
+
+// RegisterPendingDelete accepts a delete of a dirty staged path with POSIX
+// write-back semantics: the staged bytes are discarded rather than failing the
+// unlink. A durable tombstone is persisted first so the delete survives a
+// crash. Returns immediate=true when the caller can proceed to delete the COS
+// object now; immediate=false means an upload for the path is in flight and
+// the sync worker completes the delete after the upload finishes.
+func (sm *StagingManager) RegisterPendingDelete(path string) (bool, error) {
+	tomb, err := sm.addTombstone(path)
+	if err != nil {
+		return false, err
+	}
 
 	logging.Info("Registered pending delete for dirty staged path",
 		zap.String("path", path),

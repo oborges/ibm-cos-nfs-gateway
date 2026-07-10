@@ -376,10 +376,14 @@ COS is still an object store, so some filesystem operations are approximations:
   is deleted (by the sync worker after any in-flight upload finishes, retried
   until confirmed). Tombstones survive restarts, so an accepted delete never
   resurrects; recreating the path cancels its tombstone. Rename of a dirty
-  staged file is still rejected as busy at the filesystem layer and retryable
-  at the NFS layer. Directory rename is also rejected when dirty staged
-  children exist under the source or destination tree, and rmdir is rejected
-  while dirty staged children exist.
+  staged file also succeeds: the staged bytes and dirty bookkeeping re-key to
+  the destination (the destination sidecar is persisted before the byte move,
+  the source tombstone after it, so no crash window loses data), the moved
+  bytes sync to the destination key, and the source object is retired by its
+  tombstone. Renaming a clean file over a destination whose staged bytes are
+  mid-upload is rejected as busy. Directory rename is rejected when dirty
+  staged children exist under the source or destination tree, and rmdir is
+  rejected while dirty staged children exist.
 - `mkdir` creates a trailing-slash marker object. `rmdir` deletes that marker
   only when the gateway's current listing sees the directory as empty. Implicit
   directories are derived from object key prefixes.

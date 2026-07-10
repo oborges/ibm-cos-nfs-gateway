@@ -188,7 +188,7 @@ func TestCOSFileCloseReleasesStagingSessionOnce(t *testing.T) {
 	}
 }
 
-func TestCOSFilesystemRenameDirtyStagedFileIsBlocked(t *testing.T) {
+func TestCOSFilesystemRenameDirtyStagedFileSucceeds(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
 	if err != nil {
@@ -201,25 +201,147 @@ func TestCOSFilesystemRenameDirtyStagedFileIsBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrCreateSession() error = %v", err)
 	}
-	if _, err := session.Write([]byte("dirty data"), 0); err != nil {
+	payload := []byte("dirty data")
+	if _, err := session.Write(payload, 0); err != nil {
 		t.Fatalf("session.Write() error = %v", err)
 	}
+	if err := session.Sync(); err != nil {
+		t.Fatalf("session.Sync() error = %v", err)
+	}
 	manager.MarkDirty(path, session.Size)
-	stagingPath := session.StagingPath
+	manager.ReleaseSession(path)
+	oldStagingPath := session.StagingPath
 
-	fs := newDirtyStagingTestFilesystem(t, manager)
-	err = fs.Rename("dirty.txt", "renamed.txt")
+	store := newFakeObjectStore()
+	// Simulate a previously synced source object that must not survive.
+	store.objects["dirty.txt"] = []byte("stale synced data")
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("dirty.txt", "renamed.txt"); err != nil {
+		t.Fatalf("Rename() of dirty staged file error = %v, want success (POSIX write-back semantics)", err)
+	}
+
+	if manager.IsDirty(path) {
+		t.Fatal("source path should not remain dirty after rename")
+	}
+	if !manager.IsDirty("/renamed.txt") {
+		t.Fatal("destination path should be dirty after rename")
+	}
+	movedSession, exists := manager.GetSession("/renamed.txt")
+	if !exists {
+		t.Fatal("staging session should have moved to the destination path")
+	}
+	if _, exists := manager.GetSession(path); exists {
+		t.Fatal("staging session must not remain at the source path")
+	}
+	if _, err := os.Stat(oldStagingPath); !os.IsNotExist(err) {
+		t.Fatalf("source staging file should have moved, stat err = %v", err)
+	}
+	buf := make([]byte, len(payload))
+	if _, err := movedSession.Read(buf, 0); err != nil {
+		t.Fatalf("read of moved staged bytes error = %v", err)
+	}
+	if string(buf) != string(payload) {
+		t.Fatalf("moved staged bytes = %q, want %q", buf, payload)
+	}
+
+	// The source object was deleted inline (no sync in flight) and its
+	// tombstone resolved.
+	if !store.deleted["dirty.txt"] {
+		t.Fatal("source COS object should have been deleted")
+	}
+	if manager.HasPendingDelete(path) {
+		t.Fatal("source tombstone should be resolved after inline COS delete")
+	}
+
+	// Namespace: source gone, destination visible.
+	if _, err := fs.Stat("dirty.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat(source) after rename = %v, want not-exist", err)
+	}
+	info, err := fs.Stat("renamed.txt")
+	if err != nil {
+		t.Fatalf("Stat(destination) after rename error = %v", err)
+	}
+	if info.Size() != int64(len(payload)) {
+		t.Fatalf("Stat(destination) size = %d, want %d", info.Size(), len(payload))
+	}
+}
+
+func TestCOSFilesystemRenameCleanSourceOverDirtyDestination(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	destPath := "/dest.txt"
+	session, err := manager.GetOrCreateSession(destPath)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("doomed dest data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(destPath, session.Size)
+	manager.ReleaseSession(destPath)
+
+	store := newFakeObjectStore()
+	store.objects["source.txt"] = []byte("source content")
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	if err := fs.Rename("source.txt", "dest.txt"); err != nil {
+		t.Fatalf("Rename() over dirty destination error = %v, want success", err)
+	}
+	if manager.IsDirty(destPath) {
+		t.Fatal("destination staged bytes should be discarded by rename-over")
+	}
+	if _, exists := manager.GetSession(destPath); exists {
+		t.Fatal("destination staging session should be discarded by rename-over")
+	}
+	if got := string(store.objects["dest.txt"]); got != "source content" {
+		t.Fatalf("destination object = %q, want %q", got, "source content")
+	}
+	if !store.deleted["source.txt"] {
+		t.Fatal("source object should be deleted by object-store rename")
+	}
+}
+
+func TestCOSFilesystemRenameCleanSourceOverSyncingDestinationStaysBusy(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	destPath := "/dest-syncing.txt"
+	session, err := manager.GetOrCreateSession(destPath)
+	if err != nil {
+		t.Fatalf("GetOrCreateSession() error = %v", err)
+	}
+	if _, err := session.Write([]byte("doomed dest data"), 0); err != nil {
+		t.Fatalf("session.Write() error = %v", err)
+	}
+	manager.MarkDirty(destPath, session.Size)
+	manager.ReleaseSession(destPath)
+
+	// Simulate a sync worker uploading the destination's doomed bytes.
+	if !manager.TryLockSync(destPath) {
+		t.Fatal("failed to claim sync lock for test")
+	}
+	defer manager.UnlockSync(destPath)
+
+	store := newFakeObjectStore()
+	store.objects["source.txt"] = []byte("source content")
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	err = fs.Rename("source.txt", "dest-syncing.txt")
 	if !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("Rename() error = %v, want EBUSY", err)
+		t.Fatalf("Rename() over syncing destination error = %v, want EBUSY", err)
 	}
-	if !manager.IsDirty(path) {
-		t.Fatal("dirty source path should remain dirty after blocked rename")
-	}
-	if _, exists := manager.GetSession("/renamed.txt"); exists {
-		t.Fatal("blocked rename should not create a destination staging session")
-	}
-	if _, err := os.Stat(stagingPath); err != nil {
-		t.Fatalf("dirty staging file should remain after blocked rename: %v", err)
+	if !manager.IsDirty(destPath) {
+		t.Fatal("destination staged state must be untouched by the blocked rename")
 	}
 }
 

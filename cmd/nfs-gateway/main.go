@@ -199,8 +199,10 @@ func main() {
 		// Create sync worker
 		syncWorker = staging.NewSyncWorker(stagingManager, cosClientAdapter, &cfg.Staging)
 
-		// Deferred deletes bypass the operations handler, so invalidate its
-		// caches once the object is confirmed gone from COS.
+		// Sync uploads and deferred deletes bypass the operations handler, so
+		// invalidate its caches whenever the worker mutates a COS object;
+		// otherwise state cached during the dirty window (e.g. a zero-byte
+		// truncate object) outlives the sync and serves stale reads.
 		syncWorker.SetObjectMutatedCallback(operations.InvalidateFileMutation)
 
 		// Start sync worker

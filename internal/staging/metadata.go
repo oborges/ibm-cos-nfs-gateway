@@ -152,6 +152,50 @@ func (dfi *DirtyFileIndex) RestoreDirty(meta DirtyFileMetadata) {
 	dfi.dirty[meta.Path] = &metaCopy
 }
 
+// DropEntry removes the dirty entry without touching sync claims, unlike
+// MarkClean which also releases the path's syncing lock.
+func (dfi *DirtyFileIndex) DropEntry(path string) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	delete(dfi.dirty, path)
+}
+
+// Rekey moves the dirty entry for oldPath to newPath, replacing any existing
+// destination entry (rename-over semantics). The syncing map is intentionally
+// untouched: sync claims belong to the workers holding them, and the bumped
+// LastModified invalidates any in-flight snapshot of either path.
+func (dfi *DirtyFileIndex) Rekey(oldPath, newPath, stagedPath string) {
+	dfi.mu.Lock()
+	defer dfi.mu.Unlock()
+
+	now := time.Now()
+	moved := DirtyFileMetadata{
+		DirtySince:     now,
+		ConflictStatus: ConflictStatusNone,
+	}
+	if meta, exists := dfi.dirty[oldPath]; exists {
+		moved = *meta
+		delete(dfi.dirty, oldPath)
+	}
+	moved.Path = newPath
+	moved.ObjectKey = objectKeyFromPath(newPath)
+	moved.StagedPath = stagedPath
+	// The destination object's remote state is unknown; do not carry the
+	// source's observed COS state across the rename.
+	moved.ObservedETag = ""
+	moved.ObservedSize = 0
+	moved.ObservedLastModified = time.Time{}
+	moved.LocalDirtyGeneration++
+	if moved.LocalDirtyGeneration <= 0 {
+		moved.LocalDirtyGeneration = 1
+	}
+	moved.LastModified = now
+	moved.SyncAttempts = 0
+	moved.LastSyncError = nil
+	dfi.dirty[newPath] = &moved
+}
+
 // LockFile securely claims the file for syncing by a background worker natively isolating multiple loops
 func (dfi *DirtyFileIndex) LockFile(path string) bool {
 	dfi.mu.Lock()

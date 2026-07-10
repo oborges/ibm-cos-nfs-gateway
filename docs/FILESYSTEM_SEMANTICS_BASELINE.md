@@ -37,13 +37,16 @@ read, sync, cache, COS, and deployment invariants in the current codebase.
    resume sync without relying on in-memory multipart state.
 
 7. **Object-store rename/delete semantics must stay explicit.**
-   Rename is copy/delete over COS keys, not atomic local-filesystem rename.
-   Directory rename is recursive prefix copy/delete when supported. Dirty staged
-   data must not be deleted or moved accidentally: rename of dirty staged paths
-   is blocked until sync or conflict handling resolves them, while delete of a
-   dirty staged file follows POSIX write-back semantics through a durable,
-   crash-safe tombstone (staged bytes discarded intentionally, COS object
-   removed after any in-flight upload, delete never resurrects across restart).
+   Rename of a clean file is copy/delete over COS keys, not atomic
+   local-filesystem rename. Directory rename is recursive prefix copy/delete
+   when supported, and stays blocked while dirty staged children exist. Dirty
+   staged files follow POSIX write-back semantics: delete discards the staged
+   bytes behind a durable, crash-safe tombstone (COS object removed after any
+   in-flight upload; never resurrects across restart), and rename re-keys the
+   staged bytes and bookkeeping to the destination (destination sidecar
+   persisted before the byte move, source tombstone after it, so no crash
+   window loses accepted writes) with the moved bytes syncing to the
+   destination key.
 
 8. **One gateway owning one export remains the default supported deployment.**
    The supported consistency model is one gateway instance owning one mounted
@@ -65,7 +68,7 @@ read, sync, cache, COS, and deployment invariants in the current codebase.
 | Backpressure prevents local disk exhaustion | `internal/staging/backpressure_test.go`: `TestStagingBackpressureBelowWatermarkSucceeds`, `TestStagingBackpressureAboveHighWatermarkBlocksThenFails`, `TestStagingBackpressureAboveCriticalWatermarkFailsEarly`, `TestStagingBackpressureSyncDrainReleasesPressure`. | No integration test that NFS WRITE maps pressure to client-visible ENOSPC. No filesystem-stat test for staging-aware available space. No test forces actual `statfs` low-disk conditions; current tests cover configured quota pressure. |
 | Multipart per-object synchronization and safe retry/abort | `internal/staging/sync_worker_multipart_test.go`: `TestMultipartConcurrentSyncAttemptsDoNotRace`, `TestMultipartNoSuchUploadRestartsCleanly`, `TestMultipartSnapshotChangeBeforeCompleteKeepsDirtyAndDoesNotPublishPartialObject`, `TestMultipartChangedAfterCompleteKeepsDirtyForRetry`, `TestMultipartCleanupDoesNotAbortActiveUpload`, `TestMultipartRestartDuringUploadRestartsCleanly`, plus `TestIntegrationMultipartSync1GiBSucceeds`. | No live COS multipart integration test. No test for abort failures beyond mock error paths. No test of multipart limits against provider-specific edge cases such as max part count or minimum non-final part size. |
 | Crash recovery preserves unsynced staged data | `internal/staging/manager_test.go`: `TestStagingManager_RecoverFromDisk`; `internal/nfs/handler_test.go`: `TestCOSFilesystemChrootPreservesRecoveredStagingSessions`; `internal/staging/sync_worker_test.go`: `TestSyncWorker_OrphanDirtyWithStagingIsRecoveredAndSynced`, `TestSyncWorker_OrphanDirtyWithoutStagingIsForgotten`; `internal/staging/sync_worker_multipart_test.go`: `TestMultipartRestartDuringUploadRestartsCleanly`. | No process-level crash/kill test in `go test`. No test for torn or corrupt staging metadata. No test for crash during an in-flight monolithic upload with a still-dirty staged file. |
-| Object-store rename/delete semantics stay explicit | `internal/posix/operations_test.go`: file rename, directory rename, copy failure, and delete failure coverage; `internal/nfs/handler_test.go`: dirty staged file delete success, pending-delete namespace hiding, recreate-cancels-tombstone, dirty rename and dirty child directory blocks; `internal/staging/tombstone_test.go`: immediate/deferred delete, crash-safe tombstone recovery, COS delete retry, sync skip, recreate cancel. | No live COS test for provider-specific copy/delete acknowledgement edge cases, versioned buckets, lifecycle rules, or object-lock behavior. |
+| Object-store rename/delete semantics stay explicit | `internal/posix/operations_test.go`: file rename, directory rename, copy failure, and delete failure coverage; `internal/nfs/handler_test.go`: dirty staged file delete and rename success, rename-over-dirty-destination, syncing-destination busy, pending-delete namespace hiding, recreate-cancels-tombstone, dirty child directory blocks; `internal/staging/tombstone_test.go`: immediate/deferred delete, crash-safe tombstone recovery, COS delete retry, sync skip, recreate cancel; `internal/staging/rename_test.go`: staged re-key, in-flight sync claim preserved, destination replacement, restart recovery, sync-to-new-key, object-mutation cache callback. | No live COS test for provider-specific copy/delete acknowledgement edge cases, versioned buckets, lifecycle rules, or object-lock behavior. |
 | One gateway owning one export default | Documented in `ARCHITECTURE.md` deployment and consistency sections. | No automated test can currently enforce deployment topology. No guardrail test or configuration validation rejects active/active multi-gateway ownership. |
 | IBM COS/S3-compatible portability | Code path is in `internal/cos/client.go` and `internal/cos/multipart.go`, using S3-compatible APIs and IAM/HMAC configuration. | No `internal/cos` unit tests currently cover client configuration, auth mode selection, S3-compatible endpoint behavior, metadata portability, or multipart API request construction. |
 

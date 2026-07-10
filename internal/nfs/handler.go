@@ -585,13 +585,116 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 	oldFull := fs.Join(fs.root, oldpath)
 	newFull := fs.Join(fs.root, newpath)
-	if err := fs.ensureNoDirtyStagedData("rename", oldFull); err != nil {
-		return err
+
+	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
+	if stagingEnabled {
+		// Conflicted staged paths keep busy semantics until resolved.
+		if fs.stagingManager.IsConflicted(oldFull) || fs.stagingManager.IsConflicted(newFull) {
+			return &os.PathError{
+				Op:   "rename",
+				Path: oldFull,
+				Err:  fmt.Errorf("staged path has unresolved conflict: %w", syscall.EBUSY),
+			}
+		}
+
+		// Directory renames with dirty staged children stay blocked: moving a
+		// tree would have to re-key every child atomically.
+		if err := fs.ensureNoDirtyStagedChildren("rename", oldFull); err != nil {
+			return err
+		}
+		if err := fs.ensureNoDirtyStagedChildren("rename", newFull); err != nil {
+			return err
+		}
+
+		// A source with an accepted delete no longer exists.
+		if fs.stagingManager.HasPendingDelete(oldFull) {
+			return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrNotExist}
+		}
+
+		if fs.stagingManager.IsDirty(oldFull) {
+			// POSIX write-back semantics: the staged bytes move to the new
+			// name and a crash-safe tombstone retires the old COS object.
+			return fs.renameDirtyStagedFile(oldFull, newFull)
+		}
+
+		// Clean source over staged destination state: rename-over discards
+		// the destination's staged bytes and pending delete before the
+		// object-store rename overwrites the object.
+		if err := fs.discardStagedDestination(newFull); err != nil {
+			return err
+		}
 	}
-	if err := fs.ensureNoDirtyStagedData("rename", newFull); err != nil {
-		return err
-	}
+
 	return fs.ops.RenameFile(context.Background(), oldFull, newFull)
+}
+
+// renameDirtyStagedFile renames a dirty staged source by re-keying the staged
+// state and tombstoning the source object. No COS copy is needed: the staged
+// bytes sync to the destination key.
+func (fs *COSFilesystem) renameDirtyStagedFile(oldFull, newFull string) error {
+	if err := fs.stagingManager.RenameStagedPath(oldFull, newFull); err != nil {
+		if os.IsNotExist(err) {
+			// Staged bytes vanished (stale dirty entry); fall back to the
+			// object-store rename.
+			return fs.ops.RenameFile(context.Background(), oldFull, newFull)
+		}
+		return err
+	}
+
+	// Finish the source delete inline when no upload is in flight; otherwise
+	// the sync worker completes it after the upload lands.
+	if fs.stagingManager.TryLockSync(oldFull) {
+		if err := fs.ops.DeleteFile(context.Background(), oldFull); err != nil {
+			fs.logger.Error("COS delete of rename source failed; sync worker will retry",
+				zap.String("old_path", oldFull),
+				zap.Error(err))
+		} else {
+			fs.stagingManager.ResolvePendingDelete(oldFull)
+		}
+		fs.stagingManager.UnlockSync(oldFull)
+	} else {
+		fs.ops.InvalidateFileMutation(oldFull)
+		fs.logger.Info("Rename source delete deferred until in-flight sync completes",
+			zap.String("old_path", oldFull))
+	}
+
+	fs.ops.InvalidateFileMutation(newFull)
+	return nil
+}
+
+// discardStagedDestination drops staged state for a rename destination that is
+// about to be overwritten by an object-store rename.
+func (fs *COSFilesystem) discardStagedDestination(path string) error {
+	sm := fs.stagingManager
+
+	if sm.IsDirty(path) {
+		// An in-flight upload of the doomed destination bytes could land
+		// after the object-store copy and corrupt the renamed object, and a
+		// clean source leaves no dirty entry behind to self-heal it. Keep the
+		// retryable busy answer for that narrow window.
+		if !sm.TryLockSync(path) {
+			return &os.PathError{
+				Op:   "rename",
+				Path: path,
+				Err:  fmt.Errorf("destination staged data is syncing; retry rename: %w", syscall.EBUSY),
+			}
+		}
+		// Claim taken: nothing is uploading the doomed bytes. Discard them.
+		// ForgetDirty releases the claim we just took, which is fine here
+		// because no worker can have held it.
+		sm.ForgetDirty(path, "rename_over_destination")
+		if err := sm.CleanupSession(path, true); err != nil {
+			fs.logger.Error("Failed to discard destination staged session before rename",
+				zap.String("path", path),
+				zap.Error(err))
+		}
+		sm.UnlockSync(path)
+	}
+
+	// A pending delete on the destination would remove the freshly renamed
+	// object once processed; the rename supersedes it.
+	sm.CancelPendingDelete(path)
+	return nil
 }
 
 // Remove removes a file or directory
@@ -673,6 +776,31 @@ func (fs *COSFilesystem) removeDirtyStagedFile(fullPath string) error {
 	fs.stagingManager.ResolvePendingDelete(fullPath)
 	fs.cleanupCleanStagingSessionAfterDelete(fullPath)
 	return nil
+}
+
+// ensureNoDirtyStagedChildren blocks operations on a directory tree that has
+// dirty staged files strictly below path (path itself is allowed).
+func (fs *COSFilesystem) ensureNoDirtyStagedChildren(op, path string) error {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return nil
+	}
+
+	dirtyPaths := fs.stagingManager.DirtyPathsUnder(path)
+	children := dirtyPaths[:0]
+	for _, dirtyPath := range dirtyPaths {
+		if dirtyPath != path {
+			children = append(children, dirtyPath)
+		}
+	}
+	if len(children) == 0 {
+		return nil
+	}
+
+	return &os.PathError{
+		Op:   op,
+		Path: path,
+		Err:  fmt.Errorf("dirty staged data exists at %s; wait for sync before %s: %w", strings.Join(children, ","), op, syscall.EBUSY),
+	}
 }
 
 func (fs *COSFilesystem) ensureNoDirtyStagedData(op, path string) error {
