@@ -11,39 +11,66 @@ import (
 
 // Server wraps the NFS server functionality
 type Server struct {
-	handler     nfs.Handler
-	listener    net.Listener
-	logger      *Logger
-	nfsVersions []uint32
-	wg          sync.WaitGroup
-	ctx         context.Context
-	cancel      context.CancelFunc
+	handler            nfs.Handler
+	listener           net.Listener
+	logger             *Logger
+	nfsVersions        []uint32
+	concurrentHandlers int
+	wg                 sync.WaitGroup
+	ctx                context.Context
+	cancel             context.CancelFunc
+}
+
+// ServerOptions carries optional NFS server behavior from configuration.
+type ServerOptions struct {
+	// AllowedClients restricts which client addresses may connect
+	// (CIDRs or single IPs). Empty allows all clients.
+	AllowedClients []string
+	// ConcurrentHandlers bounds per-connection request parallelism.
+	// 0 selects the built-in default; 1 restores serial handling.
+	ConcurrentHandlers int
 }
 
 // NewServer creates a new NFS server
-func NewServer(handler nfs.Handler, address string, logger *Logger, nfsVersions []uint32) (*Server, error) {
+func NewServer(handler nfs.Handler, address string, logger *Logger, nfsVersions []uint32, opts ServerOptions) (*Server, error) {
+	filter, err := NewClientFilter(opts.AllowedClients)
+	if err != nil {
+		return nil, fmt.Errorf("invalid allowed_clients: %w", err)
+	}
+
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create listener: %w", err)
 	}
+	if filter != nil {
+		logger.Info("NFS client allowlist enabled",
+			"allowed_clients", opts.AllowedClients)
+	}
+	listener = newFilteredListener(listener, filter, logger)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
-		handler:     handler,
-		listener:    listener,
-		logger:      logger,
-		nfsVersions: nfsVersions,
-		ctx:         ctx,
-		cancel:      cancel,
+		handler:            handler,
+		listener:           listener,
+		logger:             logger,
+		nfsVersions:        nfsVersions,
+		concurrentHandlers: opts.ConcurrentHandlers,
+		ctx:                ctx,
+		cancel:             cancel,
 	}, nil
 }
 
 // Start begins serving NFS requests
 func (s *Server) Start() error {
+	concurrency := "default"
+	if s.concurrentHandlers > 0 {
+		concurrency = fmt.Sprintf("%d", s.concurrentHandlers)
+	}
 	s.logger.Info("Starting NFS server",
 		"address", s.listener.Addr().String(),
-		"versions", s.nfsVersions)
+		"versions", s.nfsVersions,
+		"concurrent_handlers", concurrency)
 
 	s.wg.Add(1)
 	go func() {
@@ -52,6 +79,7 @@ func (s *Server) Start() error {
 		srv := &nfs.Server{
 			Handler:            s.handler,
 			EnabledNFSVersions: s.nfsVersions,
+			ConcurrentHandlers: s.concurrentHandlers,
 		}
 		if err := srv.Serve(s.listener); err != nil {
 			s.logger.Error("NFS server error", "error", err)

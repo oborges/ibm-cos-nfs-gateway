@@ -51,6 +51,16 @@ func validateServer(config *ServerConfig) error {
 		return fmt.Errorf("invalid nfs_version: %s (must be '4', '3', or 'dual')", config.NFSVersion)
 	}
 
+	for _, client := range config.AllowedClients {
+		if _, err := ParseClientRule(client); err != nil {
+			return fmt.Errorf("invalid allowed_clients entry %q: %w", client, err)
+		}
+	}
+
+	if config.NFSConcurrentHandlers < 0 {
+		return fmt.Errorf("invalid nfs_concurrent_handlers: %d (must be >= 0; 0 selects the default)", config.NFSConcurrentHandlers)
+	}
+
 	if config.MetricsPort < 1 || config.MetricsPort > 65535 {
 		return fmt.Errorf("invalid metrics_port: %d (must be 1-65535)", config.MetricsPort)
 	}

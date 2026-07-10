@@ -270,7 +270,10 @@ func main() {
 
 	nfsAddress := fmt.Sprintf(":%d", cfg.Server.NFSPort)
 	nfsVersions := cfg.Server.GetNFSVersions()
-	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger, nfsVersions)
+	nfsServer, err := nfs.NewServer(stableHandler, nfsAddress, nfsLogger, nfsVersions, nfs.ServerOptions{
+		AllowedClients:     cfg.Server.AllowedClients,
+		ConcurrentHandlers: cfg.Server.NFSConcurrentHandlers,
+	})
 	if err != nil {
 		logging.Fatal("Failed to create NFS server", zap.Error(err))
 	}

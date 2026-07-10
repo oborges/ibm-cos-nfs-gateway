@@ -9,6 +9,17 @@ server:
   max_connections: 1000
   read_timeout: "30s"
   write_timeout: "30s"
+  # Restrict which client addresses may connect to the NFS port. Entries are
+  # CIDRs or single IPs. Empty (default) allows all clients; rejected
+  # connections are dropped at TCP accept and logged. Use alongside OS or
+  # cloud firewalls as defense in depth, similar to cloud security groups.
+  # allowed_clients:
+  #   - "10.0.1.0/24"
+  #   - "192.168.7.5"
+  # Per-connection NFS request parallelism. 0 (default) uses the built-in
+  # value (64, like a kernel nfsd thread pool); 1 restores fully serial
+  # request handling as an operational escape hatch.
+  nfs_concurrent_handlers: 0
 
 cos:
   # IBM Cloud COS endpoint

@@ -32,6 +32,14 @@ type ServerConfig struct {
 	MaxConnections int    `mapstructure:"max_connections"`
 	ReadTimeout    string `mapstructure:"read_timeout"`
 	WriteTimeout   string `mapstructure:"write_timeout"`
+	// AllowedClients restricts which client addresses may connect to the NFS
+	// port. Entries are CIDRs ("10.0.1.0/24") or single IPs ("10.0.1.5").
+	// Empty means all clients are allowed (rely on external firewalling).
+	AllowedClients []string `mapstructure:"allowed_clients"`
+	// NFSConcurrentHandlers bounds how many requests are processed in
+	// parallel per client connection. 0 selects the built-in default (64);
+	// 1 restores fully serial per-connection handling.
+	NFSConcurrentHandlers int `mapstructure:"nfs_concurrent_handlers"`
 }
 
 // COSConfig represents IBM Cloud COS configuration
@@ -193,6 +201,8 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"server.max_connections",
 		"server.read_timeout",
 		"server.write_timeout",
+		"server.allowed_clients",
+		"server.nfs_concurrent_handlers",
 		"cos.endpoint",
 		"cos.bucket",
 		"cos.region",
@@ -271,6 +281,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.debug_enabled", false)
 	v.SetDefault("server.debug_port", 8082)
 	v.SetDefault("server.max_connections", 1000)
+	v.SetDefault("server.allowed_clients", []string{})
+	v.SetDefault("server.nfs_concurrent_handlers", 0)
 	v.SetDefault("server.read_timeout", "30s")
 	v.SetDefault("server.write_timeout", "30s")
 

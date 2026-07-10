@@ -179,10 +179,20 @@ server:
   health_port: 8081
   debug_enabled: true
   debug_port: 8082
+  allowed_clients: [] # CIDRs/IPs allowed to connect; empty allows all
+  nfs_concurrent_handlers: 0 # per-connection parallelism; 0 = default (64), 1 = serial
 ```
 
 Metrics, health, and debug HTTP servers bind to localhost. Enable only the
 endpoints you need.
+
+`allowed_clients` restricts NFS connections to the listed CIDRs or IPs, the
+same model as cloud security groups: rejected connections are dropped at TCP
+accept before any RPC parsing and logged for auditing. The export still has no
+user authentication, so combine the allowlist with OS/VPC firewalling and
+trusted networks. `nfs_concurrent_handlers` is an operational escape hatch for
+the per-connection request parallelism: set it to `1` to restore fully serial
+handling if a client misbehaves with concurrent replies.
 
 ### Staging And Async Sync
 

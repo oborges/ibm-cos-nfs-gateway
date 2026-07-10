@@ -64,7 +64,11 @@ one TCP connection, so each request body is buffered as it is read and
 dispatched to a bounded handler pool (default 64 per connection, like a kernel
 nfsd thread pool). RPC replies carry XIDs so out-of-order completion is legal,
 and NFSv4.0 clients serialize seqid-ordered state operations per owner
-themselves (RFC 7530 section 9.1.7).
+themselves (RFC 7530 section 9.1.7). Per-connection parallelism is tunable via
+`server.nfs_concurrent_handlers` (1 restores serial handling). When
+`server.allowed_clients` is set, connections from addresses outside the listed
+CIDRs/IPs are dropped at TCP accept, before any RPC bytes are parsed, and
+logged — the same trust model as cloud security groups.
 
 The request path is:
 
