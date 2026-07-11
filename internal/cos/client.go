@@ -3,9 +3,11 @@ package cos
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -57,10 +59,31 @@ func NewClient(cfg *config.COSConfig) (*Client, error) {
 	awsConfig.HTTPClient = &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true, // Disable compression for better performance
+			DialContext: (&net.Dialer{
+				Timeout: 10 * time.Second,
+				// TCP keepalives hold NAT/load-balancer state for pooled
+				// connections so idle-but-open connections stay usable.
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:        128,
+			MaxIdleConnsPerHost: 128,
+			// Longer than the default 90s: bursty gateway workloads with
+			// idle gaps otherwise drain the pool and pay TLS handshakes on
+			// the next burst.
+			IdleConnTimeout:       4 * time.Minute,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    true, // Disable compression for better performance
+			// The 4KB defaults throttle large object transfers; sync
+			// uploads and range reads move MBs per request.
+			WriteBufferSize: 128 << 10,
+			ReadBufferSize:  128 << 10,
+			TLSClientConfig: &tls.Config{
+				// Session resumption cuts reconnect handshakes to one round
+				// trip when connections are re-established after idling out
+				// or during burst fan-out beyond the warm pool.
+				ClientSessionCache: tls.NewLRUClientSessionCache(256),
+			},
 		},
 	}
 
