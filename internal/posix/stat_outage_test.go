@@ -147,4 +147,40 @@ func TestStatMissingFileStillENOENT(t *testing.T) {
 	}
 }
 
+func TestStatNegativeCachingStopsProbeStorms(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	ops, _ := newRefreshTestOps(t, store)
+
+	if _, err := ops.Stat(ctx, "/missing.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat(first miss) error = %v, want ENOENT", err)
+	}
+	probesAfterFirst := store.headCallCount()
+	if probesAfterFirst == 0 {
+		t.Fatal("first miss should probe the object store")
+	}
+
+	// Repeated stats within the negative TTL must answer from cache.
+	for i := 0; i < 5; i++ {
+		if _, err := ops.Stat(ctx, "/missing.txt"); !os.IsNotExist(err) {
+			t.Fatalf("Stat(repeat miss) error = %v, want ENOENT", err)
+		}
+	}
+	if got := store.headCallCount(); got != probesAfterFirst {
+		t.Fatalf("repeat misses probed the store %d extra times, want 0", got-probesAfterFirst)
+	}
+
+	// Once the object appears and the negative entry is invalidated (as all
+	// mutation paths do), Stat sees it.
+	store.put("missing.txt", []byte("now exists"), time.Unix(200, 0))
+	ops.InvalidateFileMutation("/missing.txt")
+	info, err := ops.Stat(ctx, "/missing.txt")
+	if err != nil {
+		t.Fatalf("Stat(after create) error = %v", err)
+	}
+	if info.Size() != int64(len("now exists")) {
+		t.Fatalf("Stat(after create).Size = %d", info.Size())
+	}
+}
+
 // Made with Bob

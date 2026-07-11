@@ -389,7 +389,7 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 
 	useStagingPath := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled()
 
-	fs.logger.Info("FILE OPEN",
+	fs.logger.Debug("FILE OPEN",
 		"file_id", fileID,
 		"path", fullPath,
 		"flags", flagStr,
@@ -418,13 +418,11 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 		return nil, &os.PathError{Op: "open", Path: filename, Err: os.ErrNotExist}
 	}
 
-	// Check if file exists
-	_, err := fs.ops.Stat(context.Background(), fullPath)
-	fileExists := err == nil && !pendingDelete
-
 	// If using staging path, get or create staging session
 	// For writable files: create if needed
 	// For read-only files: get existing session if file is being staged
+	fileExists := false
+	existenceKnown := false
 	if useStagingPath {
 		if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
 			// Writable file: get or create session
@@ -439,23 +437,15 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 			}
 			file.stagingSession = session
 
-			// Automatically pre-fetch existing COS objects if modifying without truncating
-			if fileExists && flag&os.O_TRUNC == 0 {
-				err := session.Prefetch(func() error {
-					fs.logger.Info("Prefetching existing COS object to local staging cache",
-						"file_id", fileID,
-						"path", fullPath)
-					return fs.ops.DownloadToFile(context.Background(), fullPath, session.StagingPath)
-				})
-				if err != nil {
-					fs.logger.Error("Prefetch error intercepted", zap.Error(err))
-				}
+			// A session that already carries data answers the existence
+			// question locally. This keeps the object store entirely out of
+			// the per-WRITE-RPC open path (NFS clients open per WRITE):
+			// consulting COS here cost ~3 round trips per write for files
+			// that exist only in staging.
+			if session.Dirty || session.Prefetched || session.Size > 0 {
+				fileExists = true
+				existenceKnown = true
 			}
-
-			fs.logger.Info("Staging session acquired for write",
-				"file_id", fileID,
-				"path", fullPath,
-				"ref_count", session.GetRefCount())
 		} else {
 			// Read-only file: check if there's an existing staging session
 			session, exists := fs.stagingManager.GetSession(fullPath)
@@ -463,12 +453,37 @@ func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (
 				file.stagingSession = session
 				session.IncrementRefCount()
 
-				fs.logger.Info("Staging session acquired for read",
+				fs.logger.Debug("Staging session acquired for read",
 					"file_id", fileID,
 					"path", fullPath,
 					"ref_count", session.GetRefCount())
 			}
 		}
+	}
+
+	if !existenceKnown {
+		_, err := fs.ops.Stat(context.Background(), fullPath)
+		fileExists = err == nil && !pendingDelete
+	}
+
+	if useStagingPath && file.stagingSession != nil && flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE) != 0 {
+		// Automatically pre-fetch existing COS objects if modifying without truncating
+		if fileExists && !existenceKnown && flag&os.O_TRUNC == 0 {
+			err := file.stagingSession.Prefetch(func() error {
+				fs.logger.Info("Prefetching existing COS object to local staging cache",
+					"file_id", fileID,
+					"path", fullPath)
+				return fs.ops.DownloadToFile(context.Background(), fullPath, file.stagingSession.StagingPath)
+			})
+			if err != nil {
+				fs.logger.Error("Prefetch error intercepted", zap.Error(err))
+			}
+		}
+
+		fs.logger.Debug("Staging session acquired for write",
+			"file_id", fileID,
+			"path", fullPath,
+			"ref_count", file.stagingSession.GetRefCount())
 	}
 
 	// If creating a new file
@@ -1759,55 +1774,27 @@ func (f *COSFile) Close() error {
 		isDirty := f.stagingSession.Dirty
 		refCount := f.stagingSession.GetRefCount()
 
-		f.logger.Info("FILE CLOSE - Releasing staging session",
+		f.logger.Debug("FILE CLOSE - Releasing staging session",
 			"file_id", f.fileID,
 			"path", f.path,
 			"session_size", sessionSize,
 			"ref_count", refCount,
 			"dirty", isDirty)
 
-		// If this is a zero-byte file that was truncated and this is the last handle,
-		// immediately sync it to COS to ensure it exists for NFS attribute operations
-		if sessionSize == 0 && isDirty && refCount == 1 && f.totalWrites == 0 {
-			f.logger.Info("Immediately syncing zero-byte truncated file",
-				"file_id", f.fileID,
-				"path", f.path)
-
-			// Sync to staging file
-			if err := f.stagingSession.Sync(); err != nil {
-				f.logger.Error("Failed to sync zero-byte file to staging",
-					"file_id", f.fileID,
-					"path", f.path,
-					"error", err)
-			} else {
-				// Upload empty file to COS immediately
-				attrs := &types.POSIXAttributes{
-					Mode:  f.perm,
-					UID:   1000,
-					GID:   1000,
-					Mtime: time.Now(),
-				}
-				if err := f.ops.WriteFile(context.Background(), f.path, []byte{}, attrs); err != nil {
-					f.logger.Error("Failed to upload zero-byte file to COS",
-						"file_id", f.fileID,
-						"path", f.path,
-						"error", err)
-				} else {
-					// Mark as clean since we just synced it
-					f.stagingManager.MarkClean(f.path)
-					f.logger.Info("Successfully synced zero-byte file to COS",
-						"file_id", f.fileID,
-						"path", f.path)
-				}
-			}
-		}
+		// Zero-byte files stay in staging like every other write and are
+		// uploaded by the background sync worker (the idle trigger covers
+		// them within seconds). The old synchronous zero-byte upload here
+		// ran on every create's transient open/close (twice per create),
+		// costing two COS PUTs plus full ancestor-cache invalidation, and
+		// its durability semantics were no stronger than write-back. NFS
+		// attribute operations are answered from the staging session.
 
 		// Release session reference (session persists for other handles)
 		f.stagingManager.ReleaseSession(f.path)
 
 		// Log final statistics for this handle
 		if f.totalWrites > 0 {
-			f.logger.Info("File handle closed with write statistics",
+			f.logger.Debug("File handle closed with write statistics",
 				"file_id", f.fileID,
 				"path", f.path,
 				"total_writes", f.totalWrites,
@@ -1842,7 +1829,7 @@ func (f *COSFile) Close() error {
 
 	// Log final statistics for this handle
 	if f.flushCount > 0 {
-		f.logger.Info("File handle closed with write statistics",
+		f.logger.Debug("File handle closed with write statistics",
 			"file_id", f.fileID,
 			"path", f.path,
 			"total_flushes", f.flushCount,

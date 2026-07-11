@@ -47,6 +47,7 @@ type SyncWorker struct {
 	syncTicker *time.Ticker
 
 	onObjectMutated func(path string)
+	onObjectSynced  func(path string)
 
 	uploadMu           sync.Mutex
 	uploadByPath       map[string]uploadAccumulator
@@ -141,15 +142,28 @@ func (sw *SyncWorker) workerLoop(workerID int) {
 }
 
 // SetObjectMutatedCallback registers a hook invoked after the sync worker
-// changes an object in COS (upload or deferred delete), so upstream caches
-// never serve state observed before the mutation. Must be called before Start.
+// removes an object from COS (deferred deletes), so upstream caches never
+// serve state observed before the mutation. Must be called before Start.
 func (sw *SyncWorker) SetObjectMutatedCallback(fn func(path string)) {
 	sw.onObjectMutated = fn
+}
+
+// SetObjectSyncedCallback registers a hook invoked after the sync worker
+// uploads an object. Uploads do not change the namespace, so the handler can
+// invalidate more narrowly than for deletes. Must be called before Start.
+func (sw *SyncWorker) SetObjectSyncedCallback(fn func(path string)) {
+	sw.onObjectSynced = fn
 }
 
 func (sw *SyncWorker) notifyObjectMutated(path string) {
 	if sw.onObjectMutated != nil {
 		sw.onObjectMutated(path)
+	}
+}
+
+func (sw *SyncWorker) notifyObjectSynced(path string) {
+	if sw.onObjectSynced != nil {
+		sw.onObjectSynced(path)
 	}
 }
 
@@ -467,7 +481,7 @@ func (sw *SyncWorker) syncFileLocked(path string, workerID int) error {
 
 	// The object just changed in COS; caches that observed the pre-sync
 	// object (e.g. a stat during the dirty window) must not outlive it.
-	sw.notifyObjectMutated(path)
+	sw.notifyObjectSynced(path)
 
 	if sw.config.CleanAfterSync && session.GetRefCount() == 0 {
 		if err := sw.manager.CleanupSession(path, true); err != nil {
@@ -933,6 +947,6 @@ func (sw *SyncWorker) UploadToCOS(ctx context.Context, path string, data []byte,
 	if err := sw.uploadWithRetry(path, data, metadata); err != nil {
 		return err
 	}
-	sw.notifyObjectMutated(path)
+	sw.notifyObjectSynced(path)
 	return nil
 }

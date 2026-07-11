@@ -246,6 +246,7 @@ func (h *OperationsHandler) invalidateParentListing(path string) int {
 }
 
 func (h *OperationsHandler) invalidateAncestorListings(dir string) int {
+	logging.Debug("Invalidating ancestor listings", zap.String("from", dir))
 	count := 0
 	for {
 		h.metadataCache.Delete(dir)

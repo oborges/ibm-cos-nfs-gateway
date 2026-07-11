@@ -277,31 +277,39 @@ func TestSyncWorkerNotifiesObjectMutated(t *testing.T) {
 
 	cosClient := NewMockCOSClient()
 	worker := NewSyncWorker(manager, cosClient, cfg)
-	var mutated []string
+	var mutated, synced []string
 	worker.SetObjectMutatedCallback(func(path string) {
 		mutated = append(mutated, path)
 	})
+	worker.SetObjectSyncedCallback(func(path string) {
+		synced = append(synced, path)
+	})
 
-	// A successful sync upload must notify, so caches poisoned during the
-	// dirty window (e.g. a zero-byte truncate object) get invalidated.
+	// A successful sync upload must notify the synced hook, so caches
+	// poisoned during the dirty window (e.g. a zero-byte truncate object)
+	// get invalidated without purging ancestor listings.
 	syncPath := "/mutate-sync.txt"
 	writeDirtyTestFile(t, manager, syncPath, "sync payload")
 	if err := worker.syncFile(syncPath); err != nil {
 		t.Fatalf("syncFile() error = %v", err)
 	}
-	if len(mutated) != 1 || mutated[0] != syncPath {
-		t.Fatalf("mutated after sync = %v, want [%s]", mutated, syncPath)
+	if len(synced) != 1 || synced[0] != syncPath {
+		t.Fatalf("synced after sync = %v, want [%s]", synced, syncPath)
+	}
+	if len(mutated) != 0 {
+		t.Fatalf("mutated after sync = %v, want none (uploads use the synced hook)", mutated)
 	}
 
-	// A deferred delete must notify as well.
+	// A deferred delete changes the namespace and must notify the mutated
+	// hook.
 	deletePath := "/mutate-delete.txt"
 	writeDirtyTestFile(t, manager, deletePath, "delete payload")
 	if _, err := manager.RegisterPendingDelete(deletePath); err != nil {
 		t.Fatalf("RegisterPendingDelete() error = %v", err)
 	}
 	worker.processPendingDeletes(0)
-	if len(mutated) != 2 || mutated[1] != deletePath {
-		t.Fatalf("mutated after deferred delete = %v, want second entry %s", mutated, deletePath)
+	if len(mutated) != 1 || mutated[0] != deletePath {
+		t.Fatalf("mutated after deferred delete = %v, want [%s]", mutated, deletePath)
 	}
 }
 

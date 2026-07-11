@@ -270,6 +270,7 @@ type fakeObjectStore struct {
 	copyErrors   map[string]error
 	deleteErrors map[string]error
 	rangeCalls   int
+	headCalls    int
 }
 
 type fakeObject struct {
@@ -367,7 +368,17 @@ func (s *fakeObjectStore) DeleteObject(_ context.Context, key string) error {
 	return nil
 }
 
+func (s *fakeObjectStore) headCallCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.headCalls
+}
+
 func (s *fakeObjectStore) HeadObject(_ context.Context, key string) (*types.ObjectMetadata, error) {
+	s.mu.Lock()
+	s.headCalls++
+	s.mu.Unlock()
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 

@@ -27,6 +27,26 @@ type MetadataEntry struct {
 	ChildEntries []os.FileInfo // Full FileInfo for directory listings (O(1) cache hit)
 	CachedAt     time.Time
 	IsImplicit   bool // True if directory has no marker object (needs validation)
+	// Negative marks a cached "does not exist" answer, valid only for
+	// NegativeTTL after CachedAt. Prevents lookup/create storms from paying
+	// repeated object-store probes for missing paths.
+	Negative bool
+}
+
+// NegativeTTL bounds how long a cached "does not exist" answer is trusted.
+// Short by design: it only needs to cover the lookup-then-create window of a
+// single client operation.
+const NegativeTTL = 5 * time.Second
+
+// SetNegative caches a short-lived "does not exist" answer for path.
+func (c *MetadataCache) SetNegative(path string) {
+	c.Set(path, &MetadataEntry{Negative: true})
+}
+
+// GetNegative reports whether a fresh negative entry exists for path.
+func (c *MetadataCache) GetNegative(path string) bool {
+	entry, ok := c.Get(path)
+	return ok && entry != nil && entry.Negative && time.Since(entry.CachedAt) < NegativeTTL
 }
 
 // NewMetadataCache creates a new metadata cache

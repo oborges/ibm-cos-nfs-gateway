@@ -109,6 +109,21 @@ func (h *OperationsHandler) InvalidateFileMutation(path string) {
 	h.invalidateFileMutation(path)
 }
 
+// InvalidateObjectAfterSync purges caches that observed the pre-sync object
+// without touching ancestor directory listings: a completed upload does not
+// change the namespace (the file and its size were already visible), and
+// invalidating listings after every sync forced parent re-probes against COS
+// under write churn.
+func (h *OperationsHandler) InvalidateObjectAfterSync(path string) {
+	if h == nil {
+		return
+	}
+	if h.metadataCache != nil {
+		h.metadataCache.Delete(path)
+	}
+	h.invalidateDataPath(path)
+}
+
 func (h *OperationsHandler) invalidateDirectoryMutation(path string) {
 	if h == nil {
 		return
@@ -171,8 +186,15 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 
 	// Check cache first, but skip if it's an implicit directory (needs validation)
 	if entry, ok := h.metadataCache.Get(path); ok {
-		// If it's an implicit directory, don't trust the cache - validate it exists
-		if !entry.IsImplicit {
+		// A fresh negative answers ENOENT without touching the object
+		// store; an expired negative falls through to a fresh probe.
+		if entry.Negative {
+			if time.Since(entry.CachedAt) < cache.NegativeTTL {
+				metrics.RecordCacheHit("metadata")
+				return nil, os.ErrNotExist
+			}
+		} else if !entry.IsImplicit {
+			// If it's an implicit directory, don't trust the cache - validate it exists
 			metrics.RecordCacheHit("metadata")
 			log.Debug("Metadata cache hit")
 
@@ -205,7 +227,7 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		log.Info("Implicit directory detected, validating existence", zap.String("path", path))
 	}
 	metrics.RecordCacheMiss("metadata")
-	log.Info("Stat cache miss", zap.String("path", path))
+	log.Debug("Stat cache miss", zap.String("path", path))
 
 	// The export root exists by definition; never depend on the object store
 	// to answer for it. This keeps the mount usable (and creates at the root
@@ -236,8 +258,22 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		}
 	}
 
-	// Try as file first
+	// Probe file and directory-marker existence concurrently: lookups of
+	// missing names (the prelude to every file create) previously paid these
+	// round trips sequentially.
+	dirKey := ToDirectoryKey(objectKey)
+	type headResult struct {
+		metadata *types.ObjectMetadata
+		err      error
+	}
+	dirCh := make(chan headResult, 1)
 	metrics.RecordCOSHeadObject()
+	metrics.RecordCOSHeadObject()
+	go func() {
+		m, err := h.cosClient.HeadObject(ctx, dirKey)
+		dirCh <- headResult{metadata: m, err: err}
+	}()
+
 	metadata, err := h.cosClient.HeadObject(ctx, objectKey)
 	trackBackendErr(err)
 	if err == nil {
@@ -259,9 +295,8 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	}
 
 	// Try as directory
-	dirKey := ToDirectoryKey(objectKey)
-	metrics.RecordCOSHeadObject()
-	metadata, err = h.cosClient.HeadObject(ctx, dirKey)
+	dirRes := <-dirCh
+	metadata, err = dirRes.metadata, dirRes.err
 	trackBackendErr(err)
 	if err == nil {
 		// It's a directory
@@ -319,6 +354,11 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 		// is a better answer during an object-store outage than an error,
 		// and keeps the namespace usable until the backend recovers.
 		if entry, ok := h.metadataCache.GetStale(path); ok && entry != nil {
+			if entry.Negative {
+				log.Warn("Serving stale negative: object store unreachable",
+					zap.Error(backendErr))
+				return nil, os.ErrNotExist
+			}
 			if info := fileInfoFromCacheEntry(path, entry); info != nil {
 				log.Warn("Serving stale metadata: object store unreachable",
 					zap.Error(backendErr))
@@ -350,6 +390,11 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 			zap.Error(backendErr))
 		return nil, fmt.Errorf("object store unreachable for %s: %w", path, backendErr)
 	}
+
+	// Cache the miss briefly so lookup/create storms do not pay repeated
+	// object-store probes for the same missing path. Local creates overwrite
+	// the entry through the staging layer and normal invalidation.
+	h.metadataCache.SetNegative(path)
 
 	log.Debug("Path not found")
 	return nil, os.ErrNotExist
