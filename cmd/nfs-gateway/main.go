@@ -15,6 +15,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/cache"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/cos"
+	"github.com/oborges/cos-nfs-gateway/internal/ha"
 	"github.com/oborges/cos-nfs-gateway/internal/dashboard"
 	"github.com/oborges/cos-nfs-gateway/internal/feature"
 	"github.com/oborges/cos-nfs-gateway/internal/health"
@@ -103,6 +104,23 @@ func main() {
 	defer cosClient.Close()
 
 	logging.Info("COS client initialized successfully")
+
+	// HA fencing: exactly one gateway may serve this bucket.
+	if cfg.HA.Enabled {
+		heartbeat, _ := cfg.HA.GetHeartbeatInterval()
+		leaseTimeout, _ := cfg.HA.GetLeaseTimeout()
+		leaseManager, err := ha.Acquire(context.Background(), ha.Options{
+			Store:             cosClient,
+			HeartbeatInterval: heartbeat,
+			LeaseTimeout:      leaseTimeout,
+			HolderMarkerDir:   cfg.Staging.RootDir,
+			ForceTakeover:     cfg.HA.ForceTakeover,
+		})
+		if err != nil {
+			logging.Fatal("HA lease acquisition failed", zap.Error(err))
+		}
+		defer leaseManager.Release()
+	}
 
 	// Initialize caches
 	metadataCache := cache.NewMetadataCache(&cfg.Cache.Metadata)

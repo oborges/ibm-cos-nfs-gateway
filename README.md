@@ -28,6 +28,10 @@ Test carefully with your own workload before relying on it.
   or stale metadata, accepts deletes via durable tombstones, and reconciles
   when the backend heals. Set `staging.clean_after_sync: false` to retain
   staged copies as a local tier for maximum outage coverage.
+- Supports active/passive high availability fenced by a bucket lease: a
+  standby with replicated staging state promotes automatically once a crashed
+  primary's lease goes stale (planned failovers are immediate), and a second
+  active gateway is refused. See [docs/HA.md](docs/HA.md).
 - Uses read-ahead, parallel range fetches, and singleflight deduplication to
   reduce repeated COS reads.
 - Exposes Prometheus metrics, health endpoints, and debug endpoints when

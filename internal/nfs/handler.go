@@ -18,6 +18,7 @@ import (
 	"github.com/oborges/cos-nfs-gateway/internal/buffer"
 	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/internal/feature"
+	"github.com/oborges/cos-nfs-gateway/internal/ha"
 	"github.com/oborges/cos-nfs-gateway/internal/metrics"
 	"github.com/oborges/cos-nfs-gateway/internal/posix"
 	"github.com/oborges/cos-nfs-gateway/internal/staging"
@@ -358,6 +359,9 @@ func (fs *COSFilesystem) Open(filename string) (billy.File, error) {
 // OpenFile opens a file with specified flags and permissions
 func (fs *COSFilesystem) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	fullPath := fs.Join(fs.root, filename)
+	if isReservedPath(fullPath) {
+		return nil, &os.PathError{Op: "open", Path: filename, Err: os.ErrPermission}
+	}
 
 	// Generate unique file handle ID for tracking
 	fileID := fmt.Sprintf("%p", &fullPath)
@@ -573,9 +577,18 @@ func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
 	return false
 }
 
+// isReservedPath hides gateway-internal bucket objects (the HA lease) from
+// the NFS namespace so clients cannot read, delete, or overwrite them.
+func isReservedPath(fullPath string) bool {
+	return fullPath == "/"+ha.LeaseObjectKey
+}
+
 // Stat returns file information
 func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 	fullPath := fs.Join(fs.root, filename)
+	if isReservedPath(fullPath) {
+		return nil, &os.PathError{Op: "stat", Path: filename, Err: os.ErrNotExist}
+	}
 
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if fs.stagingManager.HasPendingDelete(fullPath) {
@@ -645,6 +658,9 @@ func (fs *COSFilesystem) statFromStaging(fullPath string) os.FileInfo {
 func (fs *COSFilesystem) Rename(oldpath, newpath string) error {
 	oldFull := fs.Join(fs.root, oldpath)
 	newFull := fs.Join(fs.root, newpath)
+	if isReservedPath(oldFull) || isReservedPath(newFull) {
+		return &os.PathError{Op: "rename", Path: oldpath, Err: os.ErrPermission}
+	}
 
 	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
 	if stagingEnabled {
@@ -760,6 +776,9 @@ func (fs *COSFilesystem) discardStagedDestination(path string) error {
 // Remove removes a file or directory
 func (fs *COSFilesystem) Remove(filename string) error {
 	fullPath := fs.Join(fs.root, filename)
+	if isReservedPath(fullPath) {
+		return &os.PathError{Op: "remove", Path: filename, Err: os.ErrPermission}
+	}
 
 	stagingEnabled := fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil
 	if stagingEnabled && fs.stagingManager.IsDirty(fullPath) {
@@ -1066,11 +1085,15 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 		return nil, err
 	}
 
-	// Convert []*posix.FileInfo to []os.FileInfo
+	// Convert []*posix.FileInfo to []os.FileInfo, hiding reserved
+	// gateway-internal objects from the namespace.
 	convStart := time.Now()
-	result := make([]os.FileInfo, len(entries))
-	for i, entry := range entries {
-		result[i] = entry
+	result := make([]os.FileInfo, 0, len(entries))
+	for _, entry := range entries {
+		if isReservedPath(fs.Join(fullPath, entry.Name())) {
+			continue
+		}
+		result = append(result, entry)
 	}
 
 	// Safely inject StagingManager Memory bounds natively into directories!

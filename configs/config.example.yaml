@@ -80,6 +80,17 @@ object_refresh:
   interval: "5m"      # Scan interval when enabled
   prefix: ""          # COS key prefix to scan; empty scans the mounted bucket view
 
+# Active/passive fencing: exactly one gateway may serve a bucket. The active
+# gateway heartbeats a lease object (.nfs-gateway.lease, hidden from the NFS
+# namespace); a second gateway refuses to start while a fresh foreign lease
+# exists. A standby promotes automatically once the lease is stale (holder
+# crashed) or immediately after a graceful shutdown. Break-glass takeover of
+# a fresh lease: NFS_GATEWAY_HA_FORCE_TAKEOVER=true (never set in this file).
+ha:
+  enabled: false
+  heartbeat_interval: "15s"
+  lease_timeout: "60s"
+
 logging:
   level: "info"     # debug, info, warn, error
   format: "json"    # json or text

@@ -3,6 +3,7 @@ package cos
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -171,13 +172,18 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 		}
 
 		lastErr = err
-		
+
 		// Don't retry on certain errors
 		if isNotFoundError(err) || strings.Contains(err.Error(), "too large") {
 			break
 		}
 	}
 
+	if isNotFoundError(lastErr) {
+		// Typed miss so callers can distinguish a missing object from an
+		// unreachable object store.
+		return nil, fmt.Errorf("object %s: %w", key, os.ErrNotExist)
+	}
 	log.Error("GetObject failed after retries", zap.Error(lastErr), zap.Int("maxRetries", maxRetries))
 	return nil, lastErr
 }
@@ -613,17 +619,19 @@ func (c *Client) ObjectExists(ctx context.Context, key string) (bool, error) {
 	return true, nil
 }
 
-// isNotFoundError checks if an error is a "not found" error
+// isNotFoundError checks if an error is a "not found" error. errors.As is
+// required: call sites wrap SDK errors with fmt.Errorf("...: %w", err) and a
+// direct type assertion misses those.
 func isNotFoundError(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Check for AWS error codes
-	if aerr, ok := err.(awserr.Error); ok {
+	var aerr awserr.Error
+	if errors.As(err, &aerr) {
 		code := aerr.Code()
 		return code == "NotFound" || code == "NoSuchKey" || code == s3.ErrCodeNoSuchKey || strings.Contains(code, "404")
 	}
-	return false
+	return errors.Is(err, os.ErrNotExist)
 }
 
 // CreateMultipartUpload initiates a multipart upload and returns an upload ID

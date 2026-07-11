@@ -36,6 +36,25 @@ func Validate(config *Config) error {
 		return fmt.Errorf("staging config: %w", err)
 	}
 
+	if err := validateHA(&config.HA); err != nil {
+		return fmt.Errorf("ha config: %w", err)
+	}
+
+	return nil
+}
+
+func validateHA(config *HAConfig) error {
+	heartbeat, err := config.GetHeartbeatInterval()
+	if err != nil {
+		return fmt.Errorf("invalid heartbeat_interval: %w", err)
+	}
+	timeout, err := config.GetLeaseTimeout()
+	if err != nil {
+		return fmt.Errorf("invalid lease_timeout: %w", err)
+	}
+	if config.Enabled && timeout <= heartbeat*2 {
+		return fmt.Errorf("lease_timeout (%s) must be more than twice heartbeat_interval (%s) or transient heartbeat delays cause spurious takeovers", timeout, heartbeat)
+	}
 	return nil
 }
 

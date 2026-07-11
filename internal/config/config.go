@@ -17,6 +17,35 @@ type Config struct {
 	ObjectRefresh ObjectRefreshConfig `mapstructure:"object_refresh"`
 	Logging       LoggingConfig       `mapstructure:"logging"`
 	Staging       StagingConfig       `mapstructure:"staging"`
+	HA            HAConfig            `mapstructure:"ha"`
+}
+
+// HAConfig controls active/passive fencing through a bucket lease. Exactly
+// one gateway may serve a bucket; the lease makes violations fail loudly.
+type HAConfig struct {
+	Enabled           bool   `mapstructure:"enabled"`
+	HeartbeatInterval string `mapstructure:"heartbeat_interval"`
+	LeaseTimeout      string `mapstructure:"lease_timeout"`
+	// ForceTakeover steals a fresh foreign lease at startup. Break-glass
+	// only (set NFS_GATEWAY_HA_FORCE_TAKEOVER=true); never leave enabled in
+	// a config file.
+	ForceTakeover bool `mapstructure:"force_takeover"`
+}
+
+// GetHeartbeatInterval parses the heartbeat interval with a 15s default.
+func (c *HAConfig) GetHeartbeatInterval() (time.Duration, error) {
+	if c.HeartbeatInterval == "" {
+		return 15 * time.Second, nil
+	}
+	return time.ParseDuration(c.HeartbeatInterval)
+}
+
+// GetLeaseTimeout parses the lease timeout with a 60s default.
+func (c *HAConfig) GetLeaseTimeout() (time.Duration, error) {
+	if c.LeaseTimeout == "" {
+		return 60 * time.Second, nil
+	}
+	return time.ParseDuration(c.LeaseTimeout)
 }
 
 // ServerConfig represents NFS server configuration
@@ -258,6 +287,10 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"staging.backpressure_critical_watermark_percent",
 		"staging.backpressure_wait_timeout",
 		"staging.backpressure_check_interval",
+		"ha.enabled",
+		"ha.heartbeat_interval",
+		"ha.lease_timeout",
+		"ha.force_takeover",
 	}
 
 	for _, key := range keys {
@@ -347,6 +380,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("staging.backpressure_critical_watermark_percent", 95)
 	v.SetDefault("staging.backpressure_wait_timeout", "30s")
 	v.SetDefault("staging.backpressure_check_interval", "250ms")
+
+	v.SetDefault("ha.enabled", false)
+	v.SetDefault("ha.heartbeat_interval", "15s")
+	v.SetDefault("ha.lease_timeout", "60s")
+	v.SetDefault("ha.force_takeover", false)
 }
 
 // GetReadTimeout returns the parsed read timeout duration
