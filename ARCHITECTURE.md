@@ -141,6 +141,32 @@ only when the request misses the cache, is clamped to the known object size
 concurrent fetches for the same range are deduplicated with singleflight to
 avoid stampeding COS.
 
+### Object-Store Outage Behavior
+
+The gateway keeps the export functional while COS is unreachable, verified by
+fault injection with two clients under full write/read/delete/rename/lock
+churn (zero errors across a 3-minute total outage):
+
+- Startup proceeds in degraded mode when COS cannot be reached, so crash
+  recovery works during an outage; staged dirty files are recovered and the
+  export comes back.
+- Writes are accepted into staging as always. Reads of dirty or retained
+  staged files are served locally; cached chunks keep serving.
+- Metadata answers fall back in order: fresh cache, staged state (a session
+  answers for its file; staged data under a path proves the directory), then
+  stale cache entries including stale negatives derived from parent listings.
+  Backend failures are surfaced as I/O errors, never as false ENOENT.
+- Deletes that cannot reach COS are accepted through the same durable
+  tombstones used for dirty-file deletes: the path disappears immediately and
+  the sync worker retires the object when the backend heals.
+- Readdir serves staged entries when the object store cannot answer.
+
+Operations with no local truth (cold reads of never-cached data, creation of
+new directories, renames of clean files) still fail until the backend
+responds. Retaining staged data after sync (`staging.clean_after_sync: false`)
+widens local coverage: everything written since the staged copies were last
+cleaned remains readable through an outage.
+
 ### Directory And Metadata Path
 
 Object keys are translated into filesystem paths. Directory listings are

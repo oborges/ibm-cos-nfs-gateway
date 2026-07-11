@@ -47,10 +47,11 @@ func (c *LRUCache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
-	// Check if expired
+	// Expired entries are reported as misses but retained (bounded by LRU
+	// capacity and the janitor's stale-retention window) so GetStale can
+	// serve them while the backend is unreachable.
 	ent := elem.Value.(*entry)
 	if time.Now().After(ent.expiresAt) {
-		c.removeElement(elem)
 		c.misses++
 		return nil, false
 	}
@@ -59,6 +60,21 @@ func (c *LRUCache) Get(key string) (interface{}, bool) {
 	c.evictList.MoveToFront(elem)
 	c.hits++
 	return ent.value, true
+}
+
+// GetStale returns a value even if its TTL has expired, so callers can serve
+// stale-but-known state during a backend outage. Entries expired longer than
+// the stale-retention window are reclaimed by the janitor; explicit
+// invalidation still removes entries immediately.
+func (c *LRUCache) GetStale(key string) (interface{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	elem, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	return elem.Value.(*entry).value, true
 }
 
 // Set adds or updates a value in the cache
@@ -177,6 +193,10 @@ func (c *LRUCache) SetEvictCallback(fn func(key string, value interface{})) {
 }
 
 // CleanExpired removes all expired entries
+// staleRetention keeps expired entries available to GetStale for backend
+// outage tolerance before the janitor reclaims them.
+const staleRetention = 24 * time.Hour
+
 func (c *LRUCache) CleanExpired() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -187,7 +207,7 @@ func (c *LRUCache) CleanExpired() int {
 	// Iterate from back (oldest) to front
 	for elem := c.evictList.Back(); elem != nil; {
 		ent := elem.Value.(*entry)
-		if now.After(ent.expiresAt) {
+		if now.After(ent.expiresAt.Add(staleRetention)) {
 			prev := elem.Prev()
 			c.removeElement(elem)
 			count++

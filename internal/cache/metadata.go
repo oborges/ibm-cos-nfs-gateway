@@ -77,6 +77,24 @@ func (c *MetadataCache) Get(path string) (*MetadataEntry, bool) {
 	return entry, true
 }
 
+// GetStale returns a cached entry even after its TTL expired, for serving
+// known-but-stale metadata while the object store is unreachable.
+func (c *MetadataCache) GetStale(path string) (*MetadataEntry, bool) {
+	if !c.enabled {
+		return nil, false
+	}
+
+	value, ok := c.cache.GetStale(path)
+	if !ok {
+		return nil, false
+	}
+	entry, ok := value.(*MetadataEntry)
+	if !ok {
+		return nil, false
+	}
+	return entry, true
+}
+
 // Set stores metadata in cache
 func (c *MetadataCache) Set(path string, entry *MetadataEntry) {
 	if !c.enabled {

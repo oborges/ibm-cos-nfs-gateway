@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/oborges/cos-nfs-gateway/internal/cache"
+	"github.com/oborges/cos-nfs-gateway/internal/config"
 	"github.com/oborges/cos-nfs-gateway/pkg/types"
 )
 
@@ -62,6 +65,74 @@ func TestStatDuringBackendOutage(t *testing.T) {
 	}
 	if !info.IsDir() {
 		t.Fatal("Stat(/) must report a directory")
+	}
+}
+
+func TestStatServesStaleMetadataDuringOutage(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeObjectStore()
+	store.put("stale.txt", []byte("payload-12"), time.Unix(100, 0))
+	store.put("dir/child.txt", []byte("c"), time.Unix(100, 0))
+
+	metadataCache := cache.NewMetadataCache(&config.MetadataCacheConfig{
+		Enabled:    true,
+		TTLSeconds: 1, // expire quickly so the outage hits stale entries
+		MaxEntries: 100,
+	})
+	ops := NewOperationsHandler(store, metadataCache, nil, &config.PerformanceConfig{
+		MaxDirectoryEntries: 100,
+		MaxFullObjectReadMB: 1,
+	})
+
+	// Warm the caches while the backend is healthy.
+	info, err := ops.Stat(ctx, "/stale.txt")
+	if err != nil {
+		t.Fatalf("Stat(warm) error = %v", err)
+	}
+	wantSize := info.Size()
+	entries, err := ops.ListDirectory(ctx, "/dir")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ListDirectory(warm) = %v entries, err %v", len(entries), err)
+	}
+
+	// Let the TTL lapse, then take the backend down.
+	time.Sleep(1100 * time.Millisecond)
+	ops.cosClient = downObjectStore{}
+
+	info, err = ops.Stat(ctx, "/stale.txt")
+	if err != nil {
+		t.Fatalf("Stat(stale during outage) error = %v, want stale answer", err)
+	}
+	if info.Size() != wantSize {
+		t.Fatalf("stale Stat size = %d, want %d", info.Size(), wantSize)
+	}
+
+	entries, err = ops.ListDirectory(ctx, "/dir")
+	if err != nil {
+		t.Fatalf("ListDirectory(stale during outage) error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "child.txt" {
+		t.Fatalf("stale listing = %v, want [child.txt]", entryNames(entries))
+	}
+
+	// A name absent from the parent's stale listing answers as a stale
+	// negative (ENOENT), which is what keeps creates working in an outage.
+	if _, err := ops.Stat(ctx, "/dir/brand-new-name.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat(new name under stale-listed dir) error = %v, want ENOENT", err)
+	}
+	// A name present in the parent's stale listing answers positively.
+	info, err = ops.Stat(ctx, "/dir/child.txt")
+	if err != nil {
+		t.Fatalf("Stat(child via stale parent listing) error = %v", err)
+	}
+	if info.Name() != "child.txt" {
+		t.Fatalf("stale child name = %q", info.Name())
+	}
+
+	// Paths with no stale entry AND no stale parent listing still fail with
+	// an I/O error, not ENOENT.
+	if _, err := ops.Stat(ctx, "/unlisted-dir/never-seen.txt"); err == nil || os.IsNotExist(err) {
+		t.Fatalf("Stat(uncached during outage) error = %v, want I/O error", err)
 	}
 }
 

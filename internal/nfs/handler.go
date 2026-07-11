@@ -547,6 +547,22 @@ func (s *stagingFileInfo) Sys() interface{} {
 	return nil
 }
 
+// stagingDirInfo is a synthetic directory answer derived from staged state:
+// staged data under a path proves the directory exists even when the object
+// store cannot be asked.
+type stagingDirInfo struct {
+	name    string
+	modTime time.Time
+	mode    os.FileMode
+}
+
+func (s *stagingDirInfo) Name() string       { return s.name }
+func (s *stagingDirInfo) Size() int64        { return 0 }
+func (s *stagingDirInfo) Mode() os.FileMode  { return s.mode }
+func (s *stagingDirInfo) ModTime() time.Time { return s.modTime }
+func (s *stagingDirInfo) IsDir() bool        { return true }
+func (s *stagingDirInfo) Sys() interface{}   { return nil }
+
 func (fs *COSFilesystem) isStagingDirty(fullPath string) bool {
 	if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
 		if session, exists := fs.stagingManager.GetSession(fullPath); exists {
@@ -578,7 +594,51 @@ func (fs *COSFilesystem) Stat(filename string) (os.FileInfo, error) {
 		}
 	}
 
-	return fs.ops.Stat(context.Background(), fullPath)
+	info, err := fs.ops.Stat(context.Background(), fullPath)
+	if err != nil && !os.IsNotExist(err) {
+		// The object store could not answer, but local staging state can
+		// vouch for some paths: a retained staged session answers for the
+		// file itself, and staged data below a path proves the directory
+		// exists. This keeps the namespace (and file creation, which stats
+		// the parent directory) working during a backend outage.
+		if fallback := fs.statFromStaging(fullPath); fallback != nil {
+			fs.logger.Error("Stat answered from staging state: object store unreachable",
+				zap.String("path", fullPath), zap.Error(err))
+			return fallback, nil
+		}
+	}
+	return info, err
+}
+
+// statFromStaging answers a Stat from local staging knowledge when the object
+// store cannot: an existing session for the exact path, or staged data under
+// the path implying a directory.
+func (fs *COSFilesystem) statFromStaging(fullPath string) os.FileInfo {
+	if fs.featureFlags == nil || !fs.featureFlags.IsStagingEnabled() || fs.stagingManager == nil {
+		return nil
+	}
+
+	if session, exists := fs.stagingManager.GetSession(fullPath); exists {
+		return &stagingFileInfo{
+			name:    filepath.Base(fullPath),
+			size:    session.Size,
+			modTime: session.LastWrite,
+			mode:    session.Mode,
+			uid:     session.UID,
+			gid:     session.GID,
+		}
+	}
+
+	if len(fs.stagingManager.GetSessionsInDirectory(fullPath)) > 0 ||
+		len(fs.stagingManager.DirtyPathsUnder(fullPath)) > 0 {
+		attrs := posix.DefaultAttributes(true)
+		return &stagingDirInfo{
+			name:    filepath.Base(fullPath),
+			modTime: attrs.Mtime,
+			mode:    attrs.Mode | os.ModeDir,
+		}
+	}
+	return nil
 }
 
 // Rename renames a file
@@ -740,6 +800,18 @@ func (fs *COSFilesystem) Remove(filename string) error {
 	}
 
 	if err := fs.ops.DeleteFile(context.Background(), fullPath); err != nil {
+		if stagingEnabled && !os.IsNotExist(err) {
+			// The object store could not perform the delete (outage or
+			// transient failure). Accept it write-back style: a durable
+			// tombstone hides the path immediately and the sync worker
+			// retires the object once the backend responds.
+			if _, terr := fs.stagingManager.RegisterPendingDelete(fullPath); terr == nil {
+				fs.ops.InvalidateFileMutation(fullPath)
+				fs.logger.Error("Delete accepted via tombstone: object store unreachable",
+					zap.String("path", fullPath), zap.Error(err))
+				return nil
+			}
+		}
 		return err
 	}
 
@@ -960,6 +1032,33 @@ func (fs *COSFilesystem) ReadDir(path string) ([]os.FileInfo, error) {
 	listDuration := time.Since(listStart)
 
 	if err != nil {
+		// If the object store cannot answer but staged sessions exist under
+		// this directory, serve the staged entries: a partial listing keeps
+		// applications working during a backend outage.
+		if fs.featureFlags != nil && fs.featureFlags.IsStagingEnabled() && fs.stagingManager != nil {
+			if staged := fs.stagingManager.GetSessionsInDirectory(fullPath); len(staged) > 0 {
+				fs.logger.Error("ReadDir serving staged entries only: object store unreachable",
+					zap.String("path", fullPath), zap.Error(err))
+				result := make([]os.FileInfo, 0, len(staged))
+				for _, session := range staged {
+					if fs.stagingManager.HasPendingDelete(session.Path) {
+						continue
+					}
+					result = append(result, &stagingFileInfo{
+						name:    filepath.Base(session.Path),
+						size:    session.Size,
+						modTime: session.LastWrite,
+						mode:    session.Mode,
+						uid:     session.UID,
+						gid:     session.GID,
+					})
+				}
+				duration := time.Since(start)
+				RecordReaddirCall(fullPath, len(result), duration, nil)
+				metrics.RecordReadDir(duration)
+				return result, nil
+			}
+		}
 		// Record trace even on error
 		duration := time.Since(start)
 		RecordReaddirCall(fullPath, 0, duration, err)

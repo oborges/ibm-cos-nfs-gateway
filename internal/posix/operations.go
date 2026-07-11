@@ -315,6 +315,37 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 	}
 
 	if backendErr != nil {
+		// Serve stale metadata rather than failing: an expired cache entry
+		// is a better answer during an object-store outage than an error,
+		// and keeps the namespace usable until the backend recovers.
+		if entry, ok := h.metadataCache.GetStale(path); ok && entry != nil {
+			if info := fileInfoFromCacheEntry(path, entry); info != nil {
+				log.Warn("Serving stale metadata: object store unreachable",
+					zap.Error(backendErr))
+				return info, nil
+			}
+		}
+		// A stale listing of the parent can still answer the lookup: if the
+		// name is absent there, report ENOENT (a stale negative). This is
+		// what lets file creation keep working during an outage — clients
+		// revalidate the name with a lookup before sending OPEN(create).
+		if parentEntry, ok := h.metadataCache.GetStale(GetParentPath(NormalizePath(path))); ok &&
+			parentEntry != nil && parentEntry.ChildEntries != nil {
+			name := GetBaseName(path)
+			for _, child := range parentEntry.ChildEntries {
+				if child.Name() == name {
+					log.Warn("Serving stale metadata from parent listing: object store unreachable",
+						zap.Error(backendErr))
+					if fi, isFileInfo := child.(*FileInfo); isFileInfo {
+						return fi, nil
+					}
+					break
+				}
+			}
+			log.Warn("Serving stale negative from parent listing: object store unreachable",
+				zap.Error(backendErr))
+			return nil, os.ErrNotExist
+		}
 		log.Error("Stat could not determine existence: object store unreachable",
 			zap.Error(backendErr))
 		return nil, fmt.Errorf("object store unreachable for %s: %w", path, backendErr)
@@ -322,6 +353,31 @@ func (h *OperationsHandler) Stat(ctx context.Context, path string) (*FileInfo, e
 
 	log.Debug("Path not found")
 	return nil, os.ErrNotExist
+}
+
+// fileInfoFromCacheEntry reconstructs a FileInfo from a metadata cache entry.
+func fileInfoFromCacheEntry(path string, entry *cache.MetadataEntry) *FileInfo {
+	if entry.FileInfo != nil {
+		if info, ok := entry.FileInfo.(*FileInfo); ok {
+			return info
+		}
+	}
+	mode := os.FileMode(0644)
+	modTime := DefaultAttributes(entry.IsDir).Mtime
+	if entry.Attributes != nil {
+		mode = entry.Attributes.Mode
+		modTime = entry.Attributes.Mtime
+	}
+	if entry.IsDir {
+		mode = mode | os.ModeDir
+	}
+	return &FileInfo{
+		name:    GetBaseName(path),
+		size:    0,
+		mode:    mode,
+		modTime: modTime,
+		isDir:   entry.IsDir,
+	}
 }
 
 // DownloadToFile streams the object from COS into a local file path
@@ -845,6 +901,26 @@ fetchFromCOS:
 	maxEntries := h.maxDirectoryEntries()
 	objects, err := h.cosClient.ListObjects(ctx, prefix, maxEntries+1)
 	if err != nil {
+		// Serve a stale listing during an object-store outage rather than
+		// failing the readdir; local staged entries are merged on top by the
+		// NFS layer either way.
+		if entry, ok := h.metadataCache.GetStale(path); ok && entry != nil && entry.ChildEntries != nil {
+			stale := make([]*FileInfo, 0, len(entry.ChildEntries))
+			valid := true
+			for _, child := range entry.ChildEntries {
+				fi, isFileInfo := child.(*FileInfo)
+				if !isFileInfo {
+					valid = false
+					break
+				}
+				stale = append(stale, fi)
+			}
+			if valid {
+				log.Warn("Serving stale directory listing: object store unreachable",
+					zap.Error(err))
+				return stale, nil
+			}
+		}
 		log.Error("Failed to list directory", zap.Error(err))
 		return nil, err
 	}

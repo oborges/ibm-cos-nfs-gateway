@@ -23,6 +23,11 @@ Test carefully with your own workload before relying on it.
 - Supports advisory byte-range file locking over NFSv4 (`fcntl` and `flock`),
   with POSIX conflict semantics, capped at 512 locks per file and 8,192 per
   client. Locks are advisory only and do not survive a gateway restart.
+- Tolerates object-store outages: starts degraded when COS is unreachable,
+  keeps accepting staged writes, serves staged/cached reads and staging-backed
+  or stale metadata, accepts deletes via durable tombstones, and reconciles
+  when the backend heals. Set `staging.clean_after_sync: false` to retain
+  staged copies as a local tier for maximum outage coverage.
 - Uses read-ahead, parallel range fetches, and singleflight deduplication to
   reduce repeated COS reads.
 - Exposes Prometheus metrics, health endpoints, and debug endpoints when

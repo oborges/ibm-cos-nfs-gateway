@@ -418,6 +418,38 @@ func TestCOSFilesystemRemoveDirtyStagedFileSucceeds(t *testing.T) {
 	}
 }
 
+func TestCOSFilesystemRemoveCleanFileFallsBackToTombstoneOnBackendError(t *testing.T) {
+	cfg := testStagingConfig(t)
+	manager, err := staging.NewStagingManager(cfg)
+	if err != nil {
+		t.Fatalf("NewStagingManager() error = %v", err)
+	}
+	defer manager.Shutdown()
+
+	store := newFakeObjectStore()
+	store.objects["clean.txt"] = []byte("clean synced data")
+	fs := newDirtyStagingTestFilesystemWithStore(t, manager, store)
+
+	// Backend cannot perform deletes (outage).
+	store.deleteErr = errors.New("dial tcp: connection refused")
+
+	if err := fs.Remove("clean.txt"); err != nil {
+		t.Fatalf("Remove(clean file, backend down) error = %v, want tombstone-accepted delete", err)
+	}
+	if !manager.HasPendingDelete("/clean.txt") {
+		t.Fatal("delete must be recorded as a pending tombstone")
+	}
+	if _, err := fs.Stat("clean.txt"); !os.IsNotExist(err) {
+		t.Fatalf("Stat() after accepted delete = %v, want not-exist", err)
+	}
+
+	// The deferred COS delete is completed by the sync worker's tombstone
+	// pass (covered by staging tests); here assert it is queued exactly once.
+	if manager.PendingDeleteCount() != 1 {
+		t.Fatalf("PendingDeleteCount() = %d, want 1", manager.PendingDeleteCount())
+	}
+}
+
 func TestCOSFilesystemHidesPendingDeletePaths(t *testing.T) {
 	cfg := testStagingConfig(t)
 	manager, err := staging.NewStagingManager(cfg)
@@ -549,8 +581,9 @@ func TestCOSFilesystemRemoveDirectoryWithDirtyChildIsBlocked(t *testing.T) {
 
 // fakeObjectStore is an in-memory posix.ObjectStore for handler tests.
 type fakeObjectStore struct {
-	objects map[string][]byte
-	deleted map[string]bool
+	objects   map[string][]byte
+	deleted   map[string]bool
+	deleteErr error
 }
 
 func newFakeObjectStore() *fakeObjectStore {
@@ -597,6 +630,9 @@ func (s *fakeObjectStore) PutObject(ctx context.Context, key string, data []byte
 }
 
 func (s *fakeObjectStore) DeleteObject(ctx context.Context, key string) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	delete(s.objects, key)
 	s.deleted[key] = true
 	return nil
