@@ -49,42 +49,51 @@ func NewClient(cfg *config.COSConfig) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
-	
+
 	// For large files, we need a much longer timeout
 	// Default is 30s, but large files need more time
 	if timeout < 5*time.Minute {
 		timeout = 5 * time.Minute
 	}
-	
-	awsConfig.HTTPClient = &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout: 10 * time.Second,
-				// TCP keepalives hold NAT/load-balancer state for pooled
-				// connections so idle-but-open connections stay usable.
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:        128,
-			MaxIdleConnsPerHost: 128,
-			// Longer than the default 90s: bursty gateway workloads with
-			// idle gaps otherwise drain the pool and pay TLS handshakes on
-			// the next burst.
-			IdleConnTimeout:       4 * time.Minute,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			DisableCompression:    true, // Disable compression for better performance
-			// The 4KB defaults throttle large object transfers; sync
-			// uploads and range reads move MBs per request.
-			WriteBufferSize: 128 << 10,
-			ReadBufferSize:  128 << 10,
-			TLSClientConfig: &tls.Config{
-				// Session resumption cuts reconnect handshakes to one round
-				// trip when connections are re-established after idling out
-				// or during burst fan-out beyond the warm pool.
-				ClientSessionCache: tls.NewLRUClientSessionCache(256),
-			},
+
+	var transport http.RoundTripper = &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+			// TCP keepalives hold NAT/load-balancer state for pooled
+			// connections so idle-but-open connections stay usable.
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        128,
+		MaxIdleConnsPerHost: 128,
+		// Longer than the default 90s: bursty gateway workloads with
+		// idle gaps otherwise drain the pool and pay TLS handshakes on
+		// the next burst.
+		IdleConnTimeout:       4 * time.Minute,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression:    true, // Disable compression for better performance
+		// The 4KB defaults throttle large object transfers; sync
+		// uploads and range reads move MBs per request.
+		WriteBufferSize: 128 << 10,
+		ReadBufferSize:  128 << 10,
+		TLSClientConfig: &tls.Config{
+			// Session resumption cuts reconnect handshakes to one round
+			// trip when connections are re-established after idling out
+			// or during burst fan-out beyond the warm pool.
+			ClientSessionCache: tls.NewLRUClientSessionCache(256),
 		},
+	}
+
+	// Fail fast during established outages instead of paying dial/retry
+	// timeouts on every operation; the gateway's staging and stale-cache
+	// fallbacks then answer immediately.
+	if cfg.CircuitBreakerEnabled == nil || *cfg.CircuitBreakerEnabled {
+		transport = newBreakerTransport(transport)
+	}
+
+	awsConfig.HTTPClient = &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
 	}
 
 	// Configure authentication
@@ -197,7 +206,7 @@ func (c *Client) GetObject(ctx context.Context, key string) ([]byte, error) {
 		lastErr = err
 
 		// Don't retry on certain errors
-		if isNotFoundError(err) || strings.Contains(err.Error(), "too large") {
+		if isCircuitOpenError(err) || isNotFoundError(err) || strings.Contains(err.Error(), "too large") {
 			break
 		}
 	}
@@ -248,29 +257,29 @@ func (c *Client) getObjectAttempt(ctx context.Context, key string) ([]byte, erro
 	totalRead := 0
 	lastLogTime := time.Now()
 	lastLogBytes := 0
-	
+
 	for {
 		n, err := result.Body.Read(buf)
 		if n > 0 {
 			data = append(data, buf[:n]...)
 			totalRead += n
-			
+
 			// Log progress every 10MB or every 5 seconds
 			if totalRead-lastLogBytes >= 10*1024*1024 || time.Since(lastLogTime) >= 5*time.Second {
 				percentComplete := float64(0)
 				if totalSize > 0 {
 					percentComplete = float64(totalRead) / float64(totalSize) * 100
 				}
-				
-				throughputMBps := float64(totalRead-lastLogBytes) / (1024*1024) / time.Since(lastLogTime).Seconds()
-				
+
+				throughputMBps := float64(totalRead-lastLogBytes) / (1024 * 1024) / time.Since(lastLogTime).Seconds()
+
 				log.Info("Download progress",
 					zap.String("key", key),
 					zap.Int("bytesRead", totalRead),
 					zap.String("readMB", fmt.Sprintf("%.2f MB", float64(totalRead)/(1024*1024))),
 					zap.String("progress", fmt.Sprintf("%.1f%%", percentComplete)),
 					zap.String("throughput", fmt.Sprintf("%.2f MB/s", throughputMBps)))
-				
+
 				lastLogTime = time.Now()
 				lastLogBytes = totalRead
 			}
@@ -302,7 +311,7 @@ func (c *Client) GetObjectRange(ctx context.Context, key string, offset, length 
 		zap.Int64("offset", offset),
 		zap.Int64("length", length),
 	)
-	
+
 	if length > 10*1024*1024 { // Log for ranges > 10MB
 		log.Info("Starting range download",
 			zap.String("key", key),
@@ -330,18 +339,18 @@ func (c *Client) GetObjectRange(ctx context.Context, key string, offset, length 
 
 	// Pre-allocate buffer for expected length
 	data := make([]byte, 0, length)
-	
+
 	// Use buffered reading for better performance and error handling
 	buf := make([]byte, 128*1024) // 128KB buffer
 	totalRead := 0
 	lastLogTime := time.Now()
-	
+
 	for {
 		n, err := result.Body.Read(buf)
 		if n > 0 {
 			data = append(data, buf[:n]...)
 			totalRead += n
-			
+
 			// Log progress for large ranges every 5 seconds
 			if length > 10*1024*1024 && time.Since(lastLogTime) >= 5*time.Second {
 				percentComplete := float64(totalRead) / float64(length) * 100
@@ -521,7 +530,7 @@ func (c *Client) ListObjects(ctx context.Context, prefix string, maxKeys int) ([
 
 	var objects []*types.ObjectMetadata
 	var continuationToken *string
-	
+
 	reqMaxKeys := int64(1000)
 	if maxKeys > 0 && maxKeys < 1000 {
 		reqMaxKeys = int64(maxKeys)
@@ -655,6 +664,27 @@ func isNotFoundError(err error) bool {
 		return code == "NotFound" || code == "NoSuchKey" || code == s3.ErrCodeNoSuchKey || strings.Contains(code, "404")
 	}
 	return errors.Is(err, os.ErrNotExist)
+}
+
+// isCircuitOpenError follows both standard Go wrapping and the IBM SDK's
+// awserr.OrigErr chain (awserr predates errors.Unwrap).
+func isCircuitOpenError(err error) bool {
+	for err != nil {
+		if errors.Is(err, ErrCircuitOpen) {
+			return true
+		}
+
+		var aerr awserr.Error
+		if !errors.As(err, &aerr) {
+			return false
+		}
+		orig := aerr.OrigErr()
+		if orig == nil || orig == err {
+			return false
+		}
+		err = orig
+	}
+	return false
 }
 
 // CreateMultipartUpload initiates a multipart upload and returns an upload ID

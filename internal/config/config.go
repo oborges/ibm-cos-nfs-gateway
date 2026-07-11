@@ -73,16 +73,17 @@ type ServerConfig struct {
 
 // COSConfig represents IBM Cloud COS configuration
 type COSConfig struct {
-	Endpoint   string `mapstructure:"endpoint"`
-	Bucket     string `mapstructure:"bucket"`
-	Region     string `mapstructure:"region"`
-	AuthType   string `mapstructure:"auth_type"` // "iam" or "hmac"
-	APIKey     string `mapstructure:"api_key"`
-	ServiceID  string `mapstructure:"service_id"`
-	AccessKey  string `mapstructure:"access_key"`
-	SecretKey  string `mapstructure:"secret_key"`
-	MaxRetries int    `mapstructure:"max_retries"`
-	Timeout    string `mapstructure:"timeout"`
+	Endpoint              string `mapstructure:"endpoint"`
+	Bucket                string `mapstructure:"bucket"`
+	Region                string `mapstructure:"region"`
+	AuthType              string `mapstructure:"auth_type"` // "iam" or "hmac"
+	APIKey                string `mapstructure:"api_key"`
+	ServiceID             string `mapstructure:"service_id"`
+	AccessKey             string `mapstructure:"access_key"`
+	SecretKey             string `mapstructure:"secret_key"`
+	MaxRetries            int    `mapstructure:"max_retries"`
+	Timeout               string `mapstructure:"timeout"`
+	CircuitBreakerEnabled *bool  `mapstructure:"circuit_breaker_enabled"`
 }
 
 // CacheConfig represents caching configuration
@@ -242,6 +243,7 @@ func bindEnvOverrides(v *viper.Viper) error {
 		"cos.secret_key",
 		"cos.max_retries",
 		"cos.timeout",
+		"cos.circuit_breaker_enabled",
 		"cache.metadata.enabled",
 		"cache.metadata.size_mb",
 		"cache.metadata.ttl_seconds",
@@ -323,6 +325,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cos.auth_type", "iam")
 	v.SetDefault("cos.max_retries", 3)
 	v.SetDefault("cos.timeout", "30s")
+	v.SetDefault("cos.circuit_breaker_enabled", true)
 
 	// Metadata cache defaults
 	v.SetDefault("cache.metadata.enabled", true)

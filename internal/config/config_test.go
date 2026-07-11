@@ -74,6 +74,9 @@ staging:
 	if cfg.COS.Bucket != "env-bucket" {
 		t.Fatalf("COS.Bucket = %q, want env-bucket", cfg.COS.Bucket)
 	}
+	if cfg.COS.CircuitBreakerEnabled == nil || !*cfg.COS.CircuitBreakerEnabled {
+		t.Fatal("COS.CircuitBreakerEnabled should default to true")
+	}
 	if cfg.Server.NFSVersion != "dual" {
 		t.Fatalf("Server.NFSVersion = %q, want dual", cfg.Server.NFSVersion)
 	}

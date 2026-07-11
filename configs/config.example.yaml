@@ -49,6 +49,8 @@ cos:
   # Connection settings
   max_retries: 3
   timeout: "30s"
+  # Fast-fail SDK calls after repeated transport failures during a COS outage.
+  circuit_breaker_enabled: true
 
 cache:
   metadata:
